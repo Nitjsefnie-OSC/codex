@@ -606,6 +606,9 @@
             "mentions_v2": {
               "type": "boolean"
             },
+            "monitor_tool": {
+              "type": "boolean"
+            },
             "multi_agent": {
               "type": "boolean"
             },
@@ -5238,6 +5241,9 @@
           "type": "boolean"
         },
         "mentions_v2": {
+          "type": "boolean"
+        },
+        "monitor_tool": {
           "type": "boolean"
         },
         "multi_agent": {

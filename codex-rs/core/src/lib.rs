@@ -50,6 +50,7 @@ mod elicitation;
 mod environment_selection;
 pub mod exec;
 pub mod exec_env;
+pub mod exec_output_deltas;
 mod exec_policy;
 #[cfg(test)]
 mod git_info_tests;
