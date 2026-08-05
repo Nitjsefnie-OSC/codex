@@ -9,6 +9,7 @@ pub(crate) mod unix_escalation;
 pub(crate) mod zsh_fork_backend;
 
 use crate::exec::ExecCapturePolicy;
+use crate::exec_output_deltas::ExecDeltaChunking;
 use crate::guardian::GuardianNetworkAccessTrigger;
 use crate::sandboxing::ExecOptions;
 use crate::sandboxing::SandboxPermissions;
@@ -104,6 +105,7 @@ impl ShellRuntime {
             sub_id: ctx.turn.sub_id.clone(),
             call_id: ctx.call_id.clone(),
             tx_event: ctx.session.get_tx_event(),
+            chunking: ExecDeltaChunking::Bytes,
         })
     }
 }

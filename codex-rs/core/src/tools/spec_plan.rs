@@ -18,6 +18,7 @@ use crate::tools::handlers::GetContextRemainingHandler;
 use crate::tools::handlers::ListAvailablePluginsToInstallHandler;
 use crate::tools::handlers::ListMcpResourceTemplatesHandler;
 use crate::tools::handlers::ListMcpResourcesHandler;
+use crate::tools::handlers::MonitorHandler;
 use crate::tools::handlers::NewContextWindowHandler;
 use crate::tools::handlers::PlanHandler;
 use crate::tools::handlers::ReadMcpResourceHandler;
@@ -1106,6 +1107,10 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, registry: &mut Tool
         .any(|tool| tool == "test_sync_tool")
     {
         registry.add(TestSyncHandler);
+    }
+
+    if environment_mode.has_environment() && features.enabled(Feature::MonitorTool) {
+        registry.add(MonitorHandler);
     }
 
     if environment_mode.has_environment() && features.enabled(Feature::ViewImage) {
