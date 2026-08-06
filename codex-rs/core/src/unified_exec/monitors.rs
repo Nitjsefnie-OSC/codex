@@ -330,7 +330,10 @@ impl MonitorHandle {
         {
             return false;
         }
-        let _ = self.state_tx.send(state);
+        // `send` is a no-op when nothing is subscribed, which is the common
+        // case: a monitor usually finishes before anyone waits on it. Only
+        // `send_replace` stores the state unconditionally.
+        self.state_tx.send_replace(state);
         true
     }
 

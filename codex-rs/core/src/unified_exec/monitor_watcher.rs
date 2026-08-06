@@ -44,18 +44,20 @@ const MAX_PARTIAL_LINE_BYTES: usize = MAX_NOTIFICATION_BYTES;
 ///
 /// The task outlives the turn that started the monitor: a watcher runs until it
 /// is stopped or the session tears its processes down.
+/// `seed` is the output the process produced before `receiver` existed; the
+/// caller takes both under the process's output lock so nothing falls between
+/// them. `receiver` is passed in rather than subscribed here because a receiver
+/// only sees chunks published after it is created.
 pub(crate) fn spawn_monitor_watcher(
     handle: Arc<MonitorHandle>,
     session: Arc<Session>,
     turn: Arc<TurnContext>,
     timeout: Option<Duration>,
+    seed: Vec<u8>,
+    receiver: tokio::sync::broadcast::Receiver<Vec<u8>>,
 ) {
-    // Subscribe before spawning: a receiver only sees chunks published after it
-    // exists, so deferring this to the task would lose the first lines of a
-    // command that starts writing immediately.
-    let receiver = handle.process().output_receiver();
     tokio::spawn(async move {
-        run_monitor_watcher(handle, session, turn, timeout, receiver).await;
+        run_monitor_watcher(handle, session, turn, timeout, seed, receiver).await;
     });
 }
 
@@ -64,18 +66,28 @@ async fn run_monitor_watcher(
     session: Arc<Session>,
     turn: Arc<TurnContext>,
     timeout: Option<Duration>,
+    seed: Vec<u8>,
     mut receiver: tokio::sync::broadcast::Receiver<Vec<u8>>,
 ) {
     let process = Arc::clone(handle.process());
     let exit_token = process.cancellation_token();
 
-    let mut pending = Vec::<u8>::new();
+    let mut pending = seed;
     let mut batch = Vec::<String>::new();
     let mut flush_deadline: Option<Instant> = None;
     let mut timeout_deadline = timeout.map(|timeout| Instant::now() + timeout);
     let mut exit_grace: Option<Instant> = None;
     let mut timed_out = false;
     let mut lagged = false;
+
+    // The head of the output is already in `pending`; it becomes the first
+    // notification exactly as if it had arrived over the channel.
+    if ingest(&mut pending, &mut batch) {
+        flush_deadline = None;
+        deliver_batch(&handle, &session, &turn, std::mem::take(&mut batch)).await;
+    } else if !batch.is_empty() {
+        flush_deadline = Some(Instant::now() + BATCH_INTERVAL);
+    }
 
     loop {
         let next_deadline = [flush_deadline, timeout_deadline, exit_grace]
@@ -110,8 +122,7 @@ async fn run_monitor_watcher(
                 match received {
                     Ok(chunk) => {
                         pending.extend_from_slice(&chunk);
-                        take_complete_lines(&mut pending, &mut batch);
-                        if batch.len() >= MAX_LINES_PER_NOTIFICATION {
+                        if ingest(&mut pending, &mut batch) {
                             flush_deadline = None;
                             deliver_batch(&handle, &session, &turn, std::mem::take(&mut batch)).await;
                         } else if !batch.is_empty() && flush_deadline.is_none() {
@@ -147,6 +158,13 @@ async fn run_monitor_watcher(
 
     let state = terminal_state(&handle, timed_out);
     deliver_terminal(&handle, &session, &turn, state, lagged).await;
+}
+
+/// Move complete lines from `pending` into `batch`, reporting whether the batch
+/// is now full enough to send without waiting for the batching interval.
+fn ingest(pending: &mut Vec<u8>, batch: &mut Vec<String>) -> bool {
+    take_complete_lines(pending, batch);
+    batch.len() >= MAX_LINES_PER_NOTIFICATION
 }
 
 /// Sleep until `deadline`, or forever when there is no deadline to wait for.

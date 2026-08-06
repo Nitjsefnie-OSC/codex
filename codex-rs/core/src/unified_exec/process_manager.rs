@@ -497,10 +497,16 @@ impl UnifiedExecProcessManager {
         );
         emitter.emit(event_ctx, ToolEventStage::Begin).await;
 
-        if let Some(attachment) = monitor {
-            self.attach_monitor(&request, context, &process, &transcript, attachment)
-                .await;
-        }
+        // Bytes the process produced before the monitor could subscribe. They
+        // belong to the monitor now, so the tool result has to put them back in
+        // front of what the initial yield collects.
+        let monitor_seed = match monitor {
+            Some(attachment) => {
+                self.attach_monitor(&request, context, &process, &transcript, attachment)
+                    .await
+            }
+            None => Vec::new(),
+        };
         start_streaming_output(&process, context, Arc::clone(&transcript));
         let start = Instant::now();
         // Persist live sessions before the initial yield wait so interrupting the
@@ -549,7 +555,8 @@ impl UnifiedExecProcessManager {
         ))
         .unwrap_or(usize::MAX);
         let output_omitted_bytes = NonZeroUsize::new(collected_output.omitted_bytes());
-        let collected = collected_output.to_bytes_with_omission_marker();
+        let mut collected = monitor_seed;
+        collected.extend(collected_output.to_bytes_with_omission_marker());
         let text = String::from_utf8_lossy(&collected).to_string();
         let chunk_id = generate_chunk_id();
         if deferred_network_approval
@@ -1542,7 +1549,17 @@ impl UnifiedExecProcessManager {
     }
 
     /// Register watcher metadata for a freshly spawned process and start its
-    /// notification pump.
+    /// notification pump. Returns the output the process had already produced,
+    /// which the caller must still account for in the tool result.
+    ///
+    /// A process starts writing the moment it is spawned, well before this runs
+    /// — approvals and sandbox selection sit in between. A broadcast receiver
+    /// only sees what is sent after it subscribes, so subscribing alone drops
+    /// the head of the output, and the head is usually the line that says what
+    /// started or why it failed. The complete bytes are in the process's own
+    /// output buffer, so the seed is taken from there and the subscription is
+    /// made under the same lock the reader takes to append: the reader cannot
+    /// publish between the two.
     async fn attach_monitor(
         &self,
         request: &ExecCommandRequest,
@@ -1550,7 +1567,22 @@ impl UnifiedExecProcessManager {
         process: &Arc<UnifiedExecProcess>,
         transcript: &Arc<tokio::sync::Mutex<HeadTailBuffer>>,
         attachment: MonitorAttachment,
-    ) {
+    ) -> Vec<u8> {
+        let (seed, receiver) = {
+            let mut output_buffer = process.output_handles().output_buffer.lock().await;
+            let seed = output_buffer.drain();
+            (
+                seed.to_bytes_with_omission_marker(),
+                process.output_receiver(),
+            )
+        };
+
+        // The transcript backs `monitor` `read`, so it has to start from the
+        // same first byte the notifications do.
+        if !seed.is_empty() {
+            transcript.lock().await.push_chunk(seed.clone());
+        }
+
         let handle = Arc::new(MonitorHandle::new(
             request.process_id,
             attachment.command_display,
@@ -1566,7 +1598,10 @@ impl UnifiedExecProcessManager {
             Arc::clone(&context.session),
             Arc::clone(&context.turn),
             attachment.timeout,
+            seed.clone(),
+            receiver,
         );
+        seed
     }
 
     async fn monitor(&self, process_id: i32) -> Option<Arc<MonitorHandle>> {
