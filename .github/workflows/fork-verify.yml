@@ -5,7 +5,7 @@ name: fork-verify
 # full codex-rs target tree is ~45G, which is not something to put on a dev box.
 on:
   push:
-    branches: [main]
+    branches: ['**']
   workflow_dispatch:
 
 jobs:
