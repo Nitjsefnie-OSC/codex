@@ -14,7 +14,6 @@ use crate::exec::ExecCapturePolicy;
 use crate::exec::StdoutStream;
 use crate::exec::execute_exec_request;
 use crate::exec_env::create_env;
-use crate::exec_output_deltas::ExecDeltaChunking;
 use crate::sandboxing::ExecRequest;
 use crate::session::TurnInput;
 use crate::session::turn_context::TurnContext;
@@ -238,7 +237,6 @@ pub(crate) async fn execute_user_shell_command(
         sub_id: turn_context.sub_id.clone(),
         call_id: call_id.clone(),
         tx_event: session.get_tx_event(),
-        chunking: ExecDeltaChunking::Bytes,
     });
 
     let exec_result = execute_exec_request(exec_env, stdout_stream, /*after_spawn*/ None)

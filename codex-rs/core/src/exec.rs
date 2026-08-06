@@ -17,8 +17,6 @@ use tokio::io::BufReader;
 use tokio::process::Child;
 use tokio_util::sync::CancellationToken;
 
-use crate::exec_output_deltas::ExecDeltaChunking;
-use crate::exec_output_deltas::ExecDeltaEmitter;
 use crate::sandboxing::ExecOptions;
 use crate::sandboxing::ExecRequest;
 use crate::sandboxing::SandboxPermissions;
@@ -34,6 +32,9 @@ use codex_protocol::exec_output::StreamOutput;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::Event;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ExecCommandOutputDeltaEvent;
+use codex_protocol::protocol::ExecOutputStream;
 use codex_sandboxing::SandboxCommand;
 use codex_sandboxing::SandboxManager;
 use codex_sandboxing::SandboxTransformRequest;
@@ -288,10 +289,6 @@ pub struct StdoutStream {
     pub sub_id: String,
     pub call_id: String,
     pub tx_event: Sender<Event>,
-    /// Shape of the live `ExecCommandOutputDelta` payloads. Shell-style execs
-    /// use `Bytes`; long-lived monitored commands use `Lines` so consumers
-    /// receive whole lines as they arrive.
-    pub chunking: ExecDeltaChunking,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1121,8 +1118,7 @@ async fn read_output<R: AsyncRead + Unpin + Send + 'static>(
         }),
     );
     let mut tmp = [0u8; READ_CHUNK_SIZE];
-    let mut deltas = stream
-        .map(|stream| ExecDeltaEmitter::new(stream, is_stderr, MAX_EXEC_OUTPUT_DELTAS_PER_CALL));
+    let mut emitted_deltas: usize = 0;
 
     loop {
         let n = reader.read(&mut tmp).await?;
@@ -1130,8 +1126,26 @@ async fn read_output<R: AsyncRead + Unpin + Send + 'static>(
             break;
         }
 
-        if let Some(deltas) = deltas.as_mut() {
-            deltas.push(&tmp[..n]).await;
+        if let Some(stream) = &stream
+            && emitted_deltas < MAX_EXEC_OUTPUT_DELTAS_PER_CALL
+        {
+            let chunk = tmp[..n].to_vec();
+            let msg = EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
+                call_id: stream.call_id.clone(),
+                stream: if is_stderr {
+                    ExecOutputStream::Stderr
+                } else {
+                    ExecOutputStream::Stdout
+                },
+                chunk,
+            });
+            let event = Event {
+                id: stream.sub_id.clone(),
+                msg,
+            };
+            #[allow(clippy::let_unit_value)]
+            let _ = stream.tx_event.send(event).await;
+            emitted_deltas += 1;
         }
 
         if let Some(max_bytes) = max_bytes {
@@ -1140,10 +1154,6 @@ async fn read_output<R: AsyncRead + Unpin + Send + 'static>(
             buf.extend_from_slice(&tmp[..n]);
         }
         // Continue reading to EOF to avoid back-pressure
-    }
-
-    if let Some(deltas) = deltas.as_mut() {
-        deltas.flush().await;
     }
 
     Ok(StreamOutput {
