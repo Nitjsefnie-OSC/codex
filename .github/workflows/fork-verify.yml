@@ -21,6 +21,11 @@ jobs:
                       /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
           df -h /
 
+      - name: System build deps
+        # codex-bwrap links libcap via pkg-config; without it the whole
+        # workspace fails at build-script time, not at type-check time.
+        run: sudo apt-get update -qq && sudo apt-get install -y libcap-dev
+
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.95.0"
