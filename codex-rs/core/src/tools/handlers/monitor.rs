@@ -231,12 +231,14 @@ async fn start(
     };
 
     match manager.start_monitor(request, &context, attachment).await {
-        Ok(output) => Ok(json_output(serde_json::json!({
+        // The output produced before this returned is not echoed here: it is
+        // already on its way as the monitor's first notification, and repeating
+        // it would put the same lines in the model's context twice.
+        Ok(_) => Ok(json_output(serde_json::json!({
             "started": true,
             "process_id": process_id,
             "kind": kind.as_str(),
             "command": display_command,
-            "initial_output": String::from_utf8_lossy(&output.raw_output),
             "note": "Output arrives as monitor_notification messages; exactly one final notification reports how this ended.",
         }))),
         Err(err) => Err(FunctionCallError::RespondToModel(format!(
