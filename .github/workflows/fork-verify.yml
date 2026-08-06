@@ -1,0 +1,44 @@
+name: fork-verify
+
+# Verifies that fork main — upstream/main plus our whoami and monitor tools —
+# type-checks across the whole workspace. Runs on GitHub's runners because a
+# full codex-rs target tree is ~45G, which is not something to put on a dev box.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reclaim runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs
+
+      - name: cargo check --workspace
+        working-directory: codex-rs
+        run: |
+          cargo check --workspace \
+            --exclude codex-v8-poc \
+            --exclude codex-code-mode-runtime \
+            --exclude codex-code-mode-host
+          df -h /
+
+      - name: golden tool-name list
+        working-directory: codex-rs
+        run: cargo test -p codex-core --test suite prompt_caching -- --nocapture || true
