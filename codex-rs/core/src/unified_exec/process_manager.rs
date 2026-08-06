@@ -39,6 +39,11 @@ use crate::unified_exec::MAX_UNIFIED_EXEC_PROCESSES;
 use crate::unified_exec::MAX_YIELD_TIME_MS;
 use crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS;
 use crate::unified_exec::MIN_YIELD_TIME_MS;
+use crate::unified_exec::MonitorAcknowledgement;
+use crate::unified_exec::MonitorAttachment;
+use crate::unified_exec::MonitorInfo;
+use crate::unified_exec::MonitorOutput;
+use crate::unified_exec::MonitorWaitOutcome;
 use crate::unified_exec::ProcessEntry;
 use crate::unified_exec::ProcessStore;
 use crate::unified_exec::UnifiedExecContext;
@@ -53,6 +58,8 @@ use crate::unified_exec::async_watcher::start_streaming_output;
 use crate::unified_exec::clamp_yield_time;
 use crate::unified_exec::generate_chunk_id;
 use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
+use crate::unified_exec::monitor_watcher::spawn_monitor_watcher;
+use crate::unified_exec::monitors::MonitorHandle;
 use crate::unified_exec::process::OutputHandles;
 use crate::unified_exec::process::SpawnLifecycleHandle;
 use crate::unified_exec::process::UnifiedExecProcess;
@@ -419,6 +426,34 @@ impl UnifiedExecProcessManager {
         request: ExecCommandRequest,
         context: &UnifiedExecContext,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
+        self.exec_command_inner(request, context, /*monitor*/ None)
+            .await
+    }
+
+    /// Start a monitored process.
+    ///
+    /// This is an ordinary `exec_command` with a watcher attached: the process
+    /// lands in the same process store, gets the same process id, the same
+    /// bounded retained output, the same `write_stdin` and `list`/`terminate`
+    /// operations, and the same survival across turn interruption. What the
+    /// attachment adds is the model-facing notification pump and the watcher
+    /// metadata needed to reason about a long-lived process.
+    pub(crate) async fn start_monitor(
+        &self,
+        request: ExecCommandRequest,
+        context: &UnifiedExecContext,
+        attachment: MonitorAttachment,
+    ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
+        self.exec_command_inner(request, context, Some(attachment))
+            .await
+    }
+
+    async fn exec_command_inner(
+        &self,
+        request: ExecCommandRequest,
+        context: &UnifiedExecContext,
+        monitor: Option<MonitorAttachment>,
+    ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
         let cwd = request.cwd.clone();
         let process = self
             .open_session_with_sandbox(&request, cwd.clone(), context)
@@ -462,6 +497,10 @@ impl UnifiedExecProcessManager {
         );
         emitter.emit(event_ctx, ToolEventStage::Begin).await;
 
+        if let Some(attachment) = monitor {
+            self.attach_monitor(&request, context, &process, &transcript, attachment)
+                .await;
+        }
         start_streaming_output(&process, context, Arc::clone(&transcript));
         let start = Instant::now();
         // Persist live sessions before the initial yield wait so interrupting the
@@ -1427,6 +1466,11 @@ impl UnifiedExecProcessManager {
     }
 
     pub(crate) async fn terminate_all_processes(&self) {
+        // Session teardown is a deliberate stop, not a crash: mark monitors
+        // before killing so each watcher's terminal notification says so.
+        for handle in self.monitor_store.lock().await.all() {
+            handle.request_stop();
+        }
         let entries: Vec<ProcessEntry> = {
             let mut processes = self.process_store.lock().await;
             let entries: Vec<ProcessEntry> = processes
@@ -1495,6 +1539,92 @@ impl UnifiedExecProcessManager {
 
         unregister_network_approval_for_entry(&entry).await;
         true
+    }
+
+    /// Register watcher metadata for a freshly spawned process and start its
+    /// notification pump.
+    async fn attach_monitor(
+        &self,
+        request: &ExecCommandRequest,
+        context: &UnifiedExecContext,
+        process: &Arc<UnifiedExecProcess>,
+        transcript: &Arc<tokio::sync::Mutex<HeadTailBuffer>>,
+        attachment: MonitorAttachment,
+    ) {
+        let handle = Arc::new(MonitorHandle::new(
+            request.process_id,
+            attachment.command_display,
+            request.cwd.to_string(),
+            attachment.kind,
+            attachment.owner,
+            Arc::clone(process),
+            Arc::clone(transcript),
+        ));
+        self.monitor_store.lock().await.insert(Arc::clone(&handle));
+        spawn_monitor_watcher(
+            handle,
+            Arc::clone(&context.session),
+            Arc::clone(&context.turn),
+            attachment.timeout,
+        );
+    }
+
+    async fn monitor(&self, process_id: i32) -> Option<Arc<MonitorHandle>> {
+        self.monitor_store.lock().await.get(process_id)
+    }
+
+    /// Every monitor this session started, including finished ones whose
+    /// retained output is still readable.
+    pub(crate) async fn list_monitors(&self) -> Vec<MonitorInfo> {
+        let handles = self.monitor_store.lock().await.all();
+        let mut infos = Vec::with_capacity(handles.len());
+        for handle in handles {
+            infos.push(handle.info().await);
+        }
+        infos
+    }
+
+    /// Read a monitor's bounded retained output, optionally acknowledging the
+    /// notifications it has delivered.
+    pub(crate) async fn read_monitor_output(
+        &self,
+        process_id: i32,
+        acknowledgement: MonitorAcknowledgement,
+    ) -> Option<MonitorOutput> {
+        let handle = self.monitor(process_id).await?;
+        Some(handle.output(acknowledgement).await)
+    }
+
+    /// Stop a monitor. The watcher still delivers the terminal notification —
+    /// classified as `stopped` rather than as a bare exit code.
+    pub(crate) async fn stop_monitor(&self, process_id: i32) -> Option<bool> {
+        let handle = self.monitor(process_id).await?;
+        if handle.state().is_terminal() {
+            return Some(false);
+        }
+        handle.request_stop();
+        if !self.terminate_process(process_id).await {
+            // A short-lived monitor is never stored in the process store, and a
+            // pruned one has already been removed; terminate the handle we hold.
+            handle.process().terminate();
+        }
+        Some(true)
+    }
+
+    /// Wait for a monitor to reach a terminal state, giving up after `timeout`.
+    pub(crate) async fn wait_for_monitor(
+        &self,
+        process_id: i32,
+        timeout: Duration,
+    ) -> Option<MonitorWaitOutcome> {
+        let handle = self.monitor(process_id).await?;
+        let completed = tokio::time::timeout(timeout, handle.wait_for_terminal())
+            .await
+            .is_ok();
+        Some(MonitorWaitOutcome {
+            completed,
+            info: handle.info().await,
+        })
     }
 }
 

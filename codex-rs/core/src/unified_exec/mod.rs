@@ -46,6 +46,8 @@ use crate::tools::network_approval::DeferredNetworkApproval;
 mod async_watcher;
 mod errors;
 mod head_tail_buffer;
+mod monitor_watcher;
+mod monitors;
 mod process;
 mod process_manager;
 mod process_state;
@@ -55,6 +57,16 @@ pub(crate) fn set_deterministic_process_ids_for_tests(enabled: bool) {
 }
 
 pub(crate) use errors::UnifiedExecError;
+#[cfg(test)]
+pub(crate) use monitors::MAX_MONITOR_NOTIFICATIONS;
+pub use monitors::MonitorAcknowledgement;
+pub(crate) use monitors::MonitorAttachment;
+pub use monitors::MonitorInfo;
+pub use monitors::MonitorKind;
+pub use monitors::MonitorOutput;
+pub use monitors::MonitorOwner;
+pub use monitors::MonitorState;
+pub use monitors::MonitorWaitOutcome;
 pub(crate) use process::NoopSpawnLifecycle;
 #[cfg(unix)]
 pub(crate) use process::SpawnLifecycle;
@@ -145,6 +157,9 @@ impl ProcessStore {
 
 pub(crate) struct UnifiedExecProcessManager {
     process_store: Mutex<ProcessStore>,
+    /// Watcher metadata for the subset of `process_store` started as monitors.
+    /// Not a second process registry — see [`monitors`].
+    monitor_store: Mutex<monitors::MonitorStore>,
     max_write_stdin_yield_time_ms: u64,
 }
 
@@ -152,6 +167,7 @@ impl UnifiedExecProcessManager {
     pub(crate) fn new(max_write_stdin_yield_time_ms: u64) -> Self {
         Self {
             process_store: Mutex::new(ProcessStore::default()),
+            monitor_store: Mutex::new(monitors::MonitorStore::default()),
             max_write_stdin_yield_time_ms: max_write_stdin_yield_time_ms
                 .max(MIN_EMPTY_YIELD_TIME_MS),
         }

@@ -33,6 +33,10 @@ use crate::session::turn_context::TurnContext;
 use crate::state::ActiveTurn;
 use crate::state::RunningTask;
 use crate::state::TaskKind;
+use crate::unified_exec::MonitorAcknowledgement;
+use crate::unified_exec::MonitorInfo;
+use crate::unified_exec::MonitorOutput;
+use crate::unified_exec::MonitorWaitOutcome;
 use codex_analytics::TurnProfileFact;
 use codex_analytics::TurnTokenUsageFact;
 use codex_otel::SessionTelemetry;
@@ -858,6 +862,39 @@ impl Session {
         self.services
             .unified_exec_manager
             .terminate_process(process_id)
+            .await
+    }
+
+    pub(crate) async fn list_monitors(&self) -> Vec<MonitorInfo> {
+        self.services.unified_exec_manager.list_monitors().await
+    }
+
+    pub(crate) async fn read_monitor_output(
+        &self,
+        process_id: i32,
+        acknowledgement: MonitorAcknowledgement,
+    ) -> Option<MonitorOutput> {
+        self.services
+            .unified_exec_manager
+            .read_monitor_output(process_id, acknowledgement)
+            .await
+    }
+
+    pub(crate) async fn stop_monitor(&self, process_id: i32) -> Option<bool> {
+        self.services
+            .unified_exec_manager
+            .stop_monitor(process_id)
+            .await
+    }
+
+    pub(crate) async fn wait_for_monitor(
+        &self,
+        process_id: i32,
+        timeout: std::time::Duration,
+    ) -> Option<MonitorWaitOutcome> {
+        self.services
+            .unified_exec_manager
+            .wait_for_monitor(process_id, timeout)
             .await
     }
 

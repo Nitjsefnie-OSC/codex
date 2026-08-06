@@ -108,7 +108,8 @@ pub enum Feature {
     CodeModeOnly,
     /// Use the single unified PTY-backed exec tool.
     UnifiedExec,
-    /// Expose the `monitor` tool for streaming a long-running command's output.
+    /// Expose the `monitor` tool for running long-lived work on the unified
+    /// exec process manager with model-visible progress notifications.
     MonitorTool,
     /// Route shell tool execution through the zsh exec bridge.
     ShellZshFork,
@@ -883,8 +884,8 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::MonitorTool,
         key: "monitor_tool",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
+        stage: Stage::Stable,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::ShellZshFork,
