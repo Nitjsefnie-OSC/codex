@@ -11,6 +11,7 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
@@ -42,6 +43,16 @@ jobs:
             --exclude codex-v8-poc \
             --exclude codex-code-mode-runtime \
             --exclude codex-code-mode-host
+          df -h /
+
+      - name: monitor tool tests
+        # The dev box may not run cargo test, so this is where the monitor's
+        # contract is actually executed: notification batching and sequencing,
+        # the per-monitor cap, the always-exactly-one terminal notification,
+        # stop-leaves-no-orphan, and readable retained output.
+        working-directory: codex-rs
+        run: |
+          cargo test -p codex-core --lib monitor -- --nocapture
           df -h /
 
       - name: golden tool-name list
