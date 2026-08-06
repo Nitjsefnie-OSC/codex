@@ -367,6 +367,17 @@ async fn a_noisy_monitor_is_capped_but_its_output_stays_readable() {
         delivered.len()
     );
 
+    // A command that finishes before the watcher can subscribe still reports
+    // its first line: the head of the output is never dropped.
+    let first_line = delivered
+        .iter()
+        .find(|item| !is_final(item))
+        .and_then(|item| item["lines"].as_array())
+        .and_then(|lines| lines.first())
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    assert_eq!(first_line.as_deref(), Some("line-1"));
+
     // The output the notifications did not carry is still readable after the
     // fact, and reading it acknowledges what was delivered.
     let output = call(
@@ -427,12 +438,17 @@ async fn list_reports_classification_ownership_and_unread_notifications() {
     );
 
     // Reading acknowledges, and the proof shows up in the next list.
-    call(
+    let output = call(
         &harness,
         "monitor-list-read",
         serde_json::json!({ "action": "read", "process_id": process_id }),
     )
     .await;
+    assert_eq!(
+        output["output"].as_str(),
+        Some("hello\n"),
+        "a finished monitor's output is still readable"
+    );
     let relisted = call(
         &harness,
         "monitor-list-again",
