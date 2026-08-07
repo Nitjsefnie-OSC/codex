@@ -59,6 +59,15 @@ jobs:
         working-directory: codex-rs
         run: cargo test -p codex-hooks
 
+      - name: skill activation audit tests
+        # Focused fork enforcement coverage: full-source digests and turn-local
+        # exact-record activation state must fail before later hook suites run.
+        working-directory: codex-rs
+        run: |
+          cargo test -p codex-core-skills --lib plugin_skill_injection_digest
+          cargo test -p codex-core --lib skill_activation_store
+          cargo test -p codex-core --lib pending_skill_activation
+
       - name: fork-safe update channel tests
         # These assert the negative that matters: no code path offers an
         # upgrade that would install an upstream build over a fork one, and an

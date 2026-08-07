@@ -161,3 +161,7 @@ pub(crate) async fn maybe_emit_implicit_skill_invocation(
             vec![invocation],
         );
 }
+
+#[cfg(test)]
+#[path = "skills_tests.rs"]
+mod tests;
