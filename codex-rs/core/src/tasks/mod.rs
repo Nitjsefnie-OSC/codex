@@ -285,7 +285,9 @@ impl Session {
         input: Vec<TurnInput>,
         task: T,
     ) {
+        let _turn_start_guard = self.input_queue.lock_turn_start().await;
         self.abort_all_tasks(TurnAbortReason::Replaced).await;
+        self.input_queue.claim_monitor_wake();
         self.clear_connector_selection().await;
         self.start_task(
             turn_context,
@@ -466,6 +468,12 @@ impl Session {
         self: &Arc<Self>,
         sub_id: String,
     ) {
+        if self
+            .shutdown_started
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
         if !self.input_queue.has_pending_mailbox_items().await
             || (!self.input_queue.has_trigger_turn_mailbox_items().await
                 && !self.has_outstanding_durable_sleep())
@@ -473,17 +481,24 @@ impl Session {
             return;
         }
 
+        let _turn_start_guard = self.input_queue.lock_turn_start().await;
+        if self
+            .shutdown_started
+            .load(std::sync::atomic::Ordering::Acquire)
         {
-            let mut active_turn = self.active_turn.lock().await;
-            if active_turn.is_some() {
-                return;
-            }
-            *active_turn = Some(ActiveTurn::default());
+            return;
+        }
+        if self.active_turn.lock().await.is_some() {
+            return;
         }
 
         let turn_context = self.new_default_turn_with_sub_id(sub_id).await;
         self.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
             .await;
+        if self.active_turn.lock().await.is_some() {
+            return;
+        }
+        self.input_queue.claim_monitor_wake();
         self.start_task(
             turn_context,
             Vec::new(),
@@ -503,6 +518,8 @@ impl Session {
             aborted_turn = task.is_some();
             turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
             if let Some(task) = task {
+                self.persist_pending_monitor_items(&active_turn, task.turn_context.as_ref())
+                    .await;
                 self.handle_task_abort(task, reason.clone()).await;
             }
             if aborted_turn {
@@ -521,6 +538,7 @@ impl Session {
         }
         if reason == TurnAbortReason::Interrupted && aborted_turn {
             self.maybe_start_turn_for_pending_work().await;
+            self.input_queue.notify_monitor_wake();
         }
     }
 
@@ -548,6 +566,8 @@ impl Session {
         let task = active_turn.task.take();
         let turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
         if let Some(task) = task {
+            self.persist_pending_monitor_items(&active_turn, task.turn_context.as_ref())
+                .await;
             self.handle_task_abort(task, reason.clone()).await;
         }
         if let Some(turn_context) = turn_context.as_deref() {
@@ -560,6 +580,7 @@ impl Session {
 
         if reason == TurnAbortReason::Interrupted {
             self.maybe_start_turn_for_pending_work().await;
+            self.input_queue.notify_monitor_wake();
         }
 
         true
@@ -842,7 +863,31 @@ impl Session {
         }
         if cleared_active_turn {
             self.maybe_start_turn_for_pending_work().await;
+            self.input_queue.notify_monitor_wake();
         }
+    }
+
+    async fn persist_pending_monitor_items(
+        &self,
+        active_turn: &ActiveTurn,
+        turn_context: &TurnContext,
+    ) {
+        let items = self
+            .input_queue
+            .take_pending_monitor_items_for_turn_state(active_turn.turn_state.as_ref())
+            .await;
+        if items.is_empty() {
+            return;
+        }
+        for item in &items {
+            self.record_conversation_items(turn_context, std::slice::from_ref(item))
+                .await;
+        }
+        self.input_queue.request_monitor_wake();
+        if let Err(err) = self.flush_rollout().await {
+            warn!("failed to flush monitor items during task cleanup: {err}");
+        }
+        self.input_queue.notify_monitor_wake();
     }
 
     async fn take_active_turn(&self) -> Option<ActiveTurn> {

@@ -113,7 +113,7 @@ jobs:
         working-directory: codex-rs
         run: |
           cargo test -p codex-core --lib whoami -- --nocapture
-          cargo test -p codex-core --test suite whoami -- --nocapture
+          cargo test -p codex-core --test all whoami -- --nocapture
 
       - name: monitor tool tests
         # The dev box may not run cargo test, so this is where the monitor's
@@ -125,9 +125,9 @@ jobs:
         run: |
           cargo test -p codex-core --lib monitor -- --nocapture
           cargo test -p codex-core --lib try_start_turn_if_idle -- --nocapture
-          cargo test -p codex-core --test suite monitor -- --nocapture
+          cargo test -p codex-core --test all monitor -- --nocapture
           df -h /
 
       - name: golden tool-name list
         working-directory: codex-rs
-        run: cargo test -p codex-core --test suite prompt_caching -- --nocapture || true
+        run: cargo test -p codex-core --test all prompt_caching -- --nocapture || true

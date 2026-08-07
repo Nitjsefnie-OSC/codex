@@ -3,8 +3,8 @@ use super::session::Session;
 use super::turn_context::TurnContext;
 use crate::codex_thread::TryStartTurnIfIdleError;
 use crate::codex_thread::TryStartTurnIfIdleRejectionReason;
-use crate::state::ActiveTurn;
-use crate::state::TurnState;
+use crate::context::ContextualUserFragment;
+use crate::context::MonitorNotification;
 use crate::tasks::MailboxParentProvenance;
 use crate::tasks::RegularTask;
 use codex_protocol::config_types::ModeKind;
@@ -51,6 +51,7 @@ impl Session {
         if input.is_empty() {
             return Ok(());
         }
+        let _turn_start_guard = self.input_queue.lock_turn_start().await;
         if self
             .shutdown_started
             .load(std::sync::atomic::Ordering::Acquire)
@@ -76,23 +77,9 @@ impl Session {
             ));
         }
 
-        let turn_state = {
-            let mut active_turn = self.active_turn.lock().await;
-            if active_turn.is_some() {
-                return Err(TryStartTurnIfIdleError::new(
-                    TryStartTurnIfIdleRejectionReason::Busy,
-                    input,
-                ));
-            }
-            let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
-            Arc::clone(&active_turn.turn_state)
-        };
-
-        if self.input_queue.has_trigger_turn_mailbox_items().await {
-            self.clear_reserved_idle_turn(&turn_state).await;
-            self.maybe_start_turn_for_pending_work().await;
+        if self.active_turn.lock().await.is_some() {
             return Err(TryStartTurnIfIdleError::new(
-                TryStartTurnIfIdleRejectionReason::PendingTriggerTurn,
+                TryStartTurnIfIdleRejectionReason::Busy,
                 input,
             ));
         }
@@ -101,8 +88,6 @@ impl Session {
             .new_default_turn_with_sub_id(uuid::Uuid::new_v4().to_string())
             .await;
         if !has_user_input && turn_context.mode == ModeKind::Plan {
-            self.clear_reserved_idle_turn(&turn_state).await;
-            self.maybe_start_turn_for_pending_work().await;
             return Err(TryStartTurnIfIdleError::new(
                 TryStartTurnIfIdleRejectionReason::PlanMode,
                 input,
@@ -111,21 +96,12 @@ impl Session {
         self.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
             .await;
         if self.input_queue.has_trigger_turn_mailbox_items().await {
-            self.clear_reserved_idle_turn(&turn_state).await;
-            self.maybe_start_turn_for_pending_work().await;
             return Err(TryStartTurnIfIdleError::new(
                 TryStartTurnIfIdleRejectionReason::PendingTriggerTurn,
                 input,
             ));
         }
-        let still_reserved = {
-            let active_turn = self.active_turn.lock().await;
-            active_turn.as_ref().is_some_and(|active_turn| {
-                active_turn.task.is_none() && Arc::ptr_eq(&active_turn.turn_state, &turn_state)
-            })
-        };
-        if !still_reserved {
-            self.clear_reserved_idle_turn(&turn_state).await;
+        if self.active_turn.lock().await.is_some() {
             return Err(TryStartTurnIfIdleError::new(
                 TryStartTurnIfIdleRejectionReason::Busy,
                 input,
@@ -144,11 +120,9 @@ impl Session {
             }
             input
         } else {
-            self.input_queue
-                .extend_pending_input_for_turn_state(turn_state.as_ref(), input)
-                .await;
-            Vec::new()
+            input
         };
+        self.input_queue.claim_monitor_wake();
         self.start_task(
             turn_context,
             task_input,
@@ -168,14 +142,75 @@ impl Session {
         Ok(())
     }
 
-    async fn clear_reserved_idle_turn(&self, turn_state: &Arc<tokio::sync::Mutex<TurnState>>) {
-        let mut active_turn_guard = self.active_turn.lock().await;
-        if let Some(active_turn) = active_turn_guard.as_ref()
-            && active_turn.task.is_none()
-            && Arc::ptr_eq(&active_turn.turn_state, turn_state)
+    /// Persist one monitor notification and request one coalesced idle wake.
+    ///
+    /// Active regular turns receive the item directly. At every other turn
+    /// boundary the item is recorded first, so interruption, shutdown, and a
+    /// competing user submission cannot erase it before the next model request.
+    pub(crate) async fn deliver_monitor_notification(
+        self: &Arc<Self>,
+        notification: MonitorNotification,
+        fallback_turn_context: &TurnContext,
+    ) {
+        let _delivery_guard = self.input_queue.lock_monitor_delivery().await;
+        let item = ContextualUserFragment::into(notification);
+        if self
+            .input_queue
+            .inject_monitor_if_running(&self.active_turn, item.clone())
+            .await
         {
-            *active_turn_guard = None;
+            return;
         }
+
+        self.record_conversation_items(fallback_turn_context, std::slice::from_ref(&item))
+            .await;
+        self.input_queue.request_monitor_wake();
+        if let Err(err) = self.flush_rollout().await {
+            tracing::warn!("failed to flush monitor notification before wake: {err}");
+        }
+        self.input_queue.notify_monitor_wake();
+    }
+
+    /// Start at most one regular turn for monitor history waiting for a model
+    /// request. The same lock is used by user/task starts, so no taskless
+    /// `ActiveTurn` can steal a submission race.
+    pub(crate) async fn maybe_start_monitor_turn_if_idle(self: &Arc<Self>) {
+        let _turn_start_guard = self.input_queue.lock_turn_start().await;
+        if self
+            .shutdown_started
+            .load(std::sync::atomic::Ordering::Acquire)
+            || !self.input_queue.monitor_wake_requested()
+            || self.input_queue.has_trigger_turn_mailbox_items().await
+            || self.active_turn.lock().await.is_some()
+        {
+            return;
+        }
+        if self.collaboration_mode().await.mode == ModeKind::Plan {
+            return;
+        }
+
+        let turn_context = self
+            .new_default_turn_with_sub_id(uuid::Uuid::new_v4().to_string())
+            .await;
+        if turn_context.mode == ModeKind::Plan {
+            return;
+        }
+        self.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
+            .await;
+        if self.input_queue.has_trigger_turn_mailbox_items().await
+            || self.active_turn.lock().await.is_some()
+        {
+            return;
+        }
+        self.input_queue.claim_monitor_wake();
+        self.start_task(
+            turn_context,
+            Vec::new(),
+            RegularTask::new(),
+            /*input_persisted*/ None,
+            MailboxParentProvenance::Ignore,
+        )
+        .await;
     }
 
     /// Injects items into active work, or records them without starting a turn.

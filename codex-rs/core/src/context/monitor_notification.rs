@@ -1,4 +1,6 @@
 use super::ContextualUserFragment;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
 
 /// A model-visible notification produced by a `monitor` job or watcher.
 ///
@@ -67,6 +69,23 @@ impl ContextualUserFragment for MonitorNotification {
             payload.insert("note".to_string(), note.clone().into());
         }
         format!("\n{}\n", serde_json::Value::Object(payload))
+    }
+}
+
+impl MonitorNotification {
+    /// Returns whether a response item is one of the monitor fragments owned
+    /// by the monitor delivery state machine.
+    pub(crate) fn is_response_item(item: &ResponseItem) -> bool {
+        let ResponseItem::Message { role, content, .. } = item else {
+            return false;
+        };
+        role == "developer"
+            && content.iter().any(|item| match item {
+                ContentItem::InputText { text } => Self::matches_text(text),
+                ContentItem::InputImage { .. }
+                | ContentItem::InputAudio { .. }
+                | ContentItem::OutputText { .. } => false,
+            })
     }
 }
 

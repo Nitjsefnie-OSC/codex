@@ -56,3 +56,20 @@ fn notifications_are_marked_and_never_merged_with_a_neighbour() {
     assert!(fragment.requires_separate_message());
     assert!(MonitorNotification::matches_text(&fragment.render()));
 }
+
+#[test]
+fn response_item_classifier_recognizes_only_monitor_fragments() {
+    let monitor_item = ContextualUserFragment::into(notification());
+    let ordinary_item = codex_protocol::models::ResponseItem::Message {
+        id: None,
+        role: "developer".to_string(),
+        content: vec![codex_protocol::models::ContentItem::InputText {
+            text: "ordinary developer context".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+
+    assert!(MonitorNotification::is_response_item(&monitor_item));
+    assert!(!MonitorNotification::is_response_item(&ordinary_item));
+}

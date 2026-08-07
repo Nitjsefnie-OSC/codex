@@ -57,6 +57,7 @@ use codex_rmcp_client::ElicitationAction;
 use codex_rmcp_client::ElicitationResponse;
 use serde_json::Value;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tracing::debug;
 use tracing::info;
 use tracing::warn;
@@ -108,6 +109,11 @@ pub async fn update_thread_settings(
     let updates = thread_settings_update(sess, thread_settings).await;
     match sess.update_settings(updates).await {
         Ok(()) => {
+            // A monitor wake may have been held back by Plan mode. The
+            // settings submission is already serialized ahead of the internal
+            // wake, so retry it after any concurrent delivery has finished.
+            let _monitor_delivery_guard = sess.input_queue.lock_monitor_delivery().await;
+            sess.input_queue.notify_monitor_wake();
             sess.send_event_raw_without_materializing_rollout(Event {
                 id: sub_id,
                 msg: thread_settings_applied_event(sess).await,
@@ -585,8 +591,11 @@ pub async fn set_thread_memory_mode(sess: &Arc<Session>, sub_id: String, mode: T
 }
 
 async fn shutdown_session_runtime(sess: &Arc<Session>) {
-    sess.shutdown_started
-        .store(true, std::sync::atomic::Ordering::Release);
+    {
+        let _turn_start_guard = sess.input_queue.lock_turn_start().await;
+        sess.shutdown_started
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
     if let Some(startup_prewarm) = sess.take_session_startup_prewarm().await {
         startup_prewarm.abort().await;
     }
@@ -712,7 +721,20 @@ pub(super) async fn submission_loop(
 ) {
     // To break out of this loop, send Op::Shutdown.
     let mut shutdown_received = false;
-    while let Ok(sub) = rx_sub.recv().await {
+    loop {
+        let sub = tokio::select! {
+            biased;
+            sub = rx_sub.recv() => match sub {
+                Ok(sub) => sub,
+                Err(_) => break,
+            },
+            _ = sess.input_queue.monitor_wake_notified(),
+                if !sess.shutdown_started.load(Ordering::Acquire) =>
+            {
+                sess.maybe_start_monitor_turn_if_idle().await;
+                continue;
+            }
+        };
         debug!(?sub, "Submission");
         let dispatch_span = submission_dispatch_span(&sub);
         let should_exit = async {

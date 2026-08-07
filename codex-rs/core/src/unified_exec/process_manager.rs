@@ -1494,6 +1494,7 @@ impl UnifiedExecProcessManager {
             unregister_network_approval_for_entry(&entry).await;
             entry.process.terminate();
         }
+        self.join_monitor_watchers().await;
     }
 
     pub(crate) async fn list_processes(&self) -> Vec<BackgroundTerminalInfo> {
@@ -1594,7 +1595,7 @@ impl UnifiedExecProcessManager {
             Arc::clone(transcript),
         ));
         self.monitor_store.lock().await.insert(Arc::clone(&handle));
-        spawn_monitor_watcher(
+        let watcher = spawn_monitor_watcher(
             handle,
             Arc::clone(&context.session),
             Arc::clone(&context.turn),
@@ -1602,7 +1603,19 @@ impl UnifiedExecProcessManager {
             seed.clone(),
             receiver,
         );
+        self.monitor_watcher_tasks.lock().await.push(watcher);
         seed
+    }
+
+    pub(crate) async fn join_monitor_watchers(&self) {
+        let watchers = std::mem::take(&mut *self.monitor_watcher_tasks.lock().await);
+        for watcher in watchers {
+            if let Err(err) = watcher.await {
+                if !err.is_cancelled() {
+                    tracing::warn!("monitor watcher task failed during shutdown: {err}");
+                }
+            }
+        }
     }
 
     async fn monitor(&self, process_id: i32) -> Option<Arc<MonitorHandle>> {

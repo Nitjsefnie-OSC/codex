@@ -160,6 +160,7 @@ pub(crate) struct UnifiedExecProcessManager {
     /// Watcher metadata for the subset of `process_store` started as monitors.
     /// Not a second process registry — see [`monitors`].
     monitor_store: Mutex<monitors::MonitorStore>,
+    monitor_watcher_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     max_write_stdin_yield_time_ms: u64,
 }
 
@@ -168,6 +169,7 @@ impl UnifiedExecProcessManager {
         Self {
             process_store: Mutex::new(ProcessStore::default()),
             monitor_store: Mutex::new(monitors::MonitorStore::default()),
+            monitor_watcher_tasks: Mutex::new(Vec::new()),
             max_write_stdin_yield_time_ms: max_write_stdin_yield_time_ms
                 .max(MIN_EMPTY_YIELD_TIME_MS),
         }
