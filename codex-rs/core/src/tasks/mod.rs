@@ -287,7 +287,6 @@ impl Session {
     ) {
         let _turn_start_guard = self.input_queue.lock_turn_start().await;
         self.abort_all_tasks(TurnAbortReason::Replaced).await;
-        self.input_queue.claim_monitor_wake();
         self.clear_connector_selection().await;
         self.start_task(
             turn_context,
@@ -297,6 +296,10 @@ impl Session {
             MailboxParentProvenance::Ignore,
         )
         .await;
+        // Claim after start_task publishes the active task. Notifications
+        // arriving during task setup are already in durable history and will
+        // be part of this request; later notifications are injected directly.
+        self.input_queue.claim_monitor_wake();
     }
 
     pub(crate) async fn start_task<T: SessionTask>(
@@ -498,7 +501,6 @@ impl Session {
         if self.active_turn.lock().await.is_some() {
             return;
         }
-        self.input_queue.claim_monitor_wake();
         self.start_task(
             turn_context,
             Vec::new(),
@@ -507,6 +509,7 @@ impl Session {
             MailboxParentProvenance::Attribute,
         )
         .await;
+        self.input_queue.claim_monitor_wake();
     }
 
     pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {

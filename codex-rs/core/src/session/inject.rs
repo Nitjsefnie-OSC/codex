@@ -122,7 +122,6 @@ impl Session {
         } else {
             input
         };
-        self.input_queue.claim_monitor_wake();
         self.start_task(
             turn_context,
             task_input,
@@ -131,6 +130,10 @@ impl Session {
             MailboxParentProvenance::Ignore,
         )
         .await;
+        // Claim after start_task publishes the active task. Notifications
+        // arriving during task setup are already in durable history and will
+        // be part of this request; later notifications are injected directly.
+        self.input_queue.claim_monitor_wake();
         if let Some(receiver) = input_persisted_receiver {
             return receiver
                 .await
@@ -202,7 +205,6 @@ impl Session {
         {
             return;
         }
-        self.input_queue.claim_monitor_wake();
         self.start_task(
             turn_context,
             Vec::new(),
@@ -211,6 +213,7 @@ impl Session {
             MailboxParentProvenance::Ignore,
         )
         .await;
+        self.input_queue.claim_monitor_wake();
     }
 
     /// Injects items into active work, or records them without starting a turn.
