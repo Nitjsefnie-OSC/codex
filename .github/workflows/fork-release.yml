@@ -1,13 +1,13 @@
 name: fork-release
 
-# Publishes a checksummed fork build.
+# Publishes checksummed fork builds.
 #
 # The fork had no releases at all, which left the only way to get a build with
 # `whoami`/`monitor` in it a local `cargo build` on an unpinned tree — nothing
 # to verify a downloaded binary against, and no way to say which commit a given
 # binary came from. This workflow closes both: it stamps the release commit into
 # the binary through `CODEX_FORK_BUILD_SHA` (see `codex-rs/fork-manifest`), and
-# publishes a `SHA256SUMS` next to every artifact.
+# publishes a `SHA256SUMS` covering every artifact.
 #
 # Release like:
 #
@@ -18,11 +18,23 @@ name: fork-release
 # accepts this prefix — an upstream tag must not read as an available upgrade
 # for a fork build, because taking it silently removes the fork's capabilities.
 #
-# Targets: `x86_64-unknown-linux-musl` only. That is where this fork is
-# operated, and the musl recipe below (zig, `install-musl-build-tools.sh`, the
-# aws-lc jitter workaround, the pinned rusty_v8 artifacts) is upstream's own —
-# reused rather than reinvented. Adding a target is one matrix entry, but only
-# targets upstream publishes rusty_v8 artifacts for will build.
+# Targets: `x86_64-unknown-linux-musl` and `x86_64-pc-windows-msvc`.
+#
+# Both recipes are upstream's, reused rather than reinvented: the linux side
+# takes zig, `install-musl-build-tools.sh` and the aws-lc jitter workaround from
+# `rust-release.yml`; the Windows side takes `setup-ci` (which provisions a Dev
+# Drive, because Cargo on a hosted Windows runner is I/O-bound),
+# `setup-msvc-env`, and the `LIBSQLITE3_FLAGS` workaround from
+# `rust-release-windows.yml`. What is NOT reused is that workflow's runners: it
+# builds on self-hosted `<repo>-windows-*` machines this fork does not have, so
+# the job below runs on GitHub-hosted `windows-latest` and is given a much
+# larger timeout to match.
+#
+# arm64 is absent on both platforms for the same reason: upstream builds
+# `aarch64-pc-windows-msvc` natively on self-hosted arm64 runners, and a
+# cross-build from a hosted x64 runner is a different recipe that nobody here
+# has exercised. Adding a target is one matrix entry, but only targets upstream
+# publishes rusty_v8 artifacts for will build at all.
 
 on:
   push:
@@ -64,24 +76,36 @@ jobs:
     needs: tag-check
     name: Build - ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 120
+    timeout-minutes: ${{ matrix.timeout_minutes }}
     defaults:
       run:
         working-directory: codex-rs
     strategy:
+      # One platform failing must not destroy the other's artifact: a release
+      # with one of two platforms is still worth inspecting.
       fail-fast: false
       matrix:
         include:
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-musl
+            timeout_minutes: 120
             binaries: "codex codex-code-mode-host codex-responses-api-proxy"
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            # A hosted Windows runner is far slower than the self-hosted
+            # machines upstream builds on, where this takes ~90 minutes.
+            timeout_minutes: 330
+            # The two Windows-only helpers are what the Windows sandbox runs
+            # through; a Windows build without them is not a usable one.
+            binaries: "codex codex-code-mode-host codex-responses-api-proxy codex-windows-sandbox-setup codex-command-runner"
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
 
-      - name: Reclaim runner disk
+      - name: Reclaim runner disk (Linux)
+        if: ${{ runner.os == 'Linux' }}
         shell: bash
         run: |
           df -h /
@@ -90,6 +114,7 @@ jobs:
           df -h /
 
       - name: Install Linux build dependencies
+        if: ${{ runner.os == 'Linux' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -97,12 +122,21 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             binutils pkg-config libcap-dev
 
-      - uses: dtolnay/rust-toolchain@master
+      # Provisions a Dev Drive and redirects CARGO_TARGET_DIR onto it. Every
+      # path below reads CARGO_TARGET_DIR rather than assuming `target/`,
+      # because after this step it is somewhere else entirely.
+      - name: Set up Windows CI build root
+        if: ${{ runner.os == 'Windows' }}
+        uses: ./.github/actions/setup-ci
+
+      # Pinned to the action revision that *is* 1.95.0 — for this action the ref
+      # selects the toolchain, so the pin and the version are the same fact.
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
-          toolchain: "1.95.0"
           targets: ${{ matrix.target }}
 
       - name: Use hermetic Cargo home (musl)
+        if: ${{ runner.os == 'Linux' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -113,17 +147,20 @@ jobs:
           : > "${cargo_home}/config.toml"
 
       - name: Install Zig
+        if: ${{ runner.os == 'Linux' }}
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.14.0
           use-cache: false
 
       - name: Install musl build tools
+        if: ${{ runner.os == 'Linux' }}
         env:
           TARGET: ${{ matrix.target }}
         run: bash "${GITHUB_WORKSPACE}/.github/scripts/install-musl-build-tools.sh"
 
       - name: Disable aws-lc jitter entropy (musl)
+        if: ${{ runner.os == 'Linux' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -137,15 +174,23 @@ jobs:
         with:
           target: ${{ matrix.target }}
 
-      - name: Build bwrap and export digest
+      - name: Configure LLVM linker (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        uses: ./.github/actions/setup-msvc-env
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Build bwrap and export digest (Linux)
+        if: ${{ runner.os == 'Linux' }}
         shell: bash
         env:
           CODEX_FORK_BUILD_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           target="${{ matrix.target }}"
+          release_dir="${CARGO_TARGET_DIR:-target}/${target}/release"
           cargo build --target "$target" --release --bin bwrap
-          bwrap_path="target/${target}/release/bwrap"
+          bwrap_path="${release_dir}/bwrap"
           [[ -f "$bwrap_path" ]] || { echo "bwrap binary ${bwrap_path} not found"; exit 1; }
           # Codex embeds this digest and verifies the bundled bwrap before use,
           # so it has to cover the exact bytes that get packaged: strip first,
@@ -162,18 +207,31 @@ jobs:
           CODEX_FORK_BUILD_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          target="${{ matrix.target }}"
+          if [[ "$target" == "x86_64-pc-windows-msvc" ]]; then
+            export LIBSQLITE3_FLAGS=SQLITE_DISABLE_INTRINSIC
+          fi
           build_args=()
           for binary in ${{ matrix.binaries }}; do
             build_args+=(--bin "$binary")
           done
-          cargo build --target "${{ matrix.target }}" --release "${build_args[@]}"
+          cargo build --target "$target" --release "${build_args[@]}"
 
       - name: Verify the build reports the commit it was built from
         shell: bash
         run: |
           set -euo pipefail
-          codex="target/${{ matrix.target }}/release/codex"
-          reported="$("$codex" fork-manifest --commit)"
+          # `[[ ... ]] && exe=.exe` would abort the whole step under `set -e`
+          # on Linux, where the test is simply false.
+          exe=""
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+            exe=".exe"
+          fi
+          release_dir="${CARGO_TARGET_DIR:-target}/${{ matrix.target }}/release"
+          codex="${release_dir}/codex${exe}"
+          # `tr -d '\r'` because a Windows build's stdout arrives CRLF-terminated
+          # and would never string-compare equal.
+          reported="$("$codex" fork-manifest --commit | tr -d '\r')"
           echo "reported commit: ${reported}"
           # A binary that cannot name its own commit is not a release artifact:
           # the checksum below would then attest bytes nobody can trace back to
@@ -182,27 +240,60 @@ jobs:
             || { echo "❌  binary reports '${reported}', expected '${GITHUB_SHA}'"; exit 1; }
           "$codex" fork-manifest
 
-      - name: Package artifact
+      - name: Stage artifact contents
         shell: bash
         run: |
           set -euo pipefail
           target="${{ matrix.target }}"
-          release_dir="target/${target}/release"
-          stage="dist/codex-${target}"
-          mkdir -p "$stage"
+          exe=""
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+            exe=".exe"
+          fi
+          release_dir="${CARGO_TARGET_DIR:-target}/${target}/release"
+          stage="dist/stage/codex-${target}"
+          rm -rf dist
+          mkdir -p "$stage" dist/artifacts
           for binary in ${{ matrix.binaries }}; do
-            strip --strip-debug --strip-unneeded "${release_dir}/${binary}" || true
-            cp "${release_dir}/${binary}" "${stage}/"
+            src="${release_dir}/${binary}${exe}"
+            [[ -f "$src" ]] || { echo "❌  missing built binary ${src}"; exit 1; }
+            # MSVC keeps debug info in a separate .pdb, so there is nothing for
+            # strip to do — and nothing named `strip` to do it with.
+            if [[ "${RUNNER_OS}" != "Windows" ]]; then
+              strip --strip-debug --strip-unneeded "$src" || true
+            fi
+            cp "$src" "$stage/"
           done
-          cp "${release_dir}/bwrap" "${stage}/"
-          tar -C dist -czf "dist/codex-${target}.tar.gz" "codex-${target}"
-          sha256sum "dist/codex-${target}.tar.gz"
+          # bwrap is the Linux sandbox helper; there is no Windows counterpart.
+          if [[ "${RUNNER_OS}" != "Windows" ]]; then
+            cp "${release_dir}/bwrap" "$stage/"
+          fi
+          ls -l "$stage"
+
+      - name: Package artifact (Linux)
+        if: ${{ runner.os == 'Linux' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          tar -C dist/stage -czf "dist/artifacts/codex-${target}.tar.gz" "codex-${target}"
+          sha256sum "dist/artifacts/codex-${target}.tar.gz"
+
+      - name: Package artifact (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $target = "${{ matrix.target }}"
+          # Compress-Archive rather than tar or 7z: it needs nothing that is not
+          # already on the runner, and .zip is what a Windows user expects.
+          Compress-Archive -Path "dist/stage/codex-$target" -DestinationPath "dist/artifacts/codex-$target.zip"
+          Get-FileHash -Algorithm SHA256 "dist/artifacts/codex-$target.zip" | Format-List
 
       - name: Upload artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: codex-${{ matrix.target }}
-          path: codex-rs/dist/codex-${{ matrix.target }}.tar.gz
+          path: codex-rs/dist/artifacts/*
           if-no-files-found: error
 
   publish:
@@ -229,9 +320,9 @@ jobs:
           # the action version, and getting it wrong the silent way produces an
           # empty SHA256SUMS that `sha256sum -c` still exits 0 on.
           mkdir -p dist
-          find downloads -type f -name '*.tar.gz' -exec cp -t dist -- {} +
+          find downloads -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp -t dist -- {} +
           cd dist
-          artifacts="$(find . -maxdepth 1 -type f -name '*.tar.gz' -printf '%f\n' | LC_ALL=C sort)"
+          artifacts="$(find . -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -printf '%f\n' | LC_ALL=C sort)"
           [[ -n "${artifacts}" ]] \
             || { echo "❌  no build artifacts to checksum"; exit 1; }
           # Sorted so the file is byte-stable across runs that produce the same
@@ -264,4 +355,4 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --title "$TAG" \
             --notes-file release-notes.md \
-            dist/*.tar.gz dist/SHA256SUMS
+            dist/*.tar.gz dist/*.zip dist/SHA256SUMS
