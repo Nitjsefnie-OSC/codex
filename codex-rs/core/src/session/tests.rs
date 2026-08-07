@@ -7479,6 +7479,9 @@ async fn shutdown_complete_does_not_append_to_thread_store_after_shutdown() {
     assert!(session.async_hook_results.is_closed());
     assert!(session.async_hook_results.is_empty());
     assert!(result_sender.is_closed());
+    assert!(session
+        .shutdown_started
+        .load(std::sync::atomic::Ordering::Acquire));
 
     assert_eq!(
         codex_thread_store::InMemoryThreadStoreCalls {

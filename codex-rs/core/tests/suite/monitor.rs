@@ -94,7 +94,7 @@ async fn monitor_output_during_a_turn_is_injected_without_a_duplicate_turn() -> 
         "command": [
             "/bin/sh",
             "-c",
-            "for i in $(seq 1 40); do printf 'active-monitor-output\\n'; done; sleep 30",
+            "i=0; while [ \"$i\" -lt 40 ]; do printf 'active-monitor-output\\n'; i=$((i + 1)); done; sleep 30",
         ],
         "kind": "watcher",
     }))?;
