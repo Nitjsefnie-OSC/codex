@@ -355,6 +355,17 @@ mod tests {
     }
 
     #[test]
+    fn command_input_exposes_an_empty_skill_activation_list() {
+        let request = request_for_tool_use("call-before-skill");
+
+        let input_json = command_input_json(&request).expect("serialize command input");
+        let input: serde_json::Value =
+            serde_json::from_str(&input_json).expect("parse command input");
+
+        assert_eq!(input["skill_activations"], serde_json::json!([]));
+    }
+
+    #[test]
     fn permission_decision_deny_blocks_processing() {
         let parsed = parse_completed(
             &handler(),
