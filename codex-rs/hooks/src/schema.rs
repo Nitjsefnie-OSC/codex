@@ -12,6 +12,7 @@ use serde_json::Value;
 use std::path::Path;
 use std::path::PathBuf;
 
+use crate::background_state::BackgroundState;
 use crate::events::common::SubagentHookContext;
 
 const GENERATED_DIR: &str = "generated";
@@ -585,6 +586,9 @@ pub(crate) struct StopCommandInput {
     pub permission_mode: String,
     pub stop_hook_active: bool,
     pub last_assistant_message: NullableString,
+    /// Codex extension: live monitor and background-terminal state, so a Stop
+    /// hook can refuse a turn that walked away from running work.
+    pub background: BackgroundState,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -606,6 +610,10 @@ pub(crate) struct SubagentStopCommandInput {
     pub agent_id: String,
     pub agent_type: String,
     pub last_assistant_message: NullableString,
+    /// Codex extension: as on `stop.command.input`. A subagent leaving a
+    /// monitor running is the case this exists for — its parent has no other
+    /// way to find out.
+    pub background: BackgroundState,
 }
 
 pub fn write_schema_fixtures(schema_root: &Path) -> anyhow::Result<()> {

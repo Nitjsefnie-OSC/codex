@@ -712,3 +712,72 @@ fn the_spec_advertises_the_tool_name_and_its_control_actions() {
         "`action` defaults to start, so nothing is unconditionally required"
     );
 }
+
+/// A stop hook has to be able to see a watcher the turn left running. This is
+/// the wiring test for that: it drives the real tool, then reads the same
+/// snapshot `run_turn_stop_hooks` puts on the hook's stdin.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_stop_hook_sees_a_watcher_the_turn_left_running() {
+    let harness = harness().await;
+    let started = call(
+        &harness,
+        "monitor-hook-watcher",
+        serde_json::json!({
+            "kind": "watcher",
+            "command": sh("while :; do echo tick; sleep 0.1; done"),
+        }),
+    )
+    .await;
+    let process_id = process_id_of(&started);
+
+    // Give the watcher time to produce output nobody has read.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let background = crate::hook_runtime::background_state_snapshot(&harness.session).await;
+
+    assert!(
+        background.has_running_work(),
+        "a live watcher must read as running work, got {background:?}"
+    );
+    assert_eq!(background.running_monitors, 1);
+    let monitor = background
+        .monitors
+        .iter()
+        .find(|monitor| i64::from(monitor.process_id) == process_id)
+        .unwrap_or_else(|| panic!("the started watcher is in the snapshot, got {background:?}"));
+    assert_eq!(monitor.kind, "watcher");
+    assert_eq!(monitor.state, "running");
+    assert!(monitor.running);
+    assert_eq!(monitor.exit_code, None);
+    assert_eq!(monitor.owner_call_id, "monitor-hook-watcher");
+    assert!(
+        monitor.unacknowledged_notifications > 0,
+        "the watcher produced output nobody read, got {monitor:?}"
+    );
+
+    call(
+        &harness,
+        "monitor-hook-stop",
+        serde_json::json!({ "action": "stop", "process_id": process_id }),
+    )
+    .await;
+    await_terminal(&harness, process_id).await;
+
+    let after_stop = crate::hook_runtime::background_state_snapshot(&harness.session).await;
+    assert_eq!(
+        after_stop.running_monitors, 0,
+        "a stopped watcher must not still read as running work, got {after_stop:?}"
+    );
+    let stopped = after_stop
+        .monitors
+        .iter()
+        .find(|monitor| i64::from(monitor.process_id) == process_id)
+        .unwrap_or_else(|| panic!("the stopped watcher is still listed, got {after_stop:?}"));
+    assert_eq!(stopped.state, "stopped");
+    assert!(!stopped.running);
+    assert!(
+        !after_stop.has_running_work(),
+        "nothing is running any more, got {after_stop:?}"
+    );
+}

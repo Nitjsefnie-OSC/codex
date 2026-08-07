@@ -5,6 +5,9 @@ use std::time::Duration;
 use codex_analytics::CompactionTrigger;
 use codex_analytics::HookRunFact;
 use codex_analytics::build_track_events_context;
+use codex_hooks::BackgroundState;
+use codex_hooks::BackgroundTerminalSnapshot;
+use codex_hooks::MonitorSnapshot;
 use codex_hooks::PermissionRequestDecision;
 use codex_hooks::PermissionRequestOutcome;
 use codex_hooks::PermissionRequestRequest;
@@ -51,6 +54,9 @@ use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::sandboxing::PermissionRequestPayload;
+use crate::unified_exec::MonitorInfo;
+use crate::unified_exec::MonitorKind;
+use crate::unified_exec::MonitorState;
 use crate::user_message_admission::UserMessageAdmissionError;
 
 pub(crate) struct HookRuntimeOutcome {
@@ -360,6 +366,7 @@ pub(crate) async fn run_turn_stop_hooks(
         permission_mode: hook_permission_mode(turn_context),
         stop_hook_active,
         last_assistant_message,
+        background: background_state_snapshot(sess).await,
         target,
     };
     let hooks = sess.hooks();
@@ -368,6 +375,81 @@ pub(crate) async fn run_turn_stop_hooks(
     let mut outcome = hooks.run_stop(request).await;
     emit_hook_completed_events(sess, turn_context, std::mem::take(&mut outcome.hook_events)).await;
     outcome
+}
+
+/// Reads live background work off the process manager for a stop hook.
+///
+/// Taken at the moment the hook fires rather than accumulated during the turn:
+/// a monitor can exit between the last tool call and the stop, and a hook that
+/// blocked on a stale "still running" would be wrong in the direction that
+/// costs the most.
+pub(crate) async fn background_state_snapshot(sess: &Arc<Session>) -> BackgroundState {
+    let monitors: Vec<MonitorSnapshot> = sess
+        .list_monitors()
+        .await
+        .into_iter()
+        .map(monitor_snapshot)
+        .collect();
+    let background_terminals: Vec<BackgroundTerminalSnapshot> = sess
+        .list_background_terminals()
+        .await
+        .into_iter()
+        .map(|terminal| BackgroundTerminalSnapshot {
+            process_id: terminal.process_id,
+            command: terminal.command,
+            // A filesystem path, not the `file://` URI `Display` would give:
+            // a hook shells out with this, and `cwd` on every other hook
+            // payload is a plain path.
+            cwd: terminal.cwd.to_path_buf().display().to_string(),
+        })
+        .collect();
+
+    let running_monitors = monitors.iter().filter(|monitor| monitor.running).count();
+    let unacknowledged_notifications = monitors
+        .iter()
+        .map(|monitor| monitor.unacknowledged_notifications)
+        .sum();
+
+    BackgroundState {
+        running_monitors: u32::try_from(running_monitors).unwrap_or(u32::MAX),
+        running_background_terminals: u32::try_from(background_terminals.len()).unwrap_or(u32::MAX),
+        unacknowledged_notifications,
+        monitors,
+        background_terminals,
+    }
+}
+
+fn monitor_snapshot(info: MonitorInfo) -> MonitorSnapshot {
+    // `state` is flattened into a name plus the one payload that name carries,
+    // so a hook can branch on a string without parsing a tagged union.
+    let (state, exit_code, failure_message) = match info.state {
+        MonitorState::Running => ("running", None, None),
+        MonitorState::Exited { exit_code } => ("exited", Some(exit_code), None),
+        MonitorState::Failed { message } => ("failed", None, Some(message)),
+        MonitorState::Stopped => ("stopped", None, None),
+        MonitorState::TimedOut => ("timed_out", None, None),
+    };
+
+    MonitorSnapshot {
+        process_id: info.process_id,
+        command: info.command,
+        cwd: info.cwd,
+        kind: match info.kind {
+            MonitorKind::Job => "job".to_string(),
+            MonitorKind::Watcher => "watcher".to_string(),
+        },
+        running: state == "running",
+        state: state.to_string(),
+        exit_code,
+        failure_message,
+        age_seconds: info.age_seconds,
+        notifications_delivered: info.notifications_delivered,
+        notifications_suppressed: info.notifications_suppressed,
+        unacknowledged_notifications: info.unacknowledged_notifications,
+        owner_model_slug: info.owner.model_slug,
+        owner_turn_id: info.owner.sub_id,
+        owner_call_id: info.owner.call_id,
+    }
 }
 
 #[instrument(level = "trace", skip_all)]

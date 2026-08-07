@@ -63,6 +63,13 @@ jobs:
           cargo test -p codex-tui --lib update_versions
           cargo test -p codex-cli --bin codex doctor::updates
 
+      - name: stop-hook background state tests
+        # The hooks crate also re-checks the generated JSON schema fixtures
+        # against the structs, so a payload field added without regenerating
+        # them fails here instead of shipping a schema that lies.
+        working-directory: codex-rs
+        run: cargo test -p codex-hooks
+
       - name: monitor tool tests
         # The dev box may not run cargo test, so this is where the monitor's
         # contract is actually executed: notification batching and sequencing,
