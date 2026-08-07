@@ -159,6 +159,7 @@ mod implicit_activation_tests {
     use crate::session::step_context::StepContext;
     use crate::session::tests::make_session_and_context;
     use crate::session::turn_context::TurnContext;
+    use crate::skills::has_pending_skill_activation;
     use crate::skills::promote_pending_skill_activation;
     use crate::skills::retain_pending_skill_activation;
     use crate::skills::skill_activation_snapshot;
@@ -279,7 +280,7 @@ mod implicit_activation_tests {
     async fn write_stdin_implicit_skill_activation_actual_yielded_zero_promotes_requested_id() {
         let mut fixture = implicit_skill_fixture(codex_protocol::protocol::SkillScope::Repo).await;
         configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::Disabled);
-        let command = format!("sleep 1; cat {}", fixture.skill_path.display());
+        let command = format!("sleep 1 ; cat {}", fixture.skill_path.display());
         let session = Arc::new(fixture.session);
         let turn = Arc::new(fixture.turn);
         let process_id = start_yielded_skill_read(
@@ -289,6 +290,7 @@ mod implicit_activation_tests {
             "yielded-zero",
         )
         .await;
+        assert!(has_pending_skill_activation(&turn, process_id));
         assert_eq!(skill_activation_snapshot(&turn), Vec::new());
 
         poll_process_until_terminal(session, Arc::clone(&turn), process_id, "poll-yielded-zero")
@@ -303,10 +305,7 @@ mod implicit_activation_tests {
     async fn write_stdin_implicit_skill_activation_actual_yielded_nonzero_discards_requested_id() {
         let mut fixture = implicit_skill_fixture(codex_protocol::protocol::SkillScope::User).await;
         configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::Disabled);
-        let command = format!(
-            "sleep 1; cat {} /codex-implicit-skill-definitely-missing",
-            fixture.skill_path.display()
-        );
+        let command = format!("sleep 1 ; cat {} ; false", fixture.skill_path.display());
         let session = Arc::new(fixture.session);
         let turn = Arc::new(fixture.turn);
         let process_id = start_yielded_skill_read(
@@ -316,6 +315,7 @@ mod implicit_activation_tests {
             "yielded-nonzero",
         )
         .await;
+        assert!(has_pending_skill_activation(&turn, process_id));
 
         poll_process_until_terminal(
             session,
@@ -333,7 +333,7 @@ mod implicit_activation_tests {
     async fn write_stdin_implicit_skill_activation_actual_cross_turn_poll_cannot_promote() {
         let mut fixture = implicit_skill_fixture(codex_protocol::protocol::SkillScope::Repo).await;
         configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::Disabled);
-        let command = format!("sleep 1; cat {}", fixture.skill_path.display());
+        let command = format!("sleep 1 ; cat {}", fixture.skill_path.display());
         let session = Arc::new(fixture.session);
         let turn_a = Arc::new(fixture.turn);
         let process_id = start_yielded_skill_read(
@@ -343,6 +343,7 @@ mod implicit_activation_tests {
             "yielded-cross-turn",
         )
         .await;
+        assert!(has_pending_skill_activation(&turn_a, process_id));
         let (_unused_session, turn_b) = make_session_and_context().await;
         let turn_b = Arc::new(turn_b);
 

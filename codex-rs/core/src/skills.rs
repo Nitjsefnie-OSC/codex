@@ -96,6 +96,14 @@ pub(crate) fn discard_pending_skill_activation(
         .is_some()
 }
 
+#[cfg(test)]
+pub(crate) fn has_pending_skill_activation(turn_context: &TurnContext, process_id: i32) -> bool {
+    skill_activation_state(turn_context)
+        .lock()
+        .pending_by_process_id
+        .contains_key(&process_id)
+}
+
 fn skill_activation_state(turn_context: &TurnContext) -> std::sync::Arc<SkillActivations> {
     turn_context
         .extension_data
