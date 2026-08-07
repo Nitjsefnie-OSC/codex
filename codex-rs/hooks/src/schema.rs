@@ -1125,6 +1125,43 @@ mod tests {
     }
 
     #[test]
+    fn tool_hook_schemas_require_typed_skill_activation_arrays() {
+        let schemas = [
+            schema_json::<PreToolUseCommandInput>().expect("serialize pre tool use input schema"),
+            schema_json::<PostToolUseCommandInput>()
+                .expect("serialize post tool use input schema"),
+        ];
+
+        for schema in schemas {
+            let schema: Value = serde_json::from_slice(&schema).expect("parse hook input schema");
+            assert_eq!(
+                schema["properties"]["skill_activations"],
+                json!({
+                    "items": { "$ref": "#/definitions/SkillActivation" },
+                    "type": "array",
+                })
+            );
+            assert!(
+                schema["required"]
+                    .as_array()
+                    .expect("schema required fields")
+                    .contains(&Value::String("skill_activations".to_string()))
+            );
+            assert_eq!(
+                schema["definitions"]["SkillActivation"]["required"],
+                json!([
+                    "content_sha256",
+                    "invocation",
+                    "name",
+                    "path",
+                    "scope",
+                    "turn_id",
+                ])
+            );
+        }
+    }
+
+    #[test]
     fn subagent_context_fields_are_optional_for_hooks_that_run_inside_subagents() {
         let schemas = [
             schema_json::<PreToolUseCommandInput>().expect("serialize pre tool use input schema"),
