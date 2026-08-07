@@ -2384,6 +2384,7 @@ dependencies = [
  "codex-execpolicy",
  "codex-extension-api",
  "codex-features",
+ "codex-fork-manifest",
  "codex-git-attribution",
  "codex-git-utils",
  "codex-home",
@@ -3207,6 +3208,15 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "codex-fork-manifest"
+version = "0.0.0"
+dependencies = [
+ "pretty_assertions",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -4295,6 +4305,7 @@ dependencies = [
  "codex-features",
  "codex-feedback",
  "codex-file-search",
+ "codex-fork-manifest",
  "codex-git-utils",
  "codex-http-client",
  "codex-install-context",

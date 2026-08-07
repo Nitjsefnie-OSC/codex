@@ -45,6 +45,14 @@ jobs:
             --exclude codex-code-mode-host
           df -h /
 
+      - name: fork manifest tests
+        # Cheap and load-bearing: the manifest is what tells an installer which
+        # capabilities this build has and which release channel is safe to pull
+        # from, so a manifest that stops parsing — or one whose update channel
+        # drifts back to upstream — has to fail here rather than in the field.
+        working-directory: codex-rs
+        run: cargo test -p codex-fork-manifest
+
       - name: monitor tool tests
         # The dev box may not run cargo test, so this is where the monitor's
         # contract is actually executed: notification batching and sequencing,
