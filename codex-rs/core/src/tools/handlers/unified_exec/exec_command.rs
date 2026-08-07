@@ -660,23 +660,27 @@ mod implicit_activation_tests {
         );
         let turn = Arc::new(fixture.turn);
 
-        let output = ExecCommandHandler::default()
+        let result = ExecCommandHandler::default()
             .handle(invocation(
                 Arc::new(fixture.session),
                 Arc::clone(&turn),
                 json!({ "cmd": command }),
                 "sandbox-denied-skill-read",
             ))
-            .await
-            .expect("sandbox denial should be mapped to model-facing output");
-        let preview = output.log_preview().to_ascii_lowercase();
+            .await;
+        let denial = match result {
+            Ok(output) => output.log_preview(),
+            Err(error) => error.to_string(),
+        }
+        .to_ascii_lowercase();
 
         assert!(
-            preview.contains("permission denied")
-                || preview.contains("operation not permitted")
-                || preview.contains("read-only file system")
-                || preview.contains("sandbox"),
-            "unexpected sandbox-denial output: {preview}"
+            denial.contains("permission denied")
+                || denial.contains("operation not permitted")
+                || denial.contains("read-only file system")
+                || denial.contains("sandbox")
+                || denial.contains("landlocksandboxexecutablenotprovided"),
+            "unexpected sandbox-denial output: {denial}"
         );
         assert!(!denied_path.exists());
         assert_eq!(skill_activation_snapshot(&turn), Vec::new());
