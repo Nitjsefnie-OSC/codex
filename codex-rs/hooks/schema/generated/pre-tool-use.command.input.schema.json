@@ -12,21 +12,30 @@
       "additionalProperties": false,
       "properties": {
         "content_sha256": {
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$",
           "type": "string"
         },
         "invocation": {
           "$ref": "#/definitions/SkillActivationKind"
         },
         "name": {
+          "minLength": 1,
+          "pattern": ".*\\S.*",
           "type": "string"
         },
         "path": {
+          "minLength": 1,
+          "pattern": ".*\\S.*",
           "type": "string"
         },
         "scope": {
           "$ref": "#/definitions/SkillActivationScope"
         },
         "turn_id": {
+          "minLength": 1,
+          "pattern": ".*\\S.*",
           "type": "string"
         }
       },
