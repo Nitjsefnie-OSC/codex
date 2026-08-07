@@ -144,19 +144,31 @@ impl CoreToolRuntime for WriteStdinHandler {
 
 #[cfg(test)]
 mod implicit_activation_tests {
+    use std::sync::Arc;
+
     use codex_hooks::SkillActivation;
     use codex_hooks::SkillActivationKind;
     use codex_hooks::SkillActivationScope;
     use codex_utils_output_truncation::TruncationPolicy;
     use pretty_assertions::assert_eq;
+    use serde_json::json;
+    use tokio::sync::Mutex;
 
     use super::*;
+    use crate::session::step_context::StepContext;
     use crate::session::tests::make_session_and_context;
+    use crate::session::turn_context::TurnContext;
     use crate::skills::promote_pending_skill_activation;
     use crate::skills::retain_pending_skill_activation;
     use crate::skills::skill_activation_snapshot;
+    use crate::skills::tests::implicit_skill_fixture;
     use crate::tools::context::ExecCommandToolOutput;
+    use crate::tools::context::ToolCallSource;
+    use crate::tools::registry::ToolExecutor;
+    use crate::turn_diff_tracker::TurnDiffTracker;
     use crate::unified_exec::UnifiedExecError;
+
+    use super::super::ExecCommandHandler;
 
     fn activation() -> SkillActivation {
         SkillActivation::new(
@@ -184,6 +196,154 @@ mod implicit_activation_tests {
             output_omitted_bytes: None,
             hook_command: Some("cat SKILL.md".to_string()),
         }
+    }
+
+    fn invocation(
+        session: Arc<crate::session::session::Session>,
+        turn: Arc<TurnContext>,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        call_id: &str,
+    ) -> ToolInvocation {
+        ToolInvocation {
+            session,
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn,
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: call_id.to_string(),
+            tool_name: ToolName::plain(tool_name),
+            source: ToolCallSource::Direct,
+            payload: ToolPayload::Function {
+                arguments: arguments.to_string(),
+            },
+        }
+    }
+
+    async fn start_yielded_skill_read(
+        session: Arc<crate::session::session::Session>,
+        turn: Arc<TurnContext>,
+        command: String,
+        call_id: &str,
+    ) -> i32 {
+        let output = ExecCommandHandler::default()
+            .handle(invocation(
+                session,
+                turn,
+                "exec_command",
+                json!({ "cmd": command, "yield_time_ms": 250 }),
+                call_id,
+            ))
+            .await
+            .expect("long-running skill read should yield");
+        output
+            .code_mode_result(&ToolPayload::Function {
+                arguments: String::new(),
+            })
+            .get("session_id")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|id| i32::try_from(id).ok())
+            .expect("yielded command should return a session id")
+    }
+
+    async fn poll_process_until_terminal(
+        session: Arc<crate::session::session::Session>,
+        turn: Arc<TurnContext>,
+        process_id: i32,
+        call_id: &str,
+    ) {
+        for attempt in 0..20 {
+            let output = WriteStdinHandler
+                .handle(invocation(
+                    Arc::clone(&session),
+                    Arc::clone(&turn),
+                    "write_stdin",
+                    json!({ "session_id": process_id, "yield_time_ms": 250 }),
+                    &format!("{call_id}-{attempt}"),
+                ))
+                .await
+                .expect("polling yielded process should succeed");
+            let result = output.code_mode_result(&ToolPayload::Function {
+                arguments: String::new(),
+            });
+            if result.get("session_id").is_none() {
+                return;
+            }
+        }
+        panic!("yielded process {process_id} did not terminate after repeated polls");
+    }
+
+    #[tokio::test]
+    async fn write_stdin_implicit_skill_activation_actual_yielded_zero_promotes_requested_id() {
+        let fixture = implicit_skill_fixture(codex_protocol::protocol::SkillScope::Repo).await;
+        let command = format!("cat {}; sleep 1; exit 0", fixture.skill_path.display());
+        let session = Arc::new(fixture.session);
+        let turn = Arc::new(fixture.turn);
+        let process_id = start_yielded_skill_read(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            command,
+            "yielded-zero",
+        )
+        .await;
+        assert_eq!(skill_activation_snapshot(&turn), Vec::new());
+
+        poll_process_until_terminal(session, Arc::clone(&turn), process_id, "poll-yielded-zero")
+            .await;
+
+        let activations = skill_activation_snapshot(&turn);
+        assert_eq!(activations.len(), 1);
+        assert_eq!(activations[0].name(), "audit-skill");
+    }
+
+    #[tokio::test]
+    async fn write_stdin_implicit_skill_activation_actual_yielded_nonzero_discards_requested_id() {
+        let fixture = implicit_skill_fixture(codex_protocol::protocol::SkillScope::User).await;
+        let command = format!("cat {}; sleep 1; exit 6", fixture.skill_path.display());
+        let session = Arc::new(fixture.session);
+        let turn = Arc::new(fixture.turn);
+        let process_id = start_yielded_skill_read(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            command,
+            "yielded-nonzero",
+        )
+        .await;
+
+        poll_process_until_terminal(
+            session,
+            Arc::clone(&turn),
+            process_id,
+            "poll-yielded-nonzero",
+        )
+        .await;
+
+        assert_eq!(skill_activation_snapshot(&turn), Vec::new());
+        assert!(!promote_pending_skill_activation(&turn, process_id));
+    }
+
+    #[tokio::test]
+    async fn write_stdin_implicit_skill_activation_actual_cross_turn_poll_cannot_promote() {
+        let fixture = implicit_skill_fixture(codex_protocol::protocol::SkillScope::Repo).await;
+        let command = format!("cat {}; sleep 1; exit 0", fixture.skill_path.display());
+        let session = Arc::new(fixture.session);
+        let turn_a = Arc::new(fixture.turn);
+        let process_id = start_yielded_skill_read(
+            Arc::clone(&session),
+            Arc::clone(&turn_a),
+            command,
+            "yielded-cross-turn",
+        )
+        .await;
+        let (_unused_session, turn_b) = make_session_and_context().await;
+        let turn_b = Arc::new(turn_b);
+
+        poll_process_until_terminal(session, Arc::clone(&turn_b), process_id, "poll-cross-turn")
+            .await;
+
+        assert_eq!(skill_activation_snapshot(&turn_a), Vec::new());
+        assert_eq!(skill_activation_snapshot(&turn_b), Vec::new());
+        assert!(promote_pending_skill_activation(&turn_a, process_id));
     }
 
     #[tokio::test]

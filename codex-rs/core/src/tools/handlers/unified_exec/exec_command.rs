@@ -501,17 +501,28 @@ fn emit_unified_exec_tty_metric(session_telemetry: &SessionTelemetry, tty: bool)
 
 #[cfg(test)]
 mod implicit_activation_tests {
+    use std::sync::Arc;
+
     use codex_hooks::SkillActivation;
     use codex_hooks::SkillActivationKind;
     use codex_hooks::SkillActivationScope;
     use codex_protocol::exec_output::ExecToolCallOutput;
+    use codex_protocol::models::PermissionProfile;
     use codex_utils_output_truncation::TruncationPolicy;
     use pretty_assertions::assert_eq;
+    use serde_json::json;
+    use tokio::sync::Mutex;
 
     use super::*;
+    use crate::config::PermissionProfileSnapshot;
+    use crate::environment_selection::TurnEnvironmentState;
+    use crate::session::step_context::StepContext;
     use crate::session::tests::make_session_and_context;
     use crate::skills::promote_pending_skill_activation;
     use crate::skills::skill_activation_snapshot;
+    use crate::skills::tests::implicit_skill_fixture;
+    use crate::tools::context::ToolCallSource;
+    use crate::turn_diff_tracker::TurnDiffTracker;
 
     fn activation(name: &str, digest: char) -> SkillActivation {
         SkillActivation::new(
@@ -539,6 +550,155 @@ mod implicit_activation_tests {
             output_omitted_bytes: None,
             hook_command: Some("cat SKILL.md".to_string()),
         }
+    }
+
+    fn invocation(
+        session: Arc<crate::session::session::Session>,
+        turn: Arc<TurnContext>,
+        arguments: serde_json::Value,
+        call_id: &str,
+    ) -> ToolInvocation {
+        ToolInvocation {
+            session,
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn,
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: call_id.to_string(),
+            tool_name: ToolName::plain("exec_command"),
+            source: ToolCallSource::Direct,
+            payload: ToolPayload::Function {
+                arguments: arguments.to_string(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn unified_exec_implicit_skill_activation_actual_nonzero_does_not_record() {
+        let fixture = implicit_skill_fixture(codex_protocol::protocol::SkillScope::Repo).await;
+        let command = format!("cat {}; exit 7", fixture.skill_path.display());
+        let turn = Arc::new(fixture.turn);
+
+        ExecCommandHandler::default()
+            .handle(invocation(
+                Arc::new(fixture.session),
+                Arc::clone(&turn),
+                json!({ "cmd": command }),
+                "failed-skill-read",
+            ))
+            .await
+            .expect("nonzero command should return structured output");
+
+        assert_eq!(skill_activation_snapshot(&turn), Vec::new());
+    }
+
+    #[tokio::test]
+    async fn unified_exec_implicit_skill_activation_actual_rewritten_terminal_zero_records() {
+        let fixture = implicit_skill_fixture(codex_protocol::protocol::SkillScope::Admin).await;
+        let rewritten_command = format!("cat {}", fixture.skill_path.display());
+        let turn = Arc::new(fixture.turn);
+        let handler = ExecCommandHandler::default();
+        let original = invocation(
+            Arc::new(fixture.session),
+            Arc::clone(&turn),
+            json!({ "cmd": "exit 99" }),
+            "rewritten-skill-read",
+        );
+        let rewritten = handler
+            .with_updated_hook_input(original, json!({ "command": rewritten_command }))
+            .expect("rewrite exec_command input");
+
+        handler
+            .handle(rewritten)
+            .await
+            .expect("rewritten command should execute successfully");
+
+        let activations = skill_activation_snapshot(&turn);
+        assert_eq!(activations.len(), 1);
+        assert_eq!(activations[0].name(), "audit-skill");
+        assert_eq!(activations[0].scope(), SkillActivationScope::Admin);
+    }
+
+    #[tokio::test]
+    async fn unified_exec_implicit_skill_activation_actual_escalation_rejection_does_not_record() {
+        let fixture = implicit_skill_fixture(codex_protocol::protocol::SkillScope::System).await;
+        let command = format!("cat {}", fixture.skill_path.display());
+        let mut turn = fixture.turn;
+        let mut config = (*turn.config).clone();
+        config.permissions.approval_policy =
+            codex_config::Constrained::allow_any(codex_protocol::protocol::AskForApproval::Never);
+        turn.config = Arc::new(config);
+        let turn = Arc::new(turn);
+
+        let Err(error) = ExecCommandHandler::default()
+            .handle(invocation(
+                Arc::new(fixture.session),
+                Arc::clone(&turn),
+                json!({
+                    "cmd": command,
+                    "sandbox_permissions": "require_escalated",
+                    "justification": "exercise approval rejection"
+                }),
+                "denied-skill-read",
+            ))
+            .await
+        else {
+            panic!("Never policy must reject explicit escalation");
+        };
+
+        assert!(error.to_string().contains("approval policy is Never"));
+        assert_eq!(skill_activation_snapshot(&turn), Vec::new());
+    }
+
+    #[tokio::test]
+    async fn unified_exec_implicit_skill_activation_actual_sandbox_denial_does_not_record() {
+        let fixture = implicit_skill_fixture(codex_protocol::protocol::SkillScope::Repo).await;
+        let denied_path = fixture.workdir.join("sandbox-denied.txt");
+        let command = format!(
+            "cat {}; printf denied > {}",
+            fixture.skill_path.display(),
+            denied_path.display()
+        );
+        let mut turn = fixture.turn;
+        let mut config = (*turn.config).clone();
+        config
+            .permissions
+            .set_permission_profile(PermissionProfile::read_only())
+            .expect("set read-only permission profile");
+        config.permissions.approval_policy =
+            codex_config::Constrained::allow_any(codex_protocol::protocol::AskForApproval::Never);
+        turn.config = Arc::new(config);
+        let TurnEnvironmentState::Ready(environment) = turn
+            .environments
+            .environments
+            .first_mut()
+            .expect("test session should have a primary environment")
+        else {
+            panic!("test session primary environment should be ready");
+        };
+        environment.config.permission_profile =
+            PermissionProfileSnapshot::legacy(PermissionProfile::read_only());
+        let turn = Arc::new(turn);
+
+        let output = ExecCommandHandler::default()
+            .handle(invocation(
+                Arc::new(fixture.session),
+                Arc::clone(&turn),
+                json!({ "cmd": command }),
+                "sandbox-denied-skill-read",
+            ))
+            .await
+            .expect("sandbox denial should be mapped to model-facing output");
+        let preview = output.log_preview().to_ascii_lowercase();
+
+        assert!(
+            preview.contains("permission denied")
+                || preview.contains("operation not permitted")
+                || preview.contains("sandbox"),
+            "unexpected sandbox-denial output: {preview}"
+        );
+        assert!(!denied_path.exists());
+        assert_eq!(skill_activation_snapshot(&turn), Vec::new());
     }
 
     #[tokio::test]

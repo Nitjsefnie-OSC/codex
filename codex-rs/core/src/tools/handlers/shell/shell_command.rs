@@ -301,19 +301,18 @@ mod tests {
     use std::sync::Arc;
 
     use codex_protocol::protocol::SkillScope;
-    use pretty_assertions::assert_eq;
     use serde_json::json;
     use tokio::sync::Mutex;
 
     use super::*;
     use crate::session::step_context::StepContext;
-    use crate::skills::prepare_implicit_skill_activation;
+    use crate::skills::skill_activation_snapshot;
     use crate::skills::tests::implicit_skill_fixture;
     use crate::tools::context::ToolCallSource;
     use crate::turn_diff_tracker::TurnDiffTracker;
 
     #[tokio::test]
-    async fn implicit_skill_activation_candidate_uses_rewritten_pre_tool_command() {
+    async fn classic_shell_implicit_skill_activation_uses_rewritten_pre_tool_command() {
         let fixture = implicit_skill_fixture(SkillScope::Admin).await;
         let turn = Arc::new(fixture.turn);
         let handler = ShellCommandHandler::from(ShellCommandBackendConfig::Classic);
@@ -334,22 +333,17 @@ mod tests {
         let rewritten = handler
             .with_updated_hook_input(original, json!({ "command": rewritten_command }))
             .expect("rewrite tool input");
-        let ToolPayload::Function { arguments } = rewritten.payload else {
-            panic!("expected function payload");
-        };
-        let params: ShellCommandToolCallParams =
-            parse_arguments_with_base_path(&arguments, &fixture.workdir)
-                .expect("parse rewritten arguments");
+        handler
+            .handle(rewritten)
+            .await
+            .expect("rewritten command should execute successfully");
 
-        let candidate = prepare_implicit_skill_activation(
-            rewritten.session.as_ref(),
-            turn.as_ref(),
-            &params.command,
-            &fixture.workdir,
-        )
-        .await
-        .expect("rewritten read should be recognized");
-        assert_eq!(candidate.name(), "audit-skill");
-        assert_eq!(candidate.scope(), codex_hooks::SkillActivationScope::Admin);
+        let activations = skill_activation_snapshot(&turn);
+        assert_eq!(activations.len(), 1);
+        assert_eq!(activations[0].name(), "audit-skill");
+        assert_eq!(
+            activations[0].scope(),
+            codex_hooks::SkillActivationScope::Admin
+        );
     }
 }
