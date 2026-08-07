@@ -279,7 +279,7 @@ mod implicit_activation_tests {
     async fn write_stdin_implicit_skill_activation_actual_yielded_zero_promotes_requested_id() {
         let mut fixture = implicit_skill_fixture(codex_protocol::protocol::SkillScope::Repo).await;
         configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::Disabled);
-        let command = format!("cat {}; sleep 1; exit 0", fixture.skill_path.display());
+        let command = format!("sleep 1; cat {}", fixture.skill_path.display());
         let session = Arc::new(fixture.session);
         let turn = Arc::new(fixture.turn);
         let process_id = start_yielded_skill_read(
@@ -303,7 +303,10 @@ mod implicit_activation_tests {
     async fn write_stdin_implicit_skill_activation_actual_yielded_nonzero_discards_requested_id() {
         let mut fixture = implicit_skill_fixture(codex_protocol::protocol::SkillScope::User).await;
         configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::Disabled);
-        let command = format!("cat {}; sleep 1; exit 6", fixture.skill_path.display());
+        let command = format!(
+            "sleep 1; cat {} /codex-implicit-skill-definitely-missing",
+            fixture.skill_path.display()
+        );
         let session = Arc::new(fixture.session);
         let turn = Arc::new(fixture.turn);
         let process_id = start_yielded_skill_read(
@@ -330,7 +333,7 @@ mod implicit_activation_tests {
     async fn write_stdin_implicit_skill_activation_actual_cross_turn_poll_cannot_promote() {
         let mut fixture = implicit_skill_fixture(codex_protocol::protocol::SkillScope::Repo).await;
         configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::Disabled);
-        let command = format!("cat {}; sleep 1; exit 0", fixture.skill_path.display());
+        let command = format!("sleep 1; cat {}", fixture.skill_path.display());
         let session = Arc::new(fixture.session);
         let turn_a = Arc::new(fixture.turn);
         let process_id = start_yielded_skill_read(
