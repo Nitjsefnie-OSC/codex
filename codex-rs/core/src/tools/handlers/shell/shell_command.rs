@@ -200,7 +200,7 @@ impl ShellCommandHandler {
         })?;
         let cwd = resolve_workdir_base_path(&arguments, &environment_cwd)?;
         let params: ShellCommandToolCallParams = parse_arguments_with_base_path(&arguments, &cwd)?;
-        maybe_emit_implicit_skill_invocation(
+        let implicit_skill_activation = maybe_emit_implicit_skill_invocation(
             session.as_ref(),
             turn.as_ref(),
             &params.command,
@@ -235,6 +235,7 @@ impl ShellCommandHandler {
             tracker,
             call_id,
             shell_runtime_backend: self.shell_runtime_backend(),
+            implicit_skill_activation,
         })
         .await
         .map(boxed_tool_output)

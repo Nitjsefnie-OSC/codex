@@ -7,6 +7,7 @@ use codex_hooks::SkillActivationScope;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::ShellCommandToolCallParams;
+use codex_protocol::protocol::SkillScope;
 use pretty_assertions::assert_eq;
 
 use crate::config::PermissionProfileSnapshot;
@@ -20,7 +21,9 @@ use crate::session::turn_context::EnvironmentConfig;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::Shell;
 use crate::shell::ShellType;
+use crate::skills::prepare_implicit_skill_activation;
 use crate::skills::skill_activation_snapshot;
+use crate::skills::tests::implicit_skill_fixture;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
@@ -370,21 +373,47 @@ async fn build_post_tool_use_payload_uses_tool_output_wire_value() {
 
 #[tokio::test]
 async fn classic_shell_implicit_skill_activation_records_only_structured_exit_zero() {
-    let (_session, turn) = make_session_and_context().await;
-    let succeeded = implicit_activation("succeeded", 'a');
-    let failed = implicit_activation("failed", 'b');
-    let denied = implicit_activation("denied", 'c');
+    let fixture = implicit_skill_fixture(SkillScope::Repo).await;
+    let command = format!("cat {}", fixture.skill_path.display());
+    let succeeded = prepare_implicit_skill_activation(
+        &fixture.session,
+        &fixture.turn,
+        &command,
+        &fixture.workdir,
+    )
+    .await
+    .expect("successful recognized read candidate");
+    let failed = prepare_implicit_skill_activation(
+        &fixture.session,
+        &fixture.turn,
+        &command,
+        &fixture.workdir,
+    )
+    .await
+    .expect("nonzero recognized read candidate");
+    let denied = prepare_implicit_skill_activation(
+        &fixture.session,
+        &fixture.turn,
+        &command,
+        &fixture.workdir,
+    )
+    .await
+    .expect("sandbox-denied recognized read candidate");
     let success_output = ExecToolCallOutput::default();
     let mut failure_output = ExecToolCallOutput::default();
     failure_output.exit_code = 9;
 
     settle_classic_shell_implicit_skill_activation(
-        &turn,
+        &fixture.turn,
         Some(succeeded.clone()),
         Some(&success_output),
     );
-    settle_classic_shell_implicit_skill_activation(&turn, Some(failed), Some(&failure_output));
-    settle_classic_shell_implicit_skill_activation(&turn, Some(denied), None);
+    settle_classic_shell_implicit_skill_activation(
+        &fixture.turn,
+        Some(failed),
+        Some(&failure_output),
+    );
+    settle_classic_shell_implicit_skill_activation(&fixture.turn, Some(denied), None);
 
-    assert_eq!(skill_activation_snapshot(&turn), vec![succeeded]);
+    assert_eq!(skill_activation_snapshot(&fixture.turn), vec![succeeded]);
 }

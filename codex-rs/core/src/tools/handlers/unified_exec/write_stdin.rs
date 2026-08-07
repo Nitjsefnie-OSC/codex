@@ -1,4 +1,8 @@
 use crate::function_tool::FunctionCallError;
+use crate::session::turn_context::TurnContext;
+use crate::skills::discard_pending_skill_activation;
+use crate::skills::promote_pending_skill_activation;
+use crate::tools::context::ExecCommandToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
@@ -7,6 +11,7 @@ use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::PostToolUsePayload;
 use crate::tools::registry::PreToolUsePayload;
 use crate::tools::registry::ToolExecutor;
+use crate::unified_exec::UnifiedExecError;
 use crate::unified_exec::WriteStdinInteractionEvent;
 use crate::unified_exec::WriteStdinRequest;
 use codex_tools::ToolName;
@@ -70,7 +75,7 @@ impl WriteStdinHandler {
         };
 
         let args: WriteStdinArgs = parse_arguments(&arguments)?;
-        let response = session
+        let result = session
             .services
             .unified_exec_manager
             .write_stdin(WriteStdinRequest {
@@ -84,12 +89,33 @@ impl WriteStdinHandler {
                     turn: &turn,
                 }),
             })
-            .await
-            .map_err(|err| {
-                FunctionCallError::RespondToModel(format!("write_stdin failed: {err}"))
-            })?;
+            .await;
+        settle_write_stdin_implicit_skill_activation(&turn, args.session_id, result.as_ref());
+        let response = result.map_err(|err| {
+            FunctionCallError::RespondToModel(format!("write_stdin failed: {err}"))
+        })?;
 
         Ok(boxed_tool_output(response))
+    }
+}
+
+fn settle_write_stdin_implicit_skill_activation(
+    turn: &TurnContext,
+    requested_process_id: i32,
+    result: Result<&ExecCommandToolOutput, &UnifiedExecError>,
+) {
+    match result {
+        Ok(response) if response.process_id.is_some() => {}
+        Ok(response) if response.exit_code == Some(0) => {
+            promote_pending_skill_activation(turn, requested_process_id);
+        }
+        Ok(_) => {
+            discard_pending_skill_activation(turn, requested_process_id);
+        }
+        Err(UnifiedExecError::UnknownProcessId { .. } | UnifiedExecError::ProcessFailed { .. }) => {
+            discard_pending_skill_activation(turn, requested_process_id);
+        }
+        Err(_) => {}
     }
 }
 

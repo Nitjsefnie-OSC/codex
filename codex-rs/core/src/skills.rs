@@ -8,6 +8,8 @@ use codex_analytics::build_track_events_context;
 use codex_extension_api::SkillInvocationInput;
 use codex_extension_api::SkillInvocationKind;
 use codex_hooks::SkillActivation;
+use codex_hooks::SkillActivationKind;
+use codex_hooks::SkillActivationScope;
 use codex_otel::sanitize_metric_tag_value;
 use codex_protocol::protocol::SkillScope;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -163,19 +165,69 @@ pub(crate) fn emit_explicit_skill_invocations(
         .track_skill_invocations(tracking, invocations);
 }
 
-pub(crate) async fn maybe_emit_implicit_skill_invocation(
+pub(crate) async fn prepare_implicit_skill_activation(
     sess: &Session,
     turn_context: &TurnContext,
     command: &str,
     workdir: &AbsolutePathBuf,
-) {
+) -> Option<SkillActivation> {
     let Some(candidate) = detect_implicit_skill_invocation_for_command(
         turn_context.skills_snapshot().outcome(),
         command,
         workdir,
     ) else {
-        return;
+        return None;
     };
+
+    // Candidate creation is intentionally independent of analytics deduplication. A later read of
+    // an edited SKILL.md must produce its new digest even when this skill's invocation telemetry
+    // was already emitted for the turn.
+    let activation = build_implicit_skill_activation(turn_context, &candidate).await;
+    emit_implicit_skill_invocation(sess, turn_context, candidate).await;
+    activation
+}
+
+pub(crate) async fn maybe_emit_implicit_skill_invocation(
+    sess: &Session,
+    turn_context: &TurnContext,
+    command: &str,
+    workdir: &AbsolutePathBuf,
+) -> Option<SkillActivation> {
+    prepare_implicit_skill_activation(sess, turn_context, command, workdir).await
+}
+
+async fn build_implicit_skill_activation(
+    turn_context: &TurnContext,
+    candidate: &SkillMetadata,
+) -> Option<SkillActivation> {
+    let contents = turn_context
+        .skills_snapshot()
+        .outcome()
+        .read_skill_text(candidate)
+        .await
+        .ok()?;
+    let scope = match candidate.scope {
+        SkillScope::User => SkillActivationScope::User,
+        SkillScope::Repo => SkillActivationScope::Repo,
+        SkillScope::System => SkillActivationScope::System,
+        SkillScope::Admin => SkillActivationScope::Admin,
+    };
+    SkillActivation::new(
+        candidate.name.clone(),
+        candidate.path_to_skills_md.to_string_lossy().into_owned(),
+        scope,
+        SkillActivationKind::Implicit,
+        turn_context.sub_id.clone(),
+        codex_skills_extension::sha256_hex(&contents),
+    )
+    .ok()
+}
+
+async fn emit_implicit_skill_invocation(
+    sess: &Session,
+    turn_context: &TurnContext,
+    candidate: SkillMetadata,
+) {
     let invocation = SkillInvocation {
         skill_name: candidate.name,
         skill_scope: candidate.scope,

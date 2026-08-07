@@ -3,6 +3,9 @@ use std::sync::Arc;
 
 use crate::function_tool::FunctionCallError;
 use crate::maybe_emit_implicit_skill_invocation;
+use crate::session::turn_context::TurnContext;
+use crate::skills::record_skill_activation;
+use crate::skills::retain_pending_skill_activation;
 use crate::tools::context::ExecCommandToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
@@ -28,6 +31,7 @@ use crate::unified_exec::UnifiedExecError;
 use crate::unified_exec::UnifiedExecProcessManager;
 use crate::unified_exec::generate_chunk_id;
 use codex_features::Feature;
+use codex_hooks::SkillActivation;
 use codex_otel::SessionTelemetry;
 use codex_otel::TOOL_CALL_UNIFIED_EXEC_METRIC;
 use codex_sandboxing::SandboxManager;
@@ -191,15 +195,17 @@ impl ExecCommandHandler {
             resolve_sandbox_permissions(args.sandbox_permissions, args.justification.as_deref())?;
         let hook_command = args.cmd.clone();
         // TODO(anp) wire PathUri through implicit skills instead of skipping on foreign paths
-        if let Some(native_cwd) = native_cwd.as_ref() {
+        let implicit_skill_activation = if let Some(native_cwd) = native_cwd.as_ref() {
             maybe_emit_implicit_skill_invocation(
                 session.as_ref(),
                 context.turn.as_ref(),
                 &hook_command,
                 native_cwd,
             )
-            .await;
-        }
+            .await
+        } else {
+            None
+        };
         let shell_mode =
             shell_mode_for_environment(&turn.unified_exec_shell_mode, environment.as_ref());
         // Remote environments may use a different OS and must build commands with their native
@@ -358,7 +364,7 @@ impl ExecCommandHandler {
         }
 
         emit_unified_exec_tty_metric(&turn.session_telemetry, tty);
-        match manager
+        let result = manager
             .exec_command(
                 ExecCommandRequest {
                     command,
@@ -382,8 +388,13 @@ impl ExecCommandHandler {
                 },
                 &context,
             )
-            .await
-        {
+            .await;
+        settle_unified_exec_implicit_skill_activation(
+            context.turn.as_ref(),
+            implicit_skill_activation,
+            result.as_ref(),
+        );
+        match result {
             Ok(response) => Ok(boxed_tool_output(response)),
             Err(UnifiedExecError::SandboxDenied {
                 output,
@@ -414,6 +425,21 @@ impl ExecCommandHandler {
                 "exec_command failed for `{command_for_display}`: {err:?}"
             ))),
         }
+    }
+}
+
+fn settle_unified_exec_implicit_skill_activation(
+    turn: &TurnContext,
+    candidate: Option<SkillActivation>,
+    result: Result<&ExecCommandToolOutput, &UnifiedExecError>,
+) {
+    let (Some(candidate), Ok(response)) = (candidate, result) else {
+        return;
+    };
+    if let Some(process_id) = response.process_id {
+        retain_pending_skill_activation(turn, process_id, candidate);
+    } else if response.exit_code == Some(0) {
+        record_skill_activation(turn, candidate);
     }
 }
 

@@ -109,6 +109,6 @@ impl HostSkillsSnapshot {
     }
 }
 
-fn sha256_hex(contents: &str) -> String {
+pub fn sha256_hex(contents: &str) -> String {
     format!("{:x}", Sha256::digest(contents.as_bytes()))
 }
