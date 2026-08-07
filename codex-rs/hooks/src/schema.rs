@@ -14,6 +14,7 @@ use std::path::PathBuf;
 
 use crate::background_state::BackgroundState;
 use crate::events::common::SubagentHookContext;
+use crate::skill_activation::SkillActivation;
 
 const GENERATED_DIR: &str = "generated";
 const POST_TOOL_USE_INPUT_FIXTURE: &str = "post-tool-use.command.input.schema.json";
@@ -290,8 +291,7 @@ pub(crate) struct PreToolUseCommandInput {
     pub tool_name: String,
     pub tool_input: Value,
     pub tool_use_id: String,
-    #[schemars(skip)]
-    pub skill_activations: Vec<Value>,
+    pub skill_activations: Vec<SkillActivation>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -338,8 +338,7 @@ pub(crate) struct PostToolUseCommandInput {
     pub tool_input: Value,
     pub tool_response: Value,
     pub tool_use_id: String,
-    #[schemars(skip)]
-    pub skill_activations: Vec<Value>,
+    pub skill_activations: Vec<SkillActivation>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]

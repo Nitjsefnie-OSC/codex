@@ -7,6 +7,7 @@ mod legacy_notify;
 mod output_spill;
 mod registry;
 mod schema;
+mod skill_activation;
 mod types;
 
 use codex_protocol::protocol::HookEventName;
@@ -81,6 +82,9 @@ pub use registry::HooksConfig;
 pub use registry::command_from_argv;
 pub use registry::list_hooks;
 pub use schema::write_schema_fixtures;
+pub use skill_activation::SkillActivation;
+pub use skill_activation::SkillActivationKind;
+pub use skill_activation::SkillActivationScope;
 pub use types::Hook;
 pub use types::HookEvent;
 pub use types::HookEventAfterAgent;
