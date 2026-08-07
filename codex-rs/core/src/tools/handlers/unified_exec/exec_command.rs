@@ -550,7 +550,7 @@ mod implicit_activation_tests {
             Some(terminal.clone()),
             Ok(&response(None, Some(0))),
         );
-        assert_eq!(skill_activation_snapshot(&turn), vec![terminal]);
+        assert_eq!(skill_activation_snapshot(&turn), vec![terminal.clone()]);
 
         let yielded = activation("yielded", 'b');
         settle_unified_exec_implicit_skill_activation(
