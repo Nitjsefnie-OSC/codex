@@ -300,6 +300,7 @@ impl CoreToolRuntime for ShellCommandHandler {
 mod tests {
     use std::sync::Arc;
 
+    use codex_protocol::models::PermissionProfile;
     use codex_protocol::protocol::SkillScope;
     use serde_json::json;
     use tokio::sync::Mutex;
@@ -307,13 +308,15 @@ mod tests {
     use super::*;
     use crate::session::step_context::StepContext;
     use crate::skills::skill_activation_snapshot;
+    use crate::skills::tests::configure_implicit_skill_fixture_for_exec;
     use crate::skills::tests::implicit_skill_fixture;
     use crate::tools::context::ToolCallSource;
     use crate::turn_diff_tracker::TurnDiffTracker;
 
     #[tokio::test]
     async fn classic_shell_implicit_skill_activation_uses_rewritten_pre_tool_command() {
-        let fixture = implicit_skill_fixture(SkillScope::Admin).await;
+        let mut fixture = implicit_skill_fixture(SkillScope::Admin).await;
+        configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::Disabled);
         let turn = Arc::new(fixture.turn);
         let handler = ShellCommandHandler::from(ShellCommandBackendConfig::Classic);
         let original = ToolInvocation {

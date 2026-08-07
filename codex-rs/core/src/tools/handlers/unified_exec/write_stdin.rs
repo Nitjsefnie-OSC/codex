@@ -149,6 +149,7 @@ mod implicit_activation_tests {
     use codex_hooks::SkillActivation;
     use codex_hooks::SkillActivationKind;
     use codex_hooks::SkillActivationScope;
+    use codex_protocol::models::PermissionProfile;
     use codex_utils_output_truncation::TruncationPolicy;
     use pretty_assertions::assert_eq;
     use serde_json::json;
@@ -161,6 +162,7 @@ mod implicit_activation_tests {
     use crate::skills::promote_pending_skill_activation;
     use crate::skills::retain_pending_skill_activation;
     use crate::skills::skill_activation_snapshot;
+    use crate::skills::tests::configure_implicit_skill_fixture_for_exec;
     use crate::skills::tests::implicit_skill_fixture;
     use crate::tools::context::ExecCommandToolOutput;
     use crate::tools::context::ToolCallSource;
@@ -275,7 +277,8 @@ mod implicit_activation_tests {
 
     #[tokio::test]
     async fn write_stdin_implicit_skill_activation_actual_yielded_zero_promotes_requested_id() {
-        let fixture = implicit_skill_fixture(codex_protocol::protocol::SkillScope::Repo).await;
+        let mut fixture = implicit_skill_fixture(codex_protocol::protocol::SkillScope::Repo).await;
+        configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::Disabled);
         let command = format!("cat {}; sleep 1; exit 0", fixture.skill_path.display());
         let session = Arc::new(fixture.session);
         let turn = Arc::new(fixture.turn);
@@ -298,7 +301,8 @@ mod implicit_activation_tests {
 
     #[tokio::test]
     async fn write_stdin_implicit_skill_activation_actual_yielded_nonzero_discards_requested_id() {
-        let fixture = implicit_skill_fixture(codex_protocol::protocol::SkillScope::User).await;
+        let mut fixture = implicit_skill_fixture(codex_protocol::protocol::SkillScope::User).await;
+        configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::Disabled);
         let command = format!("cat {}; sleep 1; exit 6", fixture.skill_path.display());
         let session = Arc::new(fixture.session);
         let turn = Arc::new(fixture.turn);
@@ -324,7 +328,8 @@ mod implicit_activation_tests {
 
     #[tokio::test]
     async fn write_stdin_implicit_skill_activation_actual_cross_turn_poll_cannot_promote() {
-        let fixture = implicit_skill_fixture(codex_protocol::protocol::SkillScope::Repo).await;
+        let mut fixture = implicit_skill_fixture(codex_protocol::protocol::SkillScope::Repo).await;
+        configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::Disabled);
         let command = format!("cat {}; sleep 1; exit 0", fixture.skill_path.display());
         let session = Arc::new(fixture.session);
         let turn_a = Arc::new(fixture.turn);

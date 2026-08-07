@@ -514,12 +514,11 @@ mod implicit_activation_tests {
     use tokio::sync::Mutex;
 
     use super::*;
-    use crate::config::PermissionProfileSnapshot;
-    use crate::environment_selection::TurnEnvironmentState;
     use crate::session::step_context::StepContext;
     use crate::session::tests::make_session_and_context;
     use crate::skills::promote_pending_skill_activation;
     use crate::skills::skill_activation_snapshot;
+    use crate::skills::tests::configure_implicit_skill_fixture_for_exec;
     use crate::skills::tests::implicit_skill_fixture;
     use crate::tools::context::ToolCallSource;
     use crate::turn_diff_tracker::TurnDiffTracker;
@@ -575,7 +574,8 @@ mod implicit_activation_tests {
 
     #[tokio::test]
     async fn unified_exec_implicit_skill_activation_actual_nonzero_does_not_record() {
-        let fixture = implicit_skill_fixture(codex_protocol::protocol::SkillScope::Repo).await;
+        let mut fixture = implicit_skill_fixture(codex_protocol::protocol::SkillScope::Repo).await;
+        configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::Disabled);
         let command = format!("cat {}; exit 7", fixture.skill_path.display());
         let turn = Arc::new(fixture.turn);
 
@@ -594,7 +594,8 @@ mod implicit_activation_tests {
 
     #[tokio::test]
     async fn unified_exec_implicit_skill_activation_actual_rewritten_terminal_zero_records() {
-        let fixture = implicit_skill_fixture(codex_protocol::protocol::SkillScope::Admin).await;
+        let mut fixture = implicit_skill_fixture(codex_protocol::protocol::SkillScope::Admin).await;
+        configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::Disabled);
         let rewritten_command = format!("cat {}", fixture.skill_path.display());
         let turn = Arc::new(fixture.turn);
         let handler = ExecCommandHandler::default();
@@ -621,14 +622,11 @@ mod implicit_activation_tests {
 
     #[tokio::test]
     async fn unified_exec_implicit_skill_activation_actual_escalation_rejection_does_not_record() {
-        let fixture = implicit_skill_fixture(codex_protocol::protocol::SkillScope::System).await;
+        let mut fixture =
+            implicit_skill_fixture(codex_protocol::protocol::SkillScope::System).await;
+        configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::Disabled);
         let command = format!("cat {}", fixture.skill_path.display());
-        let mut turn = fixture.turn;
-        let mut config = (*turn.config).clone();
-        config.permissions.approval_policy =
-            codex_config::Constrained::allow_any(codex_protocol::protocol::AskForApproval::Never);
-        turn.config = Arc::new(config);
-        let turn = Arc::new(turn);
+        let turn = Arc::new(fixture.turn);
 
         let Err(error) = ExecCommandHandler::default()
             .handle(invocation(
@@ -652,33 +650,15 @@ mod implicit_activation_tests {
 
     #[tokio::test]
     async fn unified_exec_implicit_skill_activation_actual_sandbox_denial_does_not_record() {
-        let fixture = implicit_skill_fixture(codex_protocol::protocol::SkillScope::Repo).await;
+        let mut fixture = implicit_skill_fixture(codex_protocol::protocol::SkillScope::Repo).await;
+        configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::read_only());
         let denied_path = fixture.workdir.join("sandbox-denied.txt");
         let command = format!(
             "cat {}; printf denied > {}",
             fixture.skill_path.display(),
             denied_path.display()
         );
-        let mut turn = fixture.turn;
-        let mut config = (*turn.config).clone();
-        config
-            .permissions
-            .set_permission_profile(PermissionProfile::read_only())
-            .expect("set read-only permission profile");
-        config.permissions.approval_policy =
-            codex_config::Constrained::allow_any(codex_protocol::protocol::AskForApproval::Never);
-        turn.config = Arc::new(config);
-        let TurnEnvironmentState::Ready(environment) = turn
-            .environments
-            .environments
-            .first_mut()
-            .expect("test session should have a primary environment")
-        else {
-            panic!("test session primary environment should be ready");
-        };
-        environment.config.permission_profile =
-            PermissionProfileSnapshot::legacy(PermissionProfile::read_only());
-        let turn = Arc::new(turn);
+        let turn = Arc::new(fixture.turn);
 
         let output = ExecCommandHandler::default()
             .handle(invocation(
@@ -694,6 +674,7 @@ mod implicit_activation_tests {
         assert!(
             preview.contains("permission denied")
                 || preview.contains("operation not permitted")
+                || preview.contains("read-only file system")
                 || preview.contains("sandbox"),
             "unexpected sandbox-denial output: {preview}"
         );

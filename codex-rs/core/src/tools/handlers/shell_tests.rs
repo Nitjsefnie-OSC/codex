@@ -4,12 +4,10 @@ use std::sync::Arc;
 use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ShellCommandToolCallParams;
-use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::SkillScope;
 use pretty_assertions::assert_eq;
 
 use crate::config::PermissionProfileSnapshot;
-use crate::environment_selection::TurnEnvironmentState;
 use crate::exec_env::CODEX_PERMISSION_PROFILE_ENV_VAR;
 use crate::exec_env::create_env;
 use crate::exec_env::inject_permission_profile_env;
@@ -21,6 +19,7 @@ use crate::session::turn_context::TurnEnvironment;
 use crate::shell::Shell;
 use crate::shell::ShellType;
 use crate::skills::skill_activation_snapshot;
+use crate::skills::tests::configure_implicit_skill_fixture_for_exec;
 use crate::skills::tests::implicit_skill_fixture;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolCallSource;
@@ -358,7 +357,8 @@ async fn build_post_tool_use_payload_uses_tool_output_wire_value() {
 
 #[tokio::test]
 async fn classic_shell_implicit_skill_activation_actual_nonzero_does_not_record() {
-    let fixture = implicit_skill_fixture(SkillScope::Repo).await;
+    let mut fixture = implicit_skill_fixture(SkillScope::Repo).await;
+    configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::Disabled);
     let command = format!("cat {}; exit 9", fixture.skill_path.display());
     let turn = Arc::new(fixture.turn);
     let invocation = classic_shell_invocation(
@@ -368,11 +368,14 @@ async fn classic_shell_implicit_skill_activation_actual_nonzero_does_not_record(
         "failed-skill-read",
     );
 
-    ShellCommandHandler::from(codex_tools::ShellCommandBackendConfig::Classic)
+    let Err(error) = ShellCommandHandler::from(codex_tools::ShellCommandBackendConfig::Classic)
         .handle(invocation)
         .await
-        .expect("nonzero shell exit should return structured output");
+    else {
+        panic!("classic nonzero shell exit should be returned to the model as an error");
+    };
 
+    assert!(error.to_string().contains("Exit code: 9"));
     // This assertion happens in a fresh turn, before any successful read can
     // insert an equal activation and mask a false positive in the set.
     assert_eq!(skill_activation_snapshot(&turn), Vec::new());
@@ -380,14 +383,10 @@ async fn classic_shell_implicit_skill_activation_actual_nonzero_does_not_record(
 
 #[tokio::test]
 async fn classic_shell_implicit_skill_activation_actual_escalation_rejection_does_not_record() {
-    let fixture = implicit_skill_fixture(SkillScope::System).await;
+    let mut fixture = implicit_skill_fixture(SkillScope::System).await;
+    configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::Disabled);
     let command = format!("cat {}", fixture.skill_path.display());
-    let mut turn = fixture.turn;
-    let mut config = (*turn.config).clone();
-    config.permissions.approval_policy =
-        codex_config::Constrained::allow_any(AskForApproval::Never);
-    turn.config = Arc::new(config);
-    let turn = Arc::new(turn);
+    let turn = Arc::new(fixture.turn);
     let invocation = ToolInvocation {
         payload: ToolPayload::Function {
             arguments: json!({
@@ -418,35 +417,17 @@ async fn classic_shell_implicit_skill_activation_actual_escalation_rejection_doe
 
 #[tokio::test]
 async fn classic_shell_implicit_skill_activation_actual_sandbox_denial_does_not_record() {
-    let fixture = implicit_skill_fixture(SkillScope::Repo).await;
+    let mut fixture = implicit_skill_fixture(SkillScope::Repo).await;
+    configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::read_only());
     let denied_path = fixture.workdir.join("sandbox-denied.txt");
     let command = format!(
         "cat {}; printf denied > {}",
         fixture.skill_path.display(),
         denied_path.display()
     );
-    let mut turn = fixture.turn;
-    let mut config = (*turn.config).clone();
-    config
-        .permissions
-        .set_permission_profile(PermissionProfile::read_only())
-        .expect("set read-only permission profile");
-    config.permissions.approval_policy =
-        codex_config::Constrained::allow_any(AskForApproval::Never);
-    turn.config = Arc::new(config);
-    let TurnEnvironmentState::Ready(environment) = turn
-        .environments
-        .environments
-        .first_mut()
-        .expect("test session should have a primary environment")
-    else {
-        panic!("test session primary environment should be ready");
-    };
-    environment.config.permission_profile =
-        PermissionProfileSnapshot::legacy(PermissionProfile::read_only());
-    let turn = Arc::new(turn);
+    let turn = Arc::new(fixture.turn);
 
-    let output = ShellCommandHandler::from(codex_tools::ShellCommandBackendConfig::Classic)
+    let Err(error) = ShellCommandHandler::from(codex_tools::ShellCommandBackendConfig::Classic)
         .handle(classic_shell_invocation(
             Arc::new(fixture.session),
             Arc::clone(&turn),
@@ -454,14 +435,17 @@ async fn classic_shell_implicit_skill_activation_actual_sandbox_denial_does_not_
             "sandbox-denied-skill-read",
         ))
         .await
-        .expect("sandbox denial should be mapped to model-facing output");
-    let preview = output.log_preview().to_ascii_lowercase();
+    else {
+        panic!("classic sandbox denial should be returned to the model as an error");
+    };
+    let message = error.to_string().to_ascii_lowercase();
 
     assert!(
-        preview.contains("permission denied")
-            || preview.contains("operation not permitted")
-            || preview.contains("sandbox"),
-        "unexpected sandbox-denial output: {preview}"
+        message.contains("permission denied")
+            || message.contains("operation not permitted")
+            || message.contains("read-only file system")
+            || message.contains("sandbox"),
+        "unexpected sandbox-denial output: {message}"
     );
     assert!(!denied_path.exists());
     assert_eq!(skill_activation_snapshot(&turn), Vec::new());
@@ -469,7 +453,8 @@ async fn classic_shell_implicit_skill_activation_actual_sandbox_denial_does_not_
 
 #[tokio::test]
 async fn classic_shell_implicit_skill_activation_actual_apply_patch_intercept_does_not_record() {
-    let fixture = implicit_skill_fixture(SkillScope::Repo).await;
+    let mut fixture = implicit_skill_fixture(SkillScope::Repo).await;
+    configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::Disabled);
     let patch_dir = tempfile::tempdir_in(&fixture.turn.config.cwd)
         .expect("create patch directory inside session workspace");
     let workdir = patch_dir.path().to_path_buf();

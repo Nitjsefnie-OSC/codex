@@ -8,6 +8,8 @@ use codex_extension_api::ExtensionData;
 use codex_hooks::SkillActivation;
 use codex_hooks::SkillActivationKind;
 use codex_hooks::SkillActivationScope;
+use codex_protocol::models::PermissionProfile;
+use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::SkillScope;
 use codex_skills_extension::HostSkillsSnapshot;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -23,6 +25,8 @@ use super::promote_pending_skill_activation;
 use super::record_skill_activation;
 use super::retain_pending_skill_activation;
 use super::skill_activation_snapshot;
+use crate::config::PermissionProfileSnapshot;
+use crate::environment_selection::TurnEnvironmentState;
 use crate::session::session::Session;
 use crate::session::tests::make_session_and_context;
 use crate::session::turn_context::TurnContext;
@@ -75,6 +79,30 @@ pub(crate) async fn implicit_skill_fixture(scope: SkillScope) -> ImplicitSkillFi
         skill_path: skill_path.abs(),
         workdir: skill_dir.abs(),
     }
+}
+
+pub(crate) fn configure_implicit_skill_fixture_for_exec(
+    fixture: &mut ImplicitSkillFixture,
+    permission_profile: PermissionProfile,
+) {
+    let mut config = (*fixture.turn.config).clone();
+    config
+        .permissions
+        .set_permission_profile(permission_profile.clone())
+        .expect("test setup should allow updating the permission profile");
+    config.permissions.approval_policy =
+        codex_config::Constrained::allow_any(AskForApproval::Never);
+    fixture.turn.config = Arc::new(config);
+    let TurnEnvironmentState::Ready(environment) = fixture
+        .turn
+        .environments
+        .environments
+        .first_mut()
+        .expect("test session should have a primary environment")
+    else {
+        panic!("test session primary environment should be ready");
+    };
+    environment.config.permission_profile = PermissionProfileSnapshot::legacy(permission_profile);
 }
 
 fn activation(name: &str, path: &str, digest_digit: char) -> SkillActivation {
