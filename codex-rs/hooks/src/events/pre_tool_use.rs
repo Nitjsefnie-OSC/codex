@@ -342,6 +342,9 @@ mod tests {
     use crate::events::common;
     use crate::output_spill::AdditionalContext;
     use crate::output_spill::AdditionalContextLimit;
+    use crate::skill_activation::SkillActivation;
+    use crate::skill_activation::SkillActivationKind;
+    use crate::skill_activation::SkillActivationScope;
 
     #[test]
     fn command_input_uses_request_tool_name() {
@@ -364,6 +367,79 @@ mod tests {
             serde_json::from_str(&input_json).expect("parse command input");
 
         assert_eq!(input["skill_activations"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn command_input_sorts_and_exposes_request_skill_activations() {
+        let mut request = request_for_tool_use("call-after-skills");
+        request.skill_activations = vec![
+            activation(
+                "later",
+                "/skills/z/SKILL.md",
+                SkillActivationKind::Explicit,
+                'f',
+            ),
+            activation(
+                "implicit",
+                "/skills/a/SKILL.md",
+                SkillActivationKind::Implicit,
+                'b',
+            ),
+            activation(
+                "hash-c",
+                "/skills/a/SKILL.md",
+                SkillActivationKind::Explicit,
+                'c',
+            ),
+            activation(
+                "hash-a",
+                "/skills/a/SKILL.md",
+                SkillActivationKind::Explicit,
+                'a',
+            ),
+        ];
+
+        let input_json = command_input_json(&request).expect("serialize command input");
+        let input: serde_json::Value =
+            serde_json::from_str(&input_json).expect("parse command input");
+
+        assert_eq!(
+            input["skill_activations"],
+            serde_json::json!([
+                {
+                    "name": "hash-a",
+                    "path": "/skills/a/SKILL.md",
+                    "scope": "repo",
+                    "invocation": "explicit",
+                    "turn_id": "turn-1",
+                    "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                },
+                {
+                    "name": "hash-c",
+                    "path": "/skills/a/SKILL.md",
+                    "scope": "repo",
+                    "invocation": "explicit",
+                    "turn_id": "turn-1",
+                    "content_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                },
+                {
+                    "name": "implicit",
+                    "path": "/skills/a/SKILL.md",
+                    "scope": "repo",
+                    "invocation": "implicit",
+                    "turn_id": "turn-1",
+                    "content_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                },
+                {
+                    "name": "later",
+                    "path": "/skills/z/SKILL.md",
+                    "scope": "repo",
+                    "invocation": "explicit",
+                    "turn_id": "turn-1",
+                    "content_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                },
+            ])
+        );
     }
 
     #[test]
@@ -822,6 +898,24 @@ mod tests {
             matcher_aliases: Vec::new(),
             tool_use_id: tool_use_id.to_string(),
             tool_input: serde_json::json!({ "command": "echo hello" }),
+            skill_activations: Vec::new(),
         }
+    }
+
+    fn activation(
+        name: &str,
+        path: &str,
+        invocation: SkillActivationKind,
+        digest_character: char,
+    ) -> SkillActivation {
+        SkillActivation::new(
+            name.to_string(),
+            path.to_string(),
+            SkillActivationScope::Repo,
+            invocation,
+            "turn-1".to_string(),
+            digest_character.to_string().repeat(64),
+        )
+        .expect("valid activation")
     }
 }
