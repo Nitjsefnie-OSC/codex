@@ -36,8 +36,9 @@ jobs:
         run: |
           cargo run --manifest-path codex-rs/Cargo.toml \
             -p codex-hooks --bin write_hooks_schema_fixtures
-          cargo run --manifest-path codex-rs/Cargo.toml \
-            -p codex-app-server-protocol --bin write_schema_fixtures
+          python3 codex-rs/app-server-protocol/scripts/write_schema_fixtures.py
+          python3 codex-rs/app-server-protocol/scripts/write_schema_fixtures.py \
+            --experimental
 
       - name: Reject changes outside generated schema trees
         shell: bash
