@@ -115,3 +115,99 @@ impl CoreToolRuntime for WriteStdinHandler {
         post_unified_exec_tool_use_payload(invocation, result)
     }
 }
+
+#[cfg(test)]
+mod implicit_activation_tests {
+    use codex_hooks::SkillActivation;
+    use codex_hooks::SkillActivationKind;
+    use codex_hooks::SkillActivationScope;
+    use codex_utils_output_truncation::TruncationPolicy;
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+    use crate::session::tests::make_session_and_context;
+    use crate::skills::promote_pending_skill_activation;
+    use crate::skills::retain_pending_skill_activation;
+    use crate::skills::skill_activation_snapshot;
+    use crate::tools::context::ExecCommandToolOutput;
+    use crate::unified_exec::UnifiedExecError;
+
+    fn activation() -> SkillActivation {
+        SkillActivation::new(
+            "yielded".to_string(),
+            "/repo/yielded/SKILL.md".to_string(),
+            SkillActivationScope::Repo,
+            SkillActivationKind::Implicit,
+            "turn-1".to_string(),
+            "a".repeat(64),
+        )
+        .expect("valid activation")
+    }
+
+    fn response(process_id: Option<i32>, exit_code: Option<i32>) -> ExecCommandToolOutput {
+        ExecCommandToolOutput {
+            event_call_id: "call-1".to_string(),
+            chunk_id: "chunk-1".to_string(),
+            wall_time: std::time::Duration::ZERO,
+            raw_output: Vec::new(),
+            truncation_policy: TruncationPolicy::Tokens(10_000),
+            max_output_tokens: None,
+            process_id,
+            exit_code,
+            original_token_count: None,
+            output_omitted_bytes: None,
+            hook_command: Some("cat SKILL.md".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn write_stdin_implicit_skill_activation_same_turn_zero_promotes_and_live_stays_pending()
+    {
+        let (_session, turn) = make_session_and_context().await;
+        retain_pending_skill_activation(&turn, 41, activation());
+        settle_write_stdin_implicit_skill_activation(&turn, 41, Ok(&response(Some(41), None)));
+        assert_eq!(skill_activation_snapshot(&turn), Vec::new());
+        settle_write_stdin_implicit_skill_activation(&turn, 41, Ok(&response(None, Some(0))));
+        assert_eq!(skill_activation_snapshot(&turn), vec![activation()]);
+    }
+
+    #[tokio::test]
+    async fn write_stdin_implicit_skill_activation_nonzero_or_missing_exit_discards() {
+        let (_session, turn) = make_session_and_context().await;
+        retain_pending_skill_activation(&turn, 41, activation());
+        settle_write_stdin_implicit_skill_activation(&turn, 41, Ok(&response(None, Some(9))));
+        assert!(!promote_pending_skill_activation(&turn, 41));
+
+        retain_pending_skill_activation(&turn, 42, activation());
+        settle_write_stdin_implicit_skill_activation(&turn, 42, Ok(&response(None, None)));
+        assert!(!promote_pending_skill_activation(&turn, 42));
+        assert_eq!(skill_activation_snapshot(&turn), Vec::new());
+    }
+
+    #[tokio::test]
+    async fn write_stdin_implicit_skill_activation_cross_turn_poll_cannot_promote() {
+        let (_session_a, turn_a) = make_session_and_context().await;
+        let (_session_b, turn_b) = make_session_and_context().await;
+        retain_pending_skill_activation(&turn_a, 41, activation());
+
+        settle_write_stdin_implicit_skill_activation(&turn_b, 41, Ok(&response(None, Some(0))));
+
+        assert_eq!(skill_activation_snapshot(&turn_a), Vec::new());
+        assert_eq!(skill_activation_snapshot(&turn_b), Vec::new());
+        assert!(promote_pending_skill_activation(&turn_a, 41));
+    }
+
+    #[tokio::test]
+    async fn write_stdin_implicit_skill_activation_preserves_pending_on_recoverable_write_error() {
+        let (_session, turn) = make_session_and_context().await;
+        retain_pending_skill_activation(&turn, 41, activation());
+
+        settle_write_stdin_implicit_skill_activation(
+            &turn,
+            41,
+            Err(&UnifiedExecError::StdinClosed),
+        );
+
+        assert!(promote_pending_skill_activation(&turn, 41));
+    }
+}

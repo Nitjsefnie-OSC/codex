@@ -67,6 +67,10 @@ jobs:
           cargo test -p codex-core-skills --lib plugin_skill_injection_digest
           cargo test -p codex-core --lib skill_activation_store
           cargo test -p codex-core --lib pending_skill_activation
+          cargo test -p codex-core --lib implicit_skill_activation_candidate
+          cargo test -p codex-core --lib classic_shell_implicit_skill_activation
+          cargo test -p codex-core --lib unified_exec_implicit_skill_activation
+          cargo test -p codex-core --lib write_stdin_implicit_skill_activation
 
       - name: fork-safe update channel tests
         # These assert the negative that matters: no code path offers an

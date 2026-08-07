@@ -294,3 +294,61 @@ impl CoreToolRuntime for ShellCommandHandler {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use codex_protocol::protocol::SkillScope;
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+    use tokio::sync::Mutex;
+
+    use super::*;
+    use crate::session::step_context::StepContext;
+    use crate::skills::prepare_implicit_skill_activation;
+    use crate::skills::tests::implicit_skill_fixture;
+    use crate::tools::context::ToolCallSource;
+    use crate::turn_diff_tracker::TurnDiffTracker;
+
+    #[tokio::test]
+    async fn implicit_skill_activation_candidate_uses_rewritten_pre_tool_command() {
+        let fixture = implicit_skill_fixture(SkillScope::Admin).await;
+        let turn = Arc::new(fixture.turn);
+        let handler = ShellCommandHandler::from(ShellCommandBackendConfig::Classic);
+        let original = ToolInvocation {
+            session: Arc::new(fixture.session),
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn: Arc::clone(&turn),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "rewritten-skill-read".to_string(),
+            tool_name: ToolName::plain("shell_command"),
+            source: ToolCallSource::Direct,
+            payload: ToolPayload::Function {
+                arguments: json!({ "command": "echo not-a-skill-read" }).to_string(),
+            },
+        };
+        let rewritten_command = format!("cat {}", fixture.skill_path.display());
+        let rewritten = handler
+            .with_updated_hook_input(original, json!({ "command": rewritten_command }))
+            .expect("rewrite tool input");
+        let ToolPayload::Function { arguments } = rewritten.payload else {
+            panic!("expected function payload");
+        };
+        let params: ShellCommandToolCallParams =
+            parse_arguments_with_base_path(&arguments, &fixture.workdir)
+                .expect("parse rewritten arguments");
+
+        let candidate = prepare_implicit_skill_activation(
+            rewritten.session.as_ref(),
+            turn.as_ref(),
+            &params.command,
+            &fixture.workdir,
+        )
+        .await
+        .expect("rewritten read should be recognized");
+        assert_eq!(candidate.name(), "audit-skill");
+        assert_eq!(candidate.scope(), codex_hooks::SkillActivationScope::Admin);
+    }
+}

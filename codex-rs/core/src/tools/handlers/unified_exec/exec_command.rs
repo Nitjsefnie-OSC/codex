@@ -472,3 +472,93 @@ fn emit_unified_exec_tty_metric(session_telemetry: &SessionTelemetry, tty: bool)
         &[("tty", if tty { "true" } else { "false" })],
     );
 }
+
+#[cfg(test)]
+mod implicit_activation_tests {
+    use codex_hooks::SkillActivation;
+    use codex_hooks::SkillActivationKind;
+    use codex_hooks::SkillActivationScope;
+    use codex_protocol::exec_output::ExecToolCallOutput;
+    use codex_utils_output_truncation::TruncationPolicy;
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+    use crate::session::tests::make_session_and_context;
+    use crate::skills::promote_pending_skill_activation;
+    use crate::skills::skill_activation_snapshot;
+
+    fn activation(name: &str, digest: char) -> SkillActivation {
+        SkillActivation::new(
+            name.to_string(),
+            format!("/repo/{name}/SKILL.md"),
+            SkillActivationScope::Repo,
+            SkillActivationKind::Implicit,
+            "turn-1".to_string(),
+            digest.to_string().repeat(64),
+        )
+        .expect("valid activation")
+    }
+
+    fn response(process_id: Option<i32>, exit_code: Option<i32>) -> ExecCommandToolOutput {
+        ExecCommandToolOutput {
+            event_call_id: "call-1".to_string(),
+            chunk_id: "chunk-1".to_string(),
+            wall_time: std::time::Duration::ZERO,
+            raw_output: Vec::new(),
+            truncation_policy: TruncationPolicy::Tokens(10_000),
+            max_output_tokens: None,
+            process_id,
+            exit_code,
+            original_token_count: None,
+            output_omitted_bytes: None,
+            hook_command: Some("cat SKILL.md".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn unified_exec_implicit_skill_activation_records_terminal_zero_and_hides_yielded() {
+        let (_session, turn) = make_session_and_context().await;
+        let terminal = activation("terminal", 'a');
+        settle_unified_exec_implicit_skill_activation(
+            &turn,
+            Some(terminal.clone()),
+            Ok(&response(None, Some(0))),
+        );
+        assert_eq!(skill_activation_snapshot(&turn), vec![terminal]);
+
+        let yielded = activation("yielded", 'b');
+        settle_unified_exec_implicit_skill_activation(
+            &turn,
+            Some(yielded.clone()),
+            Ok(&response(Some(31), Some(0))),
+        );
+        assert_eq!(skill_activation_snapshot(&turn).len(), 1);
+        assert!(promote_pending_skill_activation(&turn, 31));
+        assert_eq!(skill_activation_snapshot(&turn), vec![yielded, terminal]);
+    }
+
+    #[tokio::test]
+    async fn unified_exec_implicit_skill_activation_drops_nonzero_missing_exit_and_sandbox_denial()
+    {
+        let (_session, turn) = make_session_and_context().await;
+        settle_unified_exec_implicit_skill_activation(
+            &turn,
+            Some(activation("nonzero", 'a')),
+            Ok(&response(None, Some(7))),
+        );
+        settle_unified_exec_implicit_skill_activation(
+            &turn,
+            Some(activation("unknown", 'b')),
+            Ok(&response(None, None)),
+        );
+        let denied =
+            UnifiedExecError::sandbox_denied("denied".to_string(), ExecToolCallOutput::default());
+        settle_unified_exec_implicit_skill_activation(
+            &turn,
+            Some(activation("denied", 'c')),
+            Err(&denied),
+        );
+
+        assert_eq!(skill_activation_snapshot(&turn), Vec::new());
+    }
+}
