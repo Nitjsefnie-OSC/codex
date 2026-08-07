@@ -51,6 +51,15 @@ impl Session {
         if input.is_empty() {
             return Ok(());
         }
+        if self
+            .shutdown_started
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(TryStartTurnIfIdleError::new(
+                TryStartTurnIfIdleRejectionReason::Busy,
+                input,
+            ));
+        }
         let has_user_input = input.iter().any(
             |item| matches!(item, TurnInput::UserInput { content, .. } if !content.is_empty()),
         );

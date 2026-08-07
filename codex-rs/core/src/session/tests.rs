@@ -74,6 +74,7 @@ use codex_protocol::request_permissions::PermissionGrantScope;
 use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_tools::ToolSpec;
 use codex_utils_path_uri::PathUri;
+use std::sync::atomic::AtomicBool;
 use tracing::Span;
 
 use crate::connectors::AppInfo;
@@ -5905,6 +5906,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         conversation: Arc::new(RealtimeConversationManager::new()),
         active_turn: Mutex::new(None),
         async_hook_results,
+        shutdown_started: AtomicBool::new(false),
         pending_user_message_admissions: Default::default(),
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
@@ -8164,6 +8166,7 @@ where
         conversation: Arc::new(RealtimeConversationManager::new()),
         active_turn: Mutex::new(None),
         async_hook_results,
+        shutdown_started: AtomicBool::new(false),
         pending_user_message_admissions: Default::default(),
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
@@ -10661,6 +10664,27 @@ async fn try_start_turn_if_idle_rejects_active_turn_without_injecting() {
     );
 
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test]
+async fn try_start_turn_if_idle_rejects_session_shutdown_without_injecting() {
+    let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
+    sess.shutdown_started
+        .store(true, std::sync::atomic::Ordering::Release);
+
+    let item = TurnInput::ResponseItem(user_message("synthetic shutdown input"));
+    let err = sess
+        .try_start_turn_if_idle(vec![item.clone()])
+        .await
+        .expect_err("shutdown should reject automatic idle input");
+
+    assert_eq!(TryStartTurnIfIdleRejectionReason::Busy, err.reason());
+    assert_eq!(vec![item], err.into_input());
+    assert!(sess.active_turn.lock().await.is_none());
+    assert_eq!(
+        (Vec::<TurnInput>::new(), None),
+        sess.input_queue.get_pending_input(&sess.active_turn).await
+    );
 }
 
 #[tokio::test]

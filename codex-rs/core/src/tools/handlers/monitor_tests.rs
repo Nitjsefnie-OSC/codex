@@ -11,6 +11,7 @@ use crate::tools::context::ToolCallSource;
 use crate::tools::handlers::monitor_spec::MAX_WAIT_TIMEOUT_MS;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use crate::unified_exec::MAX_MONITOR_NOTIFICATIONS;
+use codex_protocol::config_types::ModeKind;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::PermissionProfile;
@@ -37,6 +38,14 @@ struct Harness {
 /// host's sandbox availability.
 async fn harness() -> Harness {
     let (session, mut turn, rx) = make_session_and_context_with_rx().await;
+    let mut collaboration_mode = session.collaboration_mode().await;
+    collaboration_mode.mode = ModeKind::Plan;
+    session
+        .state
+        .lock()
+        .await
+        .session_configuration
+        .collaboration_mode = collaboration_mode;
     let turn_mut =
         Arc::get_mut(&mut turn).expect("test turn context must be uniquely owned at setup");
     let mut config = (*turn_mut.config).clone();

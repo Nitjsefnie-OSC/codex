@@ -100,10 +100,13 @@ jobs:
         # The dev box may not run cargo test, so this is where the monitor's
         # contract is actually executed: notification batching and sequencing,
         # the per-monitor cap, the always-exactly-one terminal notification,
-        # stop-leaves-no-orphan, and readable retained output.
+        # stop-leaves-no-orphan, readable retained output, and idle-session
+        # wake-up through a second Responses inference.
         working-directory: codex-rs
         run: |
           cargo test -p codex-core --lib monitor -- --nocapture
+          cargo test -p codex-core --lib try_start_turn_if_idle -- --nocapture
+          cargo test -p codex-core --test suite monitor -- --nocapture
           df -h /
 
       - name: golden tool-name list

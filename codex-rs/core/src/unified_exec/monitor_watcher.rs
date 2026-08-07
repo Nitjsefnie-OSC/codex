@@ -29,6 +29,7 @@ use super::monitors::NotificationSlot;
 use crate::context::ContextualUserFragment;
 use crate::context::MonitorNotification;
 use crate::session::session::Session;
+use crate::session::TurnInput;
 use crate::session::turn_context::TurnContext;
 
 /// How long complete lines accumulate before they are delivered as one
@@ -316,8 +317,30 @@ async fn inject(
     notification: MonitorNotification,
 ) {
     let item = ContextualUserFragment::into(notification);
+    let Err(items) = session.inject_if_running(vec![item]).await else {
+        return;
+    };
+
+    let idle_input = items.into_iter().map(TurnInput::ResponseItem).collect();
+    let Err(rejection) = session.try_start_turn_if_idle(idle_input).await else {
+        return;
+    };
+
+    let items = rejection
+        .into_input()
+        .into_iter()
+        .map(|input| match input {
+            TurnInput::ResponseItem(item) => item,
+            TurnInput::UserInput { .. } => {
+                unreachable!("monitor notification input cannot be user input")
+            }
+            TurnInput::InterAgentCommunication(_) => {
+                unreachable!("monitor notification input cannot be inter-agent communication")
+            }
+        })
+        .collect();
     session
-        .inject_no_new_turn(vec![item], Some(turn.as_ref()))
+        .inject_no_new_turn(items, Some(turn.as_ref()))
         .await;
 }
 
