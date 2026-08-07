@@ -53,6 +53,16 @@ jobs:
         working-directory: codex-rs
         run: cargo test -p codex-fork-manifest
 
+      - name: fork-safe update channel tests
+        # These assert the negative that matters: no code path offers an
+        # upgrade that would install an upstream build over a fork one, and an
+        # upstream release tag does not parse as an available fork upgrade.
+        working-directory: codex-rs
+        run: |
+          cargo test -p codex-tui --lib update_action
+          cargo test -p codex-tui --lib update_versions
+          cargo test -p codex-cli --bin codex doctor::updates
+
       - name: monitor tool tests
         # The dev box may not run cargo test, so this is where the monitor's
         # contract is actually executed: notification batching and sequencing,
