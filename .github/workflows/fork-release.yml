@@ -77,7 +77,7 @@ jobs:
             binaries: "codex codex-code-mode-host codex-responses-api-proxy"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
 
@@ -113,7 +113,7 @@ jobs:
           : > "${cargo_home}/config.toml"
 
       - name: Install Zig
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.14.0
           use-cache: false
@@ -199,7 +199,7 @@ jobs:
           sha256sum "dist/codex-${target}.tar.gz"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: codex-${{ matrix.target }}
           path: codex-rs/dist/codex-${{ matrix.target }}.tar.gz
@@ -211,26 +211,32 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          path: dist
-          merge-multiple: true
+          path: downloads
 
       - name: Generate SHA256SUMS
         shell: bash
         run: |
           set -euo pipefail
+          # Flatten first rather than relying on the download action's layout:
+          # whether each artifact lands in its own subdirectory is a property of
+          # the action version, and getting it wrong the silent way produces an
+          # empty SHA256SUMS that `sha256sum -c` still exits 0 on.
+          mkdir -p dist
+          find downloads -type f -name '*.tar.gz' -exec cp -t dist -- {} +
           cd dist
+          artifacts="$(find . -maxdepth 1 -type f -name '*.tar.gz' -printf '%f\n' | LC_ALL=C sort)"
+          [[ -n "${artifacts}" ]] \
+            || { echo "❌  no build artifacts to checksum"; exit 1; }
           # Sorted so the file is byte-stable across runs that produce the same
           # set of artifacts, which makes a diff between two releases readable.
-          find . -maxdepth 1 -type f -name '*.tar.gz' -printf '%f\n' \
-            | LC_ALL=C sort \
-            | xargs sha256sum > SHA256SUMS
+          printf '%s\n' "${artifacts}" | xargs sha256sum > SHA256SUMS
           cat SHA256SUMS
           sha256sum -c SHA256SUMS
 
