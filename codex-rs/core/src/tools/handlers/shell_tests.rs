@@ -470,7 +470,9 @@ async fn classic_shell_implicit_skill_activation_actual_sandbox_denial_does_not_
 #[tokio::test]
 async fn classic_shell_implicit_skill_activation_actual_apply_patch_intercept_does_not_record() {
     let fixture = implicit_skill_fixture(SkillScope::Repo).await;
-    let workdir = fixture.workdir.clone();
+    let patch_dir = tempfile::tempdir_in(&fixture.turn.config.cwd)
+        .expect("create patch directory inside session workspace");
+    let workdir = patch_dir.path().to_path_buf();
     let command = "apply_patch <<'PATCH'\n*** Begin Patch\n*** Add File: intercepted.txt\n+intercepted\n*** End Patch\nPATCH";
     let turn = Arc::new(fixture.turn);
     let invocation = ToolInvocation {
