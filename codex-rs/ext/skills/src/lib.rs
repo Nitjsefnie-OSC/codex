@@ -30,6 +30,7 @@ pub use extension::install_with_providers;
 pub use extension::install_with_providers_and_metrics;
 pub use host_outcome::SkillLoadOutcome;
 pub use host_prompt::HostSkillPrompts;
+pub use host_prompt::InjectedHostSkill;
 pub use host_prompt::InjectedHostSkillPrompts;
 pub use host_service::HostSkillsLoadInput;
 pub use host_service::HostSkillsService;

@@ -41,6 +41,7 @@ use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
 use crate::skills::emit_explicit_skill_invocations;
+use crate::skills::record_skill_activation;
 use crate::stream_events_utils::HandleOutputCtx;
 use crate::stream_events_utils::TurnItemContributorPolicy;
 use crate::stream_events_utils::finalize_non_tool_response_item;
@@ -77,6 +78,9 @@ use codex_extension_api::TurnInputEnvironment;
 use codex_features::Feature;
 use codex_file_system::FindUpErrorPolicy;
 use codex_file_system::find_nearest_ancestor_with_markers;
+use codex_hooks::SkillActivation;
+use codex_hooks::SkillActivationKind;
+use codex_hooks::SkillActivationScope;
 use codex_login::CodexAuth;
 use codex_model_provider::RemoteCompactionSupport;
 use codex_protocol::ResponseItemId;
@@ -104,6 +108,7 @@ use codex_protocol::protocol::RawResponseCompletedEvent;
 use codex_protocol::protocol::ReasoningContentDeltaEvent;
 use codex_protocol::protocol::ReasoningRawContentDeltaEvent;
 use codex_protocol::protocol::SafetyBufferingEvent;
+use codex_protocol::protocol::SkillScope;
 use codex_protocol::protocol::TurnDiffEvent;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
@@ -809,6 +814,27 @@ async fn build_skills_and_plugins(
         &injected_host_skills,
         tracking.clone(),
     );
+
+    for injected_skill in &injected_host_skills {
+        let skill = &injected_skill.skill;
+        let scope = match skill.scope {
+            SkillScope::User => SkillActivationScope::User,
+            SkillScope::Repo => SkillActivationScope::Repo,
+            SkillScope::System => SkillActivationScope::System,
+            SkillScope::Admin => SkillActivationScope::Admin,
+        };
+        let activation = SkillActivation::new(
+            skill.name.clone(),
+            skill.path_to_skills_md.to_string_lossy().into_owned(),
+            scope,
+            SkillActivationKind::Explicit,
+            turn_context.sub_id.clone(),
+            injected_skill.content_sha256.clone(),
+        )
+        .expect("a successfully loaded skill has a valid activation identity");
+        record_skill_activation(turn_context, activation);
+    }
+
     for message in host_skill_warnings {
         sess.send_event(turn_context, EventMsg::Warning(WarningEvent { message }))
             .await;

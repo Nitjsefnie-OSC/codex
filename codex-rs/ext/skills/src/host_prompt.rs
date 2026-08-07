@@ -3,6 +3,8 @@ use std::collections::HashSet;
 use codex_extension_api::ContextualUserFragment;
 use codex_skills::SkillMetadata;
 use codex_skills::normalize_skill_path;
+use sha2::Digest;
+use sha2::Sha256;
 
 use crate::HostSkillsSnapshot;
 use crate::fragments::SkillInstructions;
@@ -34,9 +36,16 @@ impl InjectedHostSkillPrompts {
 }
 
 /// Prompt fragments and read outcomes for a set of selected host skills.
+#[derive(Debug, Clone)]
+pub struct InjectedHostSkill {
+    pub skill: SkillMetadata,
+    /// Digest of the complete source, before any prompt-size truncation.
+    pub content_sha256: String,
+}
+
 pub struct HostSkillPrompts {
     pub fragments: Vec<Box<dyn ContextualUserFragment + Send>>,
-    pub injected: Vec<SkillMetadata>,
+    pub injected: Vec<InjectedHostSkill>,
     pub warnings: Vec<String>,
 }
 
@@ -63,6 +72,7 @@ impl HostSkillsSnapshot {
         for skill in selected_skills {
             match self.read_skill_text(skill).await {
                 Ok(contents) => {
+                    let content_sha256 = sha256_hex(&contents);
                     let (contents, truncated) = if self.outcome().is_agent_plugin_skill(skill) {
                         truncate_main_prompt_contents(&contents)
                     } else {
@@ -80,7 +90,10 @@ impl HostSkillsSnapshot {
                         contents,
                         resource_access: None,
                     }));
-                    prompts.injected.push(skill.clone());
+                    prompts.injected.push(InjectedHostSkill {
+                        skill: skill.clone(),
+                        content_sha256,
+                    });
                 }
                 Err(err) => {
                     prompts.warnings.push(format!(
@@ -94,4 +107,8 @@ impl HostSkillsSnapshot {
 
         prompts
     }
+}
+
+fn sha256_hex(contents: &str) -> String {
+    format!("{:x}", Sha256::digest(contents.as_bytes()))
 }
