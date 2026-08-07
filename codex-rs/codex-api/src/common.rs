@@ -84,7 +84,8 @@ pub enum ResponseEvent {
     ServerModel(String),
     /// Emitted for transport metadata that is not tied to an individual
     /// response, currently the WebSocket connection handshake. It is useful
-    /// for diagnostics and mismatch warnings, but is not model attestation.
+    /// for diagnostics, but is not model attestation and must not drive
+    /// user-facing reroute warnings.
     UnverifiedServerModel(String),
     /// Emitted when the server recommends additional account verification.
     ModelVerifications(Vec<ModelVerification>),

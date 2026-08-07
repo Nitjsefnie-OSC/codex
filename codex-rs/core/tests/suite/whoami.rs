@@ -116,8 +116,8 @@ async fn whoami_reports_server_routed_model_and_request_provenance() -> Result<(
     let mut builder = test_codex().with_model(REQUESTED_MODEL);
     let test = builder.build(&server).await?;
     let output = submit_and_read_call(&test, &response_mock, "whoami-call-1").await?;
-    let request = response_mock
-        .requests()
+    let requests = response_mock.requests();
+    let request = requests
         .first()
         .expect("initial sampling request should be captured");
     let request_effort = request.body_json()["reasoning"]["effort"].clone();
@@ -184,31 +184,53 @@ async fn whoami_does_not_reuse_server_identity_across_sampling_steps() -> Result
 async fn whoami_does_not_attest_websocket_handshake_model() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
-    let server = start_websocket_server_with_headers(vec![WebSocketConnectionConfig {
-        requests: vec![
-            whoami_events("ws-response-1", "ws-whoami-call-1", None),
-            whoami_events("ws-response-2", "ws-whoami-call-2", None),
-            vec![
-                ev_response_created("ws-response-3"),
-                ev_assistant_message("ws-message-final", "websocket continuation complete"),
-                ev_completed("ws-response-3"),
+    let server = start_websocket_server_with_headers(vec![
+        WebSocketConnectionConfig {
+            requests: vec![vec![
+                ev_response_created("ws-warmup"),
+                ev_completed("ws-warmup"),
+            ]],
+            response_headers: Vec::new(),
+            accept_delay: None,
+            close_after_requests: true,
+        },
+        WebSocketConnectionConfig {
+            requests: vec![
+                whoami_events("ws-response-1", "ws-whoami-call-1", None),
+                whoami_events("ws-response-2", "ws-whoami-call-2", None),
+                vec![
+                    ev_response_created("ws-response-3"),
+                    ev_assistant_message("ws-message-final", "websocket continuation complete"),
+                    ev_completed("ws-response-3"),
+                ],
             ],
-        ],
-        response_headers: vec![("OpenAI-Model".to_string(), SERVER_MODEL.to_string())],
-        accept_delay: None,
-        close_after_requests: true,
-    }])
+            response_headers: vec![("OpenAI-Model".to_string(), SERVER_MODEL.to_string())],
+            accept_delay: None,
+            close_after_requests: true,
+        },
+    ])
     .await;
 
     let mut builder = test_codex().with_model(REQUESTED_MODEL);
     let test = builder.build_with_websocket_server(&server).await?;
     test.codex.submit(user_turn(&test)).await?;
-    wait_for_event(&test.codex, |event| {
-        matches!(event, codex_protocol::protocol::EventMsg::TurnComplete(_))
-    })
-    .await;
+    let mut reroute_count = 0;
+    let mut warning_count = 0;
+    loop {
+        let event = test.codex.next_event().await?;
+        match event.msg {
+            codex_protocol::protocol::EventMsg::ModelReroute(_) => reroute_count += 1,
+            codex_protocol::protocol::EventMsg::Warning(_) => warning_count += 1,
+            codex_protocol::protocol::EventMsg::TurnComplete(_) => break,
+            _ => {}
+        }
+    }
+    assert_eq!(reroute_count, 0, "handshake metadata must not reroute a turn");
+    assert_eq!(warning_count, 0, "handshake metadata must not warn the user");
 
-    let connection = server.single_connection();
+    let connections = server.connections();
+    assert_eq!(connections.len(), 2, "expected warmup and real-turn connections");
+    let connection = &connections[1];
     assert_eq!(connection.len(), 3, "expected two tool calls and continuation");
     let first_output = connection[1]
         .body_json()["input"]

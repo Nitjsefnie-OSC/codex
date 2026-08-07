@@ -124,7 +124,7 @@ impl InputQueue {
         let Some(task) = active_turn.task.as_ref() else {
             return false;
         };
-        if task.kind != TaskKind::Regular {
+        if task.kind != TaskKind::Regular || !task.accepts_monitor_input() {
             return false;
         }
         let mut turn_state = active_turn.turn_state.lock().await;

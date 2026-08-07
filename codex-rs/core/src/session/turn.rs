@@ -131,6 +131,7 @@ use futures::prelude::*;
 use futures::stream::FuturesOrdered;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
+use tracing::debug;
 use tracing::error;
 use tracing::field;
 use tracing::info;
@@ -342,6 +343,11 @@ pub(crate) async fn run_turn(
                 .await?;
 
             // Construct the input that we will send to the model.
+            // Serialize the history snapshot and wake consumption with
+            // monitor delivery. A notification arriving before this lock is
+            // included in the request and can be claimed; one arriving after
+            // it is released retains its durable wake for a later request.
+            let monitor_delivery_guard = sess.input_queue.lock_monitor_delivery().await;
             let sampling_request_input: Vec<ResponseItem> = async {
                 sess.clone_history()
                     .await
@@ -349,6 +355,8 @@ pub(crate) async fn run_turn(
             }
             .instrument(trace_span!("run_turn.prepare_sampling_request_input"))
             .await;
+            sess.input_queue.claim_monitor_wake();
+            drop(monitor_delivery_guard);
 
             let responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(
                 sess.installation_id.clone(),
@@ -2492,17 +2500,10 @@ async fn try_run_sampling_request(
                 }
             }
             ResponseEvent::UnverifiedServerModel(server_model) => {
-                if !turn_context
-                    .server_model_warning_emitted
-                    .load(Ordering::Relaxed)
-                    && sess
-                        .maybe_warn_on_server_model_mismatch(&turn_context, server_model)
-                        .await
-                {
-                    turn_context
-                        .server_model_warning_emitted
-                        .store(true, Ordering::Relaxed);
-                }
+                debug!(
+                    model = %server_model,
+                    "received unverified connection-scoped server model metadata"
+                );
             }
             ResponseEvent::ModelVerifications(verifications) => {
                 if !turn_context

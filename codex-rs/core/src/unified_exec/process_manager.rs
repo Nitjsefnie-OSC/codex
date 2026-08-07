@@ -1474,6 +1474,7 @@ impl UnifiedExecProcessManager {
     }
 
     pub(crate) async fn terminate_all_processes(&self) {
+        let _watcher_lifecycle_guard = self.monitor_watcher_lifecycle_lock.lock().await;
         // Session teardown is a deliberate stop, not a crash: mark monitors
         // before killing so each watcher's terminal notification says so.
         for handle in self.monitor_store.lock().await.all() {
@@ -1494,7 +1495,7 @@ impl UnifiedExecProcessManager {
             unregister_network_approval_for_entry(&entry).await;
             entry.process.terminate();
         }
-        self.join_monitor_watchers().await;
+        self.join_monitor_watchers_locked().await;
     }
 
     pub(crate) async fn list_processes(&self) -> Vec<BackgroundTerminalInfo> {
@@ -1570,6 +1571,7 @@ impl UnifiedExecProcessManager {
         transcript: &Arc<tokio::sync::Mutex<HeadTailBuffer>>,
         attachment: MonitorAttachment,
     ) -> Vec<u8> {
+        let _watcher_lifecycle_guard = self.monitor_watcher_lifecycle_lock.lock().await;
         let (seed, receiver) = {
             let mut output_buffer = process.output_handles().output_buffer.lock().await;
             let seed = output_buffer.drain();
@@ -1608,6 +1610,11 @@ impl UnifiedExecProcessManager {
     }
 
     pub(crate) async fn join_monitor_watchers(&self) {
+        let _watcher_lifecycle_guard = self.monitor_watcher_lifecycle_lock.lock().await;
+        self.join_monitor_watchers_locked().await;
+    }
+
+    async fn join_monitor_watchers_locked(&self) {
         let watchers = std::mem::take(&mut *self.monitor_watcher_tasks.lock().await);
         for watcher in watchers {
             if let Err(err) = watcher.await {

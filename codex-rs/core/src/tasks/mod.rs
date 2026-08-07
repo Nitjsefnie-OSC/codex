@@ -13,6 +13,7 @@ use codex_extension_api::ThreadIdleCause;
 use futures::future::BoxFuture;
 use tokio::select;
 use tokio::sync::Notify;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
@@ -27,6 +28,7 @@ use crate::codex_thread::BackgroundTerminalInfo;
 use crate::codex_thread::TryStartTurnIfIdleRejectionReason;
 use crate::config::Config;
 use crate::context::ContextualUserFragment;
+use crate::context::MonitorNotification;
 use crate::session::TurnInput;
 use crate::session::session::Session;
 use crate::session::turn::run_hooks_and_record_inputs;
@@ -195,6 +197,13 @@ pub(crate) trait SessionTask: Send + Sync + 'static {
     /// Returns the tracing name for a spawned task span.
     fn span_name(&self) -> &'static str;
 
+    /// Whether monitor notifications can be consumed as model-turn input by
+    /// this task. Standalone command tasks share the regular task kind but do
+    /// not sample a model, so they must leave durable monitor wakes intact.
+    fn accepts_monitor_input(&self) -> bool {
+        true
+    }
+
     /// Executes the task until completion or cancellation.
     ///
     /// Implementations typically stream protocol events using `session` and
@@ -234,6 +243,8 @@ pub(crate) trait AnySessionTask: Send + Sync + 'static {
 
     fn span_name(&self) -> &'static str;
 
+    fn accepts_monitor_input(&self) -> bool;
+
     fn run(
         self: Arc<Self>,
         session: Arc<Session>,
@@ -255,6 +266,10 @@ where
 
     fn span_name(&self) -> &'static str {
         SessionTask::span_name(self)
+    }
+
+    fn accepts_monitor_input(&self) -> bool {
+        SessionTask::accepts_monitor_input(self)
     }
 
     fn run(
@@ -296,10 +311,6 @@ impl Session {
             MailboxParentProvenance::Ignore,
         )
         .await;
-        // Claim after start_task publishes the active task. Notifications
-        // arriving during task setup are already in durable history and will
-        // be part of this request; later notifications are injected directly.
-        self.input_queue.claim_monitor_wake();
     }
 
     pub(crate) async fn start_task<T: SessionTask>(
@@ -327,6 +338,7 @@ impl Session {
 
         let cancellation_token = CancellationToken::new();
         let done = Arc::new(Notify::new());
+        let (startup_tx, startup_rx) = oneshot::channel();
 
         self.services
             .guardian_rejection_circuit_breaker
@@ -387,6 +399,12 @@ impl Session {
         );
         let handle = tokio::spawn(
             async move {
+                // The active task must be published before the model can
+                // clone history. Monitor delivery uses that publication as
+                // its startup barrier, avoiding a history/wake race.
+                if startup_rx.await.is_err() {
+                    return;
+                }
                 let ctx_for_finish = Arc::clone(&ctx);
                 let task_result = task_for_run
                     .run(
@@ -436,6 +454,7 @@ impl Session {
             _timer: timer,
         };
         turn.task = Some(running_task);
+        let _ = startup_tx.send(());
     }
 
     /// Returns whether an extension has marked this thread as durably asleep.
@@ -509,7 +528,6 @@ impl Session {
             MailboxParentProvenance::Attribute,
         )
         .await;
-        self.input_queue.claim_monitor_wake();
     }
 
     pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {
@@ -642,10 +660,21 @@ impl Session {
         let Some((turn_state, mut task_ended_before_persistence)) = turn_state else {
             return;
         };
+        // Keep pending monitor extraction, terminal history, and the wake
+        // generation ordered with watcher delivery. Otherwise a late watcher
+        // can overtake this turn's older notification or leave it without a
+        // follow-up request.
+        let monitor_delivery_guard = self.input_queue.lock_monitor_delivery().await;
         let pending_input = self
             .input_queue
             .take_pending_input_for_turn_state(turn_state.as_ref())
             .await;
+        let has_pending_monitor_items = pending_input.iter().any(|input| {
+            matches!(
+                input,
+                TurnInput::ResponseItem(item) if MonitorNotification::is_response_item(item)
+            )
+        });
         let (turn_had_memory_citation, turn_tool_calls, token_usage_at_turn_start) = {
             let ts = turn_state.lock().await;
             (
@@ -655,6 +684,9 @@ impl Session {
             )
         };
         run_hooks_and_record_inputs(self, &turn_context, &pending_input).await;
+        if has_pending_monitor_items {
+            self.input_queue.request_monitor_wake();
+        }
         task_ended_before_persistence |= self
             .pending_user_message_admissions
             .complete_task_end(&turn_context.sub_id);
@@ -863,6 +895,10 @@ impl Session {
         // thread writers may not flush it without another explicit barrier.
         if let Err(err) = self.flush_rollout().await {
             warn!("failed to flush rollout after emitting terminal turn event: {err}");
+        }
+        drop(monitor_delivery_guard);
+        if has_pending_monitor_items {
+            self.input_queue.notify_monitor_wake();
         }
         if cleared_active_turn {
             self.maybe_start_turn_for_pending_work().await;
