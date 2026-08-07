@@ -19,8 +19,10 @@ use crate::session::turn_context::TurnEnvironment;
 use crate::shell::Shell;
 use crate::shell::ShellType;
 use crate::skills::skill_activation_snapshot;
+use crate::skills::tests::assert_implicit_skill_candidate;
 use crate::skills::tests::configure_implicit_skill_fixture_for_exec;
 use crate::skills::tests::implicit_skill_fixture;
+use crate::skills::tests::quote_skill_test_path;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
@@ -359,7 +361,11 @@ async fn build_post_tool_use_payload_uses_tool_output_wire_value() {
 async fn classic_shell_implicit_skill_activation_actual_nonzero_does_not_record() {
     let mut fixture = implicit_skill_fixture(SkillScope::Repo).await;
     configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::Disabled);
-    let command = format!("cat {}; exit 9", fixture.skill_path.display());
+    let command = format!(
+        "cat {} ; exit 9",
+        quote_skill_test_path(&fixture.skill_path)
+    );
+    assert_implicit_skill_candidate(&fixture, &command).await;
     let turn = Arc::new(fixture.turn);
     let invocation = classic_shell_invocation(
         Arc::new(fixture.session),
@@ -385,7 +391,8 @@ async fn classic_shell_implicit_skill_activation_actual_nonzero_does_not_record(
 async fn classic_shell_implicit_skill_activation_actual_escalation_rejection_does_not_record() {
     let mut fixture = implicit_skill_fixture(SkillScope::System).await;
     configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::Disabled);
-    let command = format!("cat {}", fixture.skill_path.display());
+    let command = format!("cat {}", quote_skill_test_path(&fixture.skill_path));
+    assert_implicit_skill_candidate(&fixture, &command).await;
     let turn = Arc::new(fixture.turn);
     let invocation = ToolInvocation {
         payload: ToolPayload::Function {
@@ -421,10 +428,11 @@ async fn classic_shell_implicit_skill_activation_actual_sandbox_denial_does_not_
     configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::read_only());
     let denied_path = fixture.workdir.join("sandbox-denied.txt");
     let command = format!(
-        "cat {}; printf denied > {}",
-        fixture.skill_path.display(),
-        denied_path.display()
+        "cat {} ; echo denied > {}",
+        quote_skill_test_path(&fixture.skill_path),
+        quote_skill_test_path(&denied_path)
     );
+    assert_implicit_skill_candidate(&fixture, &command).await;
     let turn = Arc::new(fixture.turn);
 
     let Err(error) = ShellCommandHandler::from(codex_tools::ShellCommandBackendConfig::Classic)

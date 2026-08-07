@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use codex_core_skills::loader::MAX_CONCURRENT_ROOT_SCANS;
@@ -105,6 +106,29 @@ pub(crate) fn configure_implicit_skill_fixture_for_exec(
     environment.config.permission_profile = PermissionProfileSnapshot::legacy(permission_profile);
 }
 
+pub(crate) fn quote_skill_test_path(path: &Path) -> String {
+    shlex::try_quote(path.to_string_lossy().as_ref())
+        .expect("skill test path should be shell-quotable")
+        .into_owned()
+}
+
+pub(crate) async fn assert_implicit_skill_candidate(fixture: &ImplicitSkillFixture, command: &str) {
+    let cwd = fixture
+        .turn
+        .environments
+        .primary()
+        .expect("test session should have a primary environment")
+        .cwd()
+        .to_abs_path()
+        .expect("test session should use a native cwd");
+    assert!(
+        prepare_implicit_skill_activation(&fixture.session, &fixture.turn, command, &cwd)
+            .await
+            .is_some(),
+        "exact handler command should prepare an implicit skill candidate: {command}"
+    );
+}
+
 fn activation(name: &str, path: &str, digest_digit: char) -> SkillActivation {
     SkillActivation::new(
         name.to_string(),
@@ -171,7 +195,7 @@ async fn pending_skill_activation_is_hidden_until_promoted_and_can_be_discarded(
 #[tokio::test]
 async fn implicit_skill_activation_candidate_reads_current_source_and_keeps_distinct_digests() {
     let fixture = implicit_skill_fixture(SkillScope::Repo).await;
-    let command = format!("cat {}", fixture.skill_path.display());
+    let command = format!("cat {}", quote_skill_test_path(&fixture.skill_path));
 
     let original = prepare_implicit_skill_activation(
         &fixture.session,
@@ -216,7 +240,7 @@ async fn implicit_skill_activation_candidate_reads_current_source_and_keeps_dist
 #[tokio::test]
 async fn implicit_skill_activation_candidate_repeated_unchanged_read_collapses_exact_record() {
     let fixture = implicit_skill_fixture(SkillScope::User).await;
-    let command = format!("cat {}", fixture.skill_path.display());
+    let command = format!("cat {}", quote_skill_test_path(&fixture.skill_path));
 
     let first = prepare_implicit_skill_activation(
         &fixture.session,
@@ -256,7 +280,7 @@ async fn implicit_skill_activation_candidate_skips_unrelated_or_unreadable_sourc
     );
 
     std::fs::remove_file(fixture.skill_path.as_path()).expect("remove skill source");
-    let recognized_command = format!("cat {}", fixture.skill_path.display());
+    let recognized_command = format!("cat {}", quote_skill_test_path(&fixture.skill_path));
     assert_eq!(
         prepare_implicit_skill_activation(
             &fixture.session,

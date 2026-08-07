@@ -518,8 +518,10 @@ mod implicit_activation_tests {
     use crate::session::tests::make_session_and_context;
     use crate::skills::promote_pending_skill_activation;
     use crate::skills::skill_activation_snapshot;
+    use crate::skills::tests::assert_implicit_skill_candidate;
     use crate::skills::tests::configure_implicit_skill_fixture_for_exec;
     use crate::skills::tests::implicit_skill_fixture;
+    use crate::skills::tests::quote_skill_test_path;
     use crate::tools::context::ToolCallSource;
     use crate::turn_diff_tracker::TurnDiffTracker;
 
@@ -576,7 +578,11 @@ mod implicit_activation_tests {
     async fn unified_exec_implicit_skill_activation_actual_nonzero_does_not_record() {
         let mut fixture = implicit_skill_fixture(codex_protocol::protocol::SkillScope::Repo).await;
         configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::Disabled);
-        let command = format!("cat {}; exit 7", fixture.skill_path.display());
+        let command = format!(
+            "cat {} ; exit 7",
+            quote_skill_test_path(&fixture.skill_path)
+        );
+        assert_implicit_skill_candidate(&fixture, &command).await;
         let turn = Arc::new(fixture.turn);
 
         ExecCommandHandler::default()
@@ -596,7 +602,7 @@ mod implicit_activation_tests {
     async fn unified_exec_implicit_skill_activation_actual_rewritten_terminal_zero_records() {
         let mut fixture = implicit_skill_fixture(codex_protocol::protocol::SkillScope::Admin).await;
         configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::Disabled);
-        let rewritten_command = format!("cat {}", fixture.skill_path.display());
+        let rewritten_command = format!("cat {}", quote_skill_test_path(&fixture.skill_path));
         let turn = Arc::new(fixture.turn);
         let handler = ExecCommandHandler::default();
         let original = invocation(
@@ -625,7 +631,8 @@ mod implicit_activation_tests {
         let mut fixture =
             implicit_skill_fixture(codex_protocol::protocol::SkillScope::System).await;
         configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::Disabled);
-        let command = format!("cat {}", fixture.skill_path.display());
+        let command = format!("cat {}", quote_skill_test_path(&fixture.skill_path));
+        assert_implicit_skill_candidate(&fixture, &command).await;
         let turn = Arc::new(fixture.turn);
 
         let Err(error) = ExecCommandHandler::default()
@@ -654,10 +661,11 @@ mod implicit_activation_tests {
         configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::read_only());
         let denied_path = fixture.workdir.join("sandbox-denied.txt");
         let command = format!(
-            "cat {}; printf denied > {}",
-            fixture.skill_path.display(),
-            denied_path.display()
+            "cat {} ; echo denied > {}",
+            quote_skill_test_path(&fixture.skill_path),
+            quote_skill_test_path(&denied_path)
         );
+        assert_implicit_skill_candidate(&fixture, &command).await;
         let turn = Arc::new(fixture.turn);
 
         let result = ExecCommandHandler::default()

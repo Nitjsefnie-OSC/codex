@@ -310,6 +310,7 @@ mod tests {
     use crate::skills::skill_activation_snapshot;
     use crate::skills::tests::configure_implicit_skill_fixture_for_exec;
     use crate::skills::tests::implicit_skill_fixture;
+    use crate::skills::tests::quote_skill_test_path;
     use crate::tools::context::ToolCallSource;
     use crate::turn_diff_tracker::TurnDiffTracker;
 
@@ -332,7 +333,7 @@ mod tests {
                 arguments: json!({ "command": "echo not-a-skill-read" }).to_string(),
             },
         };
-        let rewritten_command = format!("cat {}", fixture.skill_path.display());
+        let rewritten_command = format!("cat {}", quote_skill_test_path(&fixture.skill_path));
         let rewritten = handler
             .with_updated_hook_input(original, json!({ "command": rewritten_command }))
             .expect("rewrite tool input");

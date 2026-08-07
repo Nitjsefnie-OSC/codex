@@ -165,6 +165,7 @@ mod implicit_activation_tests {
     use crate::skills::skill_activation_snapshot;
     use crate::skills::tests::configure_implicit_skill_fixture_for_exec;
     use crate::skills::tests::implicit_skill_fixture;
+    use crate::skills::tests::quote_skill_test_path;
     use crate::tools::context::ExecCommandToolOutput;
     use crate::tools::context::ToolCallSource;
     use crate::tools::registry::ToolExecutor;
@@ -280,7 +281,10 @@ mod implicit_activation_tests {
     async fn write_stdin_implicit_skill_activation_actual_yielded_zero_promotes_requested_id() {
         let mut fixture = implicit_skill_fixture(codex_protocol::protocol::SkillScope::Repo).await;
         configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::Disabled);
-        let command = format!("sleep 1 ; cat {}", fixture.skill_path.display());
+        let command = format!(
+            "sleep 1 ; cat {}",
+            quote_skill_test_path(&fixture.skill_path)
+        );
         let session = Arc::new(fixture.session);
         let turn = Arc::new(fixture.turn);
         let process_id = start_yielded_skill_read(
@@ -305,7 +309,10 @@ mod implicit_activation_tests {
     async fn write_stdin_implicit_skill_activation_actual_yielded_nonzero_discards_requested_id() {
         let mut fixture = implicit_skill_fixture(codex_protocol::protocol::SkillScope::User).await;
         configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::Disabled);
-        let command = format!("sleep 1 ; cat {} ; false", fixture.skill_path.display());
+        let command = format!(
+            "sleep 1 ; cat {} ; false",
+            quote_skill_test_path(&fixture.skill_path)
+        );
         let session = Arc::new(fixture.session);
         let turn = Arc::new(fixture.turn);
         let process_id = start_yielded_skill_read(
@@ -333,7 +340,10 @@ mod implicit_activation_tests {
     async fn write_stdin_implicit_skill_activation_actual_cross_turn_poll_cannot_promote() {
         let mut fixture = implicit_skill_fixture(codex_protocol::protocol::SkillScope::Repo).await;
         configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::Disabled);
-        let command = format!("sleep 1 ; cat {}", fixture.skill_path.display());
+        let command = format!(
+            "sleep 1 ; cat {}",
+            quote_skill_test_path(&fixture.skill_path)
+        );
         let session = Arc::new(fixture.session);
         let turn_a = Arc::new(fixture.turn);
         let process_id = start_yielded_skill_read(
