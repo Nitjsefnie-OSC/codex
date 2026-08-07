@@ -19,6 +19,7 @@ use crate::engine::output_parser;
 use crate::output_spill::AdditionalContext;
 use crate::schema::PreToolUseCommandInput;
 use crate::schema::SubagentCommandInputFields;
+use crate::skill_activation::SkillActivation;
 
 #[derive(Debug, Clone)]
 pub struct PreToolUseRequest {
@@ -33,6 +34,7 @@ pub struct PreToolUseRequest {
     pub matcher_aliases: Vec<String>,
     pub tool_use_id: String,
     pub tool_input: Value,
+    pub skill_activations: Vec<SkillActivation>,
 }
 
 #[derive(Debug)]
@@ -174,6 +176,13 @@ fn latest_updated_input(
 /// tools pass their resolved JSON arguments.
 fn command_input_json(request: &PreToolUseRequest) -> Result<String, serde_json::Error> {
     let subagent = SubagentCommandInputFields::from(request.subagent.as_ref());
+    let mut skill_activations = request.skill_activations.clone();
+    skill_activations.sort_by(|left, right| {
+        left.path()
+            .cmp(right.path())
+            .then_with(|| left.invocation().cmp(&right.invocation()))
+            .then_with(|| left.content_sha256().cmp(right.content_sha256()))
+    });
     serde_json::to_string(&PreToolUseCommandInput {
         session_id: request.session_id.to_string(),
         turn_id: request.turn_id.clone(),
@@ -187,7 +196,7 @@ fn command_input_json(request: &PreToolUseRequest) -> Result<String, serde_json:
         tool_name: request.tool_name.clone(),
         tool_input: request.tool_input.clone(),
         tool_use_id: request.tool_use_id.clone(),
-        skill_activations: Vec::new(),
+        skill_activations,
     })
 }
 

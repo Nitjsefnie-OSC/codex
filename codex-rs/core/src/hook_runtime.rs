@@ -191,6 +191,7 @@ pub(crate) async fn run_pre_tool_use_hooks(
         matcher_aliases: tool_name.matcher_aliases().to_vec(),
         tool_use_id,
         tool_input: tool_input.clone(),
+        skill_activations: Vec::new(),
     };
     let hooks = sess.hooks();
     let preview_runs = hooks.preview_pre_tool_use(&request);
@@ -295,6 +296,7 @@ pub(crate) async fn run_post_tool_use_hooks(
         tool_use_id,
         tool_input,
         tool_response,
+        skill_activations: Vec::new(),
     };
     let hooks = sess.hooks();
     let preview_runs = hooks.preview_post_tool_use(&request);
