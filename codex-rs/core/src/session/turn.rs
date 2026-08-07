@@ -2491,6 +2491,19 @@ async fn try_run_sampling_request(
                         .store(true, Ordering::Relaxed);
                 }
             }
+            ResponseEvent::UnverifiedServerModel(server_model) => {
+                if !turn_context
+                    .server_model_warning_emitted
+                    .load(Ordering::Relaxed)
+                    && sess
+                        .maybe_warn_on_server_model_mismatch(&turn_context, server_model)
+                        .await
+                {
+                    turn_context
+                        .server_model_warning_emitted
+                        .store(true, Ordering::Relaxed);
+                }
+            }
             ResponseEvent::ModelVerifications(verifications) => {
                 if !turn_context
                     .model_verification_emitted

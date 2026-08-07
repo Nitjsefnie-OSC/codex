@@ -7,8 +7,6 @@ use crate::tools::router::ToolRouter;
 use codex_exec_server::ExecutorCapabilityDiscoverySnapshot;
 use codex_exec_server::ResolvedSelectedCapabilityRoot;
 use codex_mcp::McpBinding;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 
 /// Response-scoped server identity observed while a sampling step is in flight.
@@ -18,15 +16,21 @@ use tokio::sync::Mutex;
 /// of the current response before a tool call reads it.
 #[derive(Debug, Default)]
 pub(crate) struct ResponseIdentityState {
-    generation: AtomicU64,
-    latest_server_model: Mutex<Option<String>>,
+    state: Mutex<ResponseIdentitySnapshot>,
+}
+
+#[derive(Debug, Default)]
+struct ResponseIdentitySnapshot {
+    generation: u64,
+    latest_server_model: Option<String>,
 }
 
 impl ResponseIdentityState {
     pub(crate) async fn begin_response(&self) -> u64 {
-        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
-        *self.latest_server_model.lock().await = None;
-        generation
+        let mut state = self.state.lock().await;
+        state.generation = state.generation.wrapping_add(1);
+        state.latest_server_model = None;
+        state.generation
     }
 
     pub(crate) async fn record_server_model_for_response(
@@ -34,14 +38,14 @@ impl ResponseIdentityState {
         response_generation: u64,
         server_model: String,
     ) {
-        let mut latest_server_model = self.latest_server_model.lock().await;
-        if self.generation.load(Ordering::Acquire) == response_generation {
-            *latest_server_model = Some(server_model);
+        let mut state = self.state.lock().await;
+        if state.generation == response_generation {
+            state.latest_server_model = Some(server_model);
         }
     }
 
     pub(crate) async fn latest_server_model(&self) -> Option<String> {
-        self.latest_server_model.lock().await.clone()
+        self.state.lock().await.latest_server_model.clone()
     }
 }
 

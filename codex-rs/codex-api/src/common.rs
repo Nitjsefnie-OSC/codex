@@ -78,9 +78,14 @@ pub enum ResponseEvent {
     SafetyBuffering(SafetyBuffering),
     OutputItemDone(ResponseItem),
     OutputItemAdded(ResponseItem),
-    /// Emitted when the server includes `OpenAI-Model` on the stream response.
-    /// This can differ from the requested model when backend safety routing applies.
+    /// Emitted when the response transport reports a per-response model.
+    /// This can differ from the requested model when backend safety routing
+    /// applies. Connection-handshake metadata is never emitted here.
     ServerModel(String),
+    /// Emitted for transport metadata that is not tied to an individual
+    /// response, currently the WebSocket connection handshake. It is useful
+    /// for diagnostics and mismatch warnings, but is not model attestation.
+    UnverifiedServerModel(String),
     /// Emitted when the server recommends additional account verification.
     ModelVerifications(Vec<ModelVerification>),
     /// Emitted when the server includes moderation metadata for first-party turn presentation.

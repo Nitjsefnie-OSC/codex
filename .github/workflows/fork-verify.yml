@@ -96,6 +96,25 @@ jobs:
           cargo test -p codex-tui --lib update_versions
           cargo test -p codex-cli --bin codex doctor::updates
 
+      - name: codex-api WebSocket provenance tests
+        # Run transport provenance before the monitor gate so a model identity
+        # regression remains independently attributable when monitor coverage
+        # is unavailable or fails for an unrelated reason.
+        working-directory: codex-rs
+        run: |
+          cargo test -p codex-api --lib websocket_handshake_model -- --nocapture
+          cargo test -p codex-api --lib websocket_response_model_attestation -- --nocapture
+
+      - name: whoami provenance tests
+        # whoami must distinguish request metadata from the response-scoped
+        # server model, including when a later sampling step has no model
+        # report. Keep this focused so provenance regressions are attributed
+        # separately from the monitor integration suite.
+        working-directory: codex-rs
+        run: |
+          cargo test -p codex-core --lib whoami -- --nocapture
+          cargo test -p codex-core --test suite whoami -- --nocapture
+
       - name: monitor tool tests
         # The dev box may not run cargo test, so this is where the monitor's
         # contract is actually executed: notification batching and sequencing,
@@ -108,16 +127,6 @@ jobs:
           cargo test -p codex-core --lib try_start_turn_if_idle -- --nocapture
           cargo test -p codex-core --test suite monitor -- --nocapture
           df -h /
-
-      - name: whoami provenance tests
-        # whoami must distinguish request metadata from the response-scoped
-        # server model, including when a later sampling step has no model
-        # report. Keep this focused so provenance regressions are attributed
-        # separately from the monitor integration suite.
-        working-directory: codex-rs
-        run: |
-          cargo test -p codex-core --lib whoami -- --nocapture
-          cargo test -p codex-core --test suite whoami -- --nocapture
 
       - name: golden tool-name list
         working-directory: codex-rs

@@ -185,7 +185,7 @@ pub struct ResponsesWebsocketConnection {
     idle_timeout: Duration,
     server_reasoning_included: bool,
     models_etag: Option<String>,
-    server_model: Option<String>,
+    handshake_server_model: Option<String>,
     telemetry: Option<Arc<dyn WebsocketTelemetry>>,
 }
 
@@ -196,7 +196,7 @@ impl std::fmt::Debug for ResponsesWebsocketConnection {
             .field("idle_timeout", &self.idle_timeout)
             .field("server_reasoning_included", &self.server_reasoning_included)
             .field("models_etag", &self.models_etag)
-            .field("server_model", &self.server_model)
+            .field("handshake_server_model", &self.handshake_server_model)
             .field("telemetry", &self.telemetry.as_ref().map(|_| "<telemetry>"))
             .finish()
     }
@@ -208,7 +208,7 @@ impl ResponsesWebsocketConnection {
         idle_timeout: Duration,
         server_reasoning_included: bool,
         models_etag: Option<String>,
-        server_model: Option<String>,
+        handshake_server_model: Option<String>,
         telemetry: Option<Arc<dyn WebsocketTelemetry>>,
     ) -> Self {
         Self {
@@ -216,7 +216,7 @@ impl ResponsesWebsocketConnection {
             idle_timeout,
             server_reasoning_included,
             models_etag,
-            server_model,
+            handshake_server_model,
             telemetry,
         }
     }
@@ -243,7 +243,7 @@ impl ResponsesWebsocketConnection {
         let idle_timeout = self.idle_timeout;
         let server_reasoning_included = self.server_reasoning_included;
         let models_etag = self.models_etag.clone();
-        let server_model = self.server_model.clone();
+        let handshake_server_model = self.handshake_server_model.clone();
         let telemetry = self.telemetry.clone();
         let ResponsesWsRequest::ResponseCreate(ws_request) = &request;
         let client_metadata = ws_request.client_metadata.as_ref();
@@ -281,7 +281,7 @@ impl ResponsesWebsocketConnection {
             async move {
                 if let Some(event) = websocket_connection_model_event(
                     connection_reused,
-                    server_model.as_deref(),
+                    handshake_server_model.as_deref(),
                 ) {
                     let _ = tx_event.send(Ok(event)).await;
                 }
@@ -396,14 +396,14 @@ impl ResponsesWebsocketClient {
             merge_request_headers(&self.provider.headers, extra_headers, default_headers);
         self.auth.add_auth_headers(&mut headers);
 
-        let (stream, _status, server_reasoning_included, models_etag, server_model) =
+        let (stream, _status, server_reasoning_included, models_etag, _handshake_server_model) =
             connect_websocket(ws_url, headers, http_client_factory, turn_state.clone()).await?;
         Ok(ResponsesWebsocketConnection::new(
             stream,
             self.provider.stream_idle_timeout,
             server_reasoning_included,
             models_etag,
-            server_model,
+            _handshake_server_model,
             telemetry,
         ))
     }
@@ -685,6 +685,7 @@ async fn run_websocket_response_stream(
     timing_log_context: &ResponsesWebsocketTimingLogContext,
 ) -> Result<(), ApiError> {
     let mut last_server_model: Option<String> = None;
+    let mut last_unverified_server_model: Option<String> = None;
     let mut safety_buffering_treatment = SafetyBufferingTreatment::default();
     send_websocket_request(
         ws_stream,
@@ -753,6 +754,14 @@ async fn run_websocket_response_stream(
                         let _ = tx_event.send(Ok(ResponseEvent::RateLimits(snapshot))).await;
                     }
                     continue;
+                }
+                if let Some(model) = event.header_model()
+                    && last_unverified_server_model.as_deref() != Some(model.as_str())
+                {
+                    let _ = tx_event
+                        .send(Ok(ResponseEvent::UnverifiedServerModel(model.clone())))
+                        .await;
+                    last_unverified_server_model = Some(model);
                 }
                 if let Some(model) = event.response_model()
                     && last_server_model.as_deref() != Some(model.as_str())
@@ -902,12 +911,13 @@ fn serialize_websocket_request(request: &ResponsesWsRequest<'_>) -> Result<Strin
 
 fn websocket_connection_model_event(
     connection_reused: bool,
-    server_model: Option<&str>,
+    handshake_server_model: Option<&str>,
 ) -> Option<ResponseEvent> {
     if connection_reused {
         None
     } else {
-        server_model.map(|model| ResponseEvent::ServerModel(model.to_string()))
+        handshake_server_model
+            .map(|model| ResponseEvent::UnverifiedServerModel(model.to_string()))
     }
 }
 
@@ -992,13 +1002,34 @@ mod tests {
     }
 
     #[test]
-    fn websocket_connection_model_is_only_reported_for_new_connections() {
+    fn websocket_handshake_model_is_unverified_and_only_reported_for_new_connections() {
         assert!(matches!(
             websocket_connection_model_event(false, Some("gpt-5.2")),
-            Some(ResponseEvent::ServerModel(model)) if model == "gpt-5.2"
+            Some(ResponseEvent::UnverifiedServerModel(model)) if model == "gpt-5.2"
         ));
         assert!(websocket_connection_model_event(true, Some("gpt-5.2")).is_none());
         assert!(websocket_connection_model_event(false, None).is_none());
+    }
+
+    #[test]
+    fn websocket_response_model_attestation_comes_from_response_model() {
+        let event: ResponsesStreamEvent = serde_json::from_value(json!({
+            "type": "response.created",
+            "headers": {
+                "openai-model": "connection-model"
+            },
+            "response": {
+                "id": "resp-1",
+                "model": "routed-model",
+                "headers": {
+                    "openai-model": "response-header-model"
+                }
+            }
+        }))
+        .expect("expected websocket response event to deserialize");
+
+        assert_eq!(event.response_model().as_deref(), Some("routed-model"));
+        assert_eq!(event.header_model().as_deref(), Some("response-header-model"));
     }
 
     #[test]
