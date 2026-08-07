@@ -560,7 +560,7 @@ mod implicit_activation_tests {
         );
         assert_eq!(skill_activation_snapshot(&turn).len(), 1);
         assert!(promote_pending_skill_activation(&turn, 31));
-        assert_eq!(skill_activation_snapshot(&turn), vec![yielded, terminal]);
+        assert_eq!(skill_activation_snapshot(&turn), vec![terminal, yielded]);
     }
 
     #[tokio::test]
