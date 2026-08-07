@@ -1186,6 +1186,7 @@ mod tests {
                 "tool_name": "Bash",
                 "tool_input": { "command": "echo hello" },
                 "tool_use_id": "tool-1",
+                "skill_activations": [],
             })
         );
 
