@@ -11,6 +11,7 @@ use codex_protocol::protocol::HookRunSummary;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
 use super::common;
+use crate::background_state::BackgroundState;
 use crate::engine::CommandShell;
 use crate::engine::ConfiguredHandler;
 use crate::engine::command_runner::CommandRunResult;
@@ -30,6 +31,10 @@ pub struct StopRequest {
     pub permission_mode: String,
     pub stop_hook_active: bool,
     pub last_assistant_message: Option<String>,
+    /// Work the turn started that is still outstanding. Read from the process
+    /// manager when the hook fires, so a hook can refuse to let a turn end on
+    /// top of a running build or unread monitor output.
+    pub background: BackgroundState,
     pub target: StopHookTarget,
 }
 
@@ -113,67 +118,18 @@ pub(crate) async fn run(
         };
     }
 
-    let input_json = match request.target {
-        StopHookTarget::Stop => {
-            let input = StopCommandInput {
-                session_id: request.session_id.to_string(),
-                turn_id: request.turn_id.clone(),
-                transcript_path: NullableString::from_path(request.transcript_path.clone()),
-                cwd: request.cwd.display().to_string(),
-                hook_event_name: "Stop".to_string(),
-                model: request.model.clone(),
-                permission_mode: request.permission_mode.clone(),
-                stop_hook_active: request.stop_hook_active,
-                last_assistant_message: NullableString::from_string(
-                    request.last_assistant_message.clone(),
-                ),
+    let input_json = match build_input_json(&request) {
+        Ok(input_json) => input_json,
+        Err(error) => {
+            let label = match request.target {
+                StopHookTarget::Stop => "stop hook input",
+                StopHookTarget::SubagentStop { .. } => "subagent stop hook input",
             };
-            match serde_json::to_string(&input) {
-                Ok(input_json) => input_json,
-                Err(error) => {
-                    return serialization_failure_outcome(
-                        common::serialization_failure_hook_events(
-                            matched,
-                            Some(request.turn_id),
-                            format!("failed to serialize stop hook input: {error}"),
-                        ),
-                    );
-                }
-            }
-        }
-        StopHookTarget::SubagentStop {
-            agent_id,
-            agent_type,
-            agent_transcript_path,
-        } => {
-            let input = SubagentStopCommandInput {
-                session_id: request.session_id.to_string(),
-                turn_id: request.turn_id.clone(),
-                transcript_path: NullableString::from_path(request.transcript_path.clone()),
-                agent_transcript_path: NullableString::from_path(agent_transcript_path),
-                cwd: request.cwd.display().to_string(),
-                hook_event_name: "SubagentStop".to_string(),
-                model: request.model.clone(),
-                permission_mode: request.permission_mode.clone(),
-                stop_hook_active: request.stop_hook_active,
-                agent_id,
-                agent_type,
-                last_assistant_message: NullableString::from_string(
-                    request.last_assistant_message.clone(),
-                ),
-            };
-            match serde_json::to_string(&input) {
-                Ok(input_json) => input_json,
-                Err(error) => {
-                    return serialization_failure_outcome(
-                        common::serialization_failure_hook_events(
-                            matched,
-                            Some(request.turn_id),
-                            format!("failed to serialize subagent stop hook input: {error}"),
-                        ),
-                    );
-                }
-            }
+            return serialization_failure_outcome(common::serialization_failure_hook_events(
+                matched,
+                Some(request.turn_id),
+                format!("failed to serialize {label}: {error}"),
+            ));
         }
     };
 
@@ -196,6 +152,51 @@ pub(crate) async fn run(
         should_block: aggregate.should_block,
         block_reason: aggregate.block_reason,
         continuation_fragments: aggregate.continuation_fragments,
+    }
+}
+
+/// Renders the JSON a stop hook reads on stdin.
+///
+/// Split out of `run` so the payload can be asserted without standing up a
+/// shell and a handler: the fields a gate hook reads are a contract, and the
+/// contract is what a test should pin.
+fn build_input_json(request: &StopRequest) -> Result<String, serde_json::Error> {
+    match &request.target {
+        StopHookTarget::Stop => serde_json::to_string(&StopCommandInput {
+            session_id: request.session_id.to_string(),
+            turn_id: request.turn_id.clone(),
+            transcript_path: NullableString::from_path(request.transcript_path.clone()),
+            cwd: request.cwd.display().to_string(),
+            hook_event_name: "Stop".to_string(),
+            model: request.model.clone(),
+            permission_mode: request.permission_mode.clone(),
+            stop_hook_active: request.stop_hook_active,
+            last_assistant_message: NullableString::from_string(
+                request.last_assistant_message.clone(),
+            ),
+            background: request.background.clone(),
+        }),
+        StopHookTarget::SubagentStop {
+            agent_id,
+            agent_type,
+            agent_transcript_path,
+        } => serde_json::to_string(&SubagentStopCommandInput {
+            session_id: request.session_id.to_string(),
+            turn_id: request.turn_id.clone(),
+            transcript_path: NullableString::from_path(request.transcript_path.clone()),
+            agent_transcript_path: NullableString::from_path(agent_transcript_path.clone()),
+            cwd: request.cwd.display().to_string(),
+            hook_event_name: "SubagentStop".to_string(),
+            model: request.model.clone(),
+            permission_mode: request.permission_mode.clone(),
+            stop_hook_active: request.stop_hook_active,
+            agent_id: agent_id.clone(),
+            agent_type: agent_type.clone(),
+            last_assistant_message: NullableString::from_string(
+                request.last_assistant_message.clone(),
+            ),
+            background: request.background.clone(),
+        }),
     }
 }
 
@@ -429,8 +430,14 @@ mod tests {
 
     use codex_protocol::items::HookPromptFragment;
 
+    use codex_protocol::ThreadId;
+
+    use super::BackgroundState;
     use super::StopHandlerData;
+    use super::StopHookTarget;
+    use super::StopRequest;
     use super::aggregate_results;
+    use super::build_input_json;
     use super::parse_completed;
     use crate::engine::ConfiguredHandler;
     use crate::engine::command_runner::CommandRunResult;
@@ -625,6 +632,116 @@ mod tests {
                     HookPromptFragment::from_single_hook("second", "run-2"),
                 ],
             }
+        );
+    }
+
+    fn running_monitor() -> crate::background_state::MonitorSnapshot {
+        crate::background_state::MonitorSnapshot {
+            process_id: 4,
+            command: "cargo build".to_string(),
+            cwd: "/repo".to_string(),
+            kind: "job".to_string(),
+            state: "running".to_string(),
+            running: true,
+            exit_code: None,
+            failure_message: None,
+            age_seconds: 12.0,
+            notifications_delivered: 2,
+            notifications_suppressed: 0,
+            unacknowledged_notifications: 2,
+            owner_model_slug: "gpt-5".to_string(),
+            owner_turn_id: "turn-1".to_string(),
+            owner_call_id: "call-1".to_string(),
+        }
+    }
+
+    fn request(target: StopHookTarget) -> StopRequest {
+        StopRequest {
+            session_id: ThreadId::new(),
+            turn_id: "turn-1".to_string(),
+            cwd: test_path_buf("/repo").abs(),
+            transcript_path: None,
+            model: "gpt-5".to_string(),
+            permission_mode: "default".to_string(),
+            stop_hook_active: false,
+            last_assistant_message: None,
+            background: BackgroundState {
+                monitors: vec![running_monitor()],
+                running_monitors: 1,
+                unacknowledged_notifications: 2,
+                background_terminals: vec![crate::background_state::BackgroundTerminalSnapshot {
+                    process_id: "9".to_string(),
+                    command: "bash".to_string(),
+                    cwd: "/repo".to_string(),
+                }],
+                running_background_terminals: 1,
+            },
+            target,
+        }
+    }
+
+    fn input_value(target: StopHookTarget) -> serde_json::Value {
+        let json = build_input_json(&request(target)).expect("stop input should serialize");
+        serde_json::from_str(&json).expect("stop input should be valid JSON")
+    }
+
+    #[test]
+    fn stop_input_carries_running_background_work() {
+        // Without this a Stop hook cannot tell a turn that finished from one
+        // that walked away from a running build — the rest of the payload is
+        // identical in both cases.
+        let value = input_value(StopHookTarget::Stop);
+
+        assert_eq!(value["hook_event_name"], "Stop");
+        assert_eq!(value["background"]["running_monitors"], 1);
+        assert_eq!(value["background"]["unacknowledged_notifications"], 2);
+        assert_eq!(value["background"]["running_background_terminals"], 1);
+        assert_eq!(value["background"]["monitors"][0]["process_id"], 4);
+        assert_eq!(value["background"]["monitors"][0]["state"], "running");
+        assert_eq!(value["background"]["monitors"][0]["kind"], "job");
+        assert_eq!(
+            value["background"]["monitors"][0]["owner_turn_id"],
+            "turn-1"
+        );
+        assert_eq!(
+            value["background"]["background_terminals"][0]["process_id"],
+            "9"
+        );
+    }
+
+    #[test]
+    fn subagent_stop_input_carries_the_same_background_work() {
+        // A subagent leaving a watcher running is the case this exists for: its
+        // parent never sees the child's process manager.
+        let value = input_value(StopHookTarget::SubagentStop {
+            agent_id: "agent-1".to_string(),
+            agent_type: "implementer".to_string(),
+            agent_transcript_path: None,
+        });
+
+        assert_eq!(value["hook_event_name"], "SubagentStop");
+        assert_eq!(value["agent_type"], "implementer");
+        assert_eq!(value["background"]["running_monitors"], 1);
+        assert_eq!(value["background"]["monitors"][0]["command"], "cargo build");
+    }
+
+    #[test]
+    fn an_idle_turn_reports_empty_background_work() {
+        let mut idle = request(StopHookTarget::Stop);
+        idle.background = BackgroundState::default();
+        let json = build_input_json(&idle).expect("stop input should serialize");
+        let value: serde_json::Value =
+            serde_json::from_str(&json).expect("stop input should be valid JSON");
+
+        // Empty, not absent: a hook reads `background.running_monitors`
+        // unconditionally and a missing key would read as an error, not as
+        // "nothing running".
+        assert_eq!(value["background"]["running_monitors"], 0);
+        assert_eq!(value["background"]["running_background_terminals"], 0);
+        assert_eq!(value["background"]["monitors"], serde_json::json!([]));
+        assert_eq!(
+            value["background"]["background_terminals"],
+            serde_json::json!([])
         );
     }
 

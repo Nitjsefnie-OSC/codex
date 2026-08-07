@@ -241,10 +241,11 @@ mod tests {
     }
 
     #[test]
-    fn every_fork_added_tool_is_declared() {
+    fn every_fork_added_capability_is_declared() {
         let manifest = manifest();
         assert!(manifest.has_capability("tool.whoami"));
         assert!(manifest.has_capability("tool.monitor"));
+        assert!(manifest.has_capability("hook.stop_background_state"));
         assert!(!manifest.has_capability("tool.not-a-thing"));
     }
 

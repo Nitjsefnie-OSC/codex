@@ -1,3 +1,4 @@
+mod background_state;
 mod config_rules;
 mod declarations;
 mod engine;
@@ -10,6 +11,9 @@ mod types;
 
 use codex_protocol::protocol::HookEventName;
 
+pub use background_state::BackgroundState;
+pub use background_state::BackgroundTerminalSnapshot;
+pub use background_state::MonitorSnapshot;
 pub use config_rules::hook_states_from_stack;
 pub use declarations::PluginHookDeclaration;
 pub use declarations::plugin_hook_declarations;
