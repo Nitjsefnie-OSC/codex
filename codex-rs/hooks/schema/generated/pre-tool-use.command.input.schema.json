@@ -7,6 +7,54 @@
         "string",
         "null"
       ]
+    },
+    "SkillActivation": {
+      "additionalProperties": false,
+      "properties": {
+        "content_sha256": {
+          "type": "string"
+        },
+        "invocation": {
+          "$ref": "#/definitions/SkillActivationKind"
+        },
+        "name": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "scope": {
+          "$ref": "#/definitions/SkillActivationScope"
+        },
+        "turn_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "content_sha256",
+        "invocation",
+        "name",
+        "path",
+        "scope",
+        "turn_id"
+      ],
+      "type": "object"
+    },
+    "SkillActivationKind": {
+      "enum": [
+        "explicit",
+        "implicit"
+      ],
+      "type": "string"
+    },
+    "SkillActivationScope": {
+      "enum": [
+        "user",
+        "repo",
+        "system",
+        "admin"
+      ],
+      "type": "string"
     }
   },
   "properties": {
@@ -39,6 +87,12 @@
     "session_id": {
       "type": "string"
     },
+    "skill_activations": {
+      "items": {
+        "$ref": "#/definitions/SkillActivation"
+      },
+      "type": "array"
+    },
     "tool_input": true,
     "tool_name": {
       "type": "string"
@@ -60,6 +114,7 @@
     "model",
     "permission_mode",
     "session_id",
+    "skill_activations",
     "tool_input",
     "tool_name",
     "tool_use_id",
