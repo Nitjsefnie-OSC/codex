@@ -59,7 +59,15 @@ pub fn get_upgrade_version(config: &Config) -> Option<String> {
 
 // We use the latest version from the cask if installation is via homebrew - homebrew does not immediately pick up the latest release and can lag behind.
 const HOMEBREW_CASK_API_URL: &str = "https://formulae.brew.sh/api/cask/codex.json";
-const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/openai/codex/releases/latest";
+
+/// The release channel this build may upgrade from. Read from the fork
+/// manifest so it can never drift back to upstream's releases, which carry
+/// none of this build's capabilities.
+fn latest_release_url() -> &'static str {
+    &codex_fork_manifest::manifest()
+        .release_channel
+        .latest_release_api_url
+}
 
 #[derive(Deserialize, Debug, Clone)]
 struct ReleaseInfo {
@@ -81,6 +89,11 @@ async fn check_for_update(
         ClientRouteClass::Other,
     )
     .with_legacy_custom_ca_fallback();
+    // `action` is already `None` for every install method whose upgrade would
+    // pull an upstream build (see `update_action`), so the package-manager arms
+    // below are unreachable on a fork build and the GitHub arm answers instead.
+    // Keeping them intact means turning the fork's own package-manager releases
+    // on later is a manifest change, not a rewrite.
     let latest_version = match action {
         Some(UpdateAction::BrewUpgrade) => {
             let HomebrewCaskInfo { version } = client_pool
@@ -135,7 +148,7 @@ async fn fetch_latest_github_release_version(
     let ReleaseInfo {
         tag_name: latest_tag_name,
     } = client_pool
-        .get(LATEST_RELEASE_URL)
+        .get(latest_release_url())
         .headers(default_headers())
         .send()
         .await?

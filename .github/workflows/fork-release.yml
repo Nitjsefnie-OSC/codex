@@ -1,0 +1,261 @@
+name: fork-release
+
+# Publishes a checksummed fork build.
+#
+# The fork had no releases at all, which left the only way to get a build with
+# `whoami`/`monitor` in it a local `cargo build` on an unpinned tree — nothing
+# to verify a downloaded binary against, and no way to say which commit a given
+# binary came from. This workflow closes both: it stamps the release commit into
+# the binary through `CODEX_FORK_BUILD_SHA` (see `codex-rs/fork-manifest`), and
+# publishes a `SHA256SUMS` next to every artifact.
+#
+# Release like:
+#
+#     git tag -a fork-v0.1.0 -m "Fork release 0.1.0"
+#     git push origin fork-v0.1.0
+#
+# The tag prefix is `fork-v`, not upstream's `rust-v`, and the updater only
+# accepts this prefix — an upstream tag must not read as an available upgrade
+# for a fork build, because taking it silently removes the fork's capabilities.
+#
+# Targets: `x86_64-unknown-linux-musl` only. That is where this fork is
+# operated, and the musl recipe below (zig, `install-musl-build-tools.sh`, the
+# aws-lc jitter workaround, the pinned rusty_v8 artifacts) is upstream's own —
+# reused rather than reinvented. Adding a target is one matrix entry, but only
+# targets upstream publishes rusty_v8 artifacts for will build.
+
+on:
+  push:
+    tags:
+      - "fork-v*.*.*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and checksum, but do not publish a release"
+        type: boolean
+        default: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  tag-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate the release tag
+        if: ${{ github.event_name == 'push' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${GITHUB_REF_TYPE}" == "tag" ]] \
+            || { echo "❌  Not a tag ref"; exit 1; }
+          # Deliberately not checked against codex-rs/Cargo.toml: fork main
+          # tracks upstream main, whose version stays 0.0.0 between upstream
+          # releases, so a fork release version is its own sequence.
+          [[ "${GITHUB_REF_NAME}" =~ ^fork-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] \
+            || { echo "❌  Tag '${GITHUB_REF_NAME}' is not fork-vMAJOR.MINOR.PATCH"; exit 1; }
+          echo "✅  ${GITHUB_REF_NAME}"
+
+  build:
+    needs: tag-check
+    name: Build - ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: codex-rs
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            binaries: "codex codex-code-mode-host codex-responses-api-proxy"
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Reclaim runner disk
+        shell: bash
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: Install Linux build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            binutils pkg-config libcap-dev
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+          targets: ${{ matrix.target }}
+
+      - name: Use hermetic Cargo home (musl)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_home="${GITHUB_WORKSPACE}/.cargo-home"
+          mkdir -p "${cargo_home}/bin"
+          echo "CARGO_HOME=${cargo_home}" >> "$GITHUB_ENV"
+          echo "${cargo_home}/bin" >> "$GITHUB_PATH"
+          : > "${cargo_home}/config.toml"
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.0
+          use-cache: false
+
+      - name: Install musl build tools
+        env:
+          TARGET: ${{ matrix.target }}
+        run: bash "${GITHUB_WORKSPACE}/.github/scripts/install-musl-build-tools.sh"
+
+      - name: Disable aws-lc jitter entropy (musl)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "AWS_LC_SYS_NO_JITTER_ENTROPY=1" >> "$GITHUB_ENV"
+          target_no_jitter="AWS_LC_SYS_NO_JITTER_ENTROPY_${{ matrix.target }}"
+          target_no_jitter="${target_no_jitter//-/_}"
+          echo "${target_no_jitter}=1" >> "$GITHUB_ENV"
+
+      - name: Configure rusty_v8 artifact overrides and verify checksums
+        uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Build bwrap and export digest
+        shell: bash
+        env:
+          CODEX_FORK_BUILD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          cargo build --target "$target" --release --bin bwrap
+          bwrap_path="target/${target}/release/bwrap"
+          [[ -f "$bwrap_path" ]] || { echo "bwrap binary ${bwrap_path} not found"; exit 1; }
+          # Codex embeds this digest and verifies the bundled bwrap before use,
+          # so it has to cover the exact bytes that get packaged: strip first,
+          # then hash.
+          strip --strip-debug --strip-unneeded "$bwrap_path"
+          digest="$(sha256sum "$bwrap_path" | awk '{print $1}')"
+          echo "CODEX_BWRAP_SHA256=${digest}" >> "$GITHUB_ENV"
+
+      - name: Cargo build
+        shell: bash
+        env:
+          # Pins the manifest's build commit to the commit being released, so a
+          # published binary can name the tree it came from without asking git.
+          CODEX_FORK_BUILD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          build_args=()
+          for binary in ${{ matrix.binaries }}; do
+            build_args+=(--bin "$binary")
+          done
+          cargo build --target "${{ matrix.target }}" --release "${build_args[@]}"
+
+      - name: Verify the build reports the commit it was built from
+        shell: bash
+        run: |
+          set -euo pipefail
+          codex="target/${{ matrix.target }}/release/codex"
+          reported="$("$codex" fork-manifest --commit)"
+          echo "reported commit: ${reported}"
+          # A binary that cannot name its own commit is not a release artifact:
+          # the checksum below would then attest bytes nobody can trace back to
+          # a tree.
+          [[ "${reported}" == "${GITHUB_SHA}" ]] \
+            || { echo "❌  binary reports '${reported}', expected '${GITHUB_SHA}'"; exit 1; }
+          "$codex" fork-manifest
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          release_dir="target/${target}/release"
+          stage="dist/codex-${target}"
+          mkdir -p "$stage"
+          for binary in ${{ matrix.binaries }}; do
+            strip --strip-debug --strip-unneeded "${release_dir}/${binary}" || true
+            cp "${release_dir}/${binary}" "${stage}/"
+          done
+          cp "${release_dir}/bwrap" "${stage}/"
+          tar -C dist -czf "dist/codex-${target}.tar.gz" "codex-${target}"
+          sha256sum "dist/codex-${target}.tar.gz"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-${{ matrix.target }}
+          path: codex-rs/dist/codex-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          # Sorted so the file is byte-stable across runs that produce the same
+          # set of artifacts, which makes a diff between two releases readable.
+          find . -maxdepth 1 -type f -name '*.tar.gz' -printf '%f\n' \
+            | LC_ALL=C sort \
+            | xargs sha256sum > SHA256SUMS
+          cat SHA256SUMS
+          sha256sum -c SHA256SUMS
+
+      - name: Publish release
+        if: ${{ github.event_name == 'push' && !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "Fork build of \`openai/codex\` at commit \`${GITHUB_SHA}\`."
+            echo
+            echo "Run \`codex fork-manifest\` to see the identity, capabilities, and build"
+            echo "commit this binary reports."
+            echo
+            echo "Verify a download before running it:"
+            echo
+            echo '```'
+            echo "sha256sum -c SHA256SUMS --ignore-missing"
+            echo '```'
+          } > release-notes.md
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --notes-file release-notes.md \
+            dist/*.tar.gz dist/SHA256SUMS

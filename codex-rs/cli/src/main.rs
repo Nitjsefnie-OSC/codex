@@ -849,8 +849,17 @@ fn run_update_command() -> anyhow::Result<()> {
     #[cfg(not(debug_assertions))]
     {
         let Some(action) = codex_tui::get_update_action() else {
+            // Either the installation method is unknown, or it is one whose
+            // upgrade would install an upstream build over this fork one. Both
+            // land the user in the same place: the fork's own releases.
             anyhow::bail!(
-                "Could not detect the Codex installation method. Please update manually: https://developers.openai.com/codex/cli/"
+                "No in-place update path for this installation. Download a build from {}, and verify it against the {} published alongside it.",
+                codex_fork_manifest::manifest()
+                    .release_channel
+                    .releases_page_url,
+                codex_fork_manifest::manifest()
+                    .release_channel
+                    .checksums_asset,
             );
         };
         run_update_action(action)
