@@ -60,7 +60,8 @@ pub(crate) async fn implicit_skill_fixture(scope: SkillScope) -> ImplicitSkillFi
         None,
         Arc::new(Semaphore::new(MAX_CONCURRENT_ROOT_SCANS)),
     )
-    .await;
+    .await
+    .with_disabled_paths(Default::default());
     assert_eq!(outcome.errors, Vec::new());
     assert_eq!(outcome.skills.len(), 1);
 
