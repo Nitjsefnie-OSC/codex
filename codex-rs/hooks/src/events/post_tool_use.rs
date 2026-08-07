@@ -163,6 +163,7 @@ fn command_input_json(request: &PostToolUseRequest) -> Result<String, serde_json
         tool_input: request.tool_input.clone(),
         tool_response: request.tool_response.clone(),
         tool_use_id: request.tool_use_id.clone(),
+        skill_activations: Vec::new(),
     })
 }
 

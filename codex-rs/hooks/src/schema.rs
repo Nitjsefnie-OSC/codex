@@ -290,6 +290,8 @@ pub(crate) struct PreToolUseCommandInput {
     pub tool_name: String,
     pub tool_input: Value,
     pub tool_use_id: String,
+    #[schemars(skip)]
+    pub skill_activations: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -336,6 +338,8 @@ pub(crate) struct PostToolUseCommandInput {
     pub tool_input: Value,
     pub tool_response: Value,
     pub tool_use_id: String,
+    #[schemars(skip)]
+    pub skill_activations: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -1164,6 +1168,7 @@ mod tests {
             tool_name: "Bash".to_string(),
             tool_input: json!({ "command": "echo hello" }),
             tool_use_id: "tool-1".to_string(),
+            skill_activations: Vec::new(),
         };
 
         assert_eq!(
@@ -1197,6 +1202,7 @@ mod tests {
             tool_name: "Bash".to_string(),
             tool_input: json!({ "command": "echo hello" }),
             tool_use_id: "tool-1".to_string(),
+            skill_activations: Vec::new(),
         };
         let root_input = serde_json::to_value(root_input).expect("serialize root hook input");
         assert_eq!(root_input.get("agent_id"), None);
