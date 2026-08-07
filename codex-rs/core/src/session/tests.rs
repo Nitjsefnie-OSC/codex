@@ -7,6 +7,7 @@ use crate::config::ConfigBuilder;
 use crate::config::ConfigOverrides;
 use crate::config::test_config;
 use crate::context::ContextualUserFragment;
+use crate::context::MonitorNotification;
 use crate::context::TurnAborted;
 use crate::environment_selection::ThreadEnvironments;
 use crate::environment_selection::TurnEnvironmentState;
@@ -10594,6 +10595,41 @@ async fn task_finish_emits_thread_idle_lifecycle_after_active_turn_clears() {
         .expect("idle receiver open");
     assert_eq!(1, calls.load(std::sync::atomic::Ordering::SeqCst));
     assert!(session.active_turn.lock().await.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_idle_monitor_notifications_are_persisted_once_and_coalesce_wake() {
+    let (session, turn_context, _rx) = make_session_and_context_with_rx().await;
+    let notification = |seq| MonitorNotification {
+        process_id: 17,
+        seq,
+        command: "watch".to_string(),
+        kind: "watcher",
+        terminal_state: None,
+        lines: vec![format!("line-{seq}")],
+        omitted_lines: 0,
+        suppressed_notifications: 0,
+        note: None,
+    };
+
+    tokio::join!(
+        session.deliver_monitor_notification(notification(1), turn_context.as_ref()),
+        session.deliver_monitor_notification(notification(2), turn_context.as_ref()),
+    );
+
+    let history = session.clone_history().await;
+    assert_eq!(
+        2,
+        history
+            .raw_items()
+            .iter()
+            .filter(|item| MonitorNotification::is_response_item(item))
+            .count(),
+        "racing idle notifications must not be dropped or duplicated"
+    );
+    assert!(session.input_queue.monitor_wake_requested());
+    assert!(session.input_queue.claim_monitor_wake());
+    assert!(!session.input_queue.claim_monitor_wake());
 }
 
 #[tokio::test]

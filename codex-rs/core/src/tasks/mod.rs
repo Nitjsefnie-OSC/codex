@@ -872,6 +872,7 @@ impl Session {
         active_turn: &ActiveTurn,
         turn_context: &TurnContext,
     ) {
+        let _delivery_guard = self.input_queue.lock_monitor_delivery().await;
         let items = self
             .input_queue
             .take_pending_monitor_items_for_turn_state(active_turn.turn_state.as_ref())

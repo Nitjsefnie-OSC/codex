@@ -607,6 +607,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn monitor_wake_notification_waits_for_explicit_durable_wake() {
+        let input_queue = InputQueue::new();
+        input_queue.request_monitor_wake();
+
+        let mut notified = Box::pin(input_queue.monitor_wake_notified());
+        tokio::select! {
+            biased;
+            _ = &mut notified => panic!("a flag alone must not wake the submission loop"),
+            _ = tokio::task::yield_now() => {}
+        }
+
+        input_queue.notify_monitor_wake();
+        notified.await;
+    }
+
+    #[tokio::test]
     async fn monitor_pending_items_can_be_recovered_before_turn_state_cleanup() {
         let input_queue = InputQueue::new();
         let turn_state = Mutex::new(TurnState::default());
