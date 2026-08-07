@@ -38,14 +38,17 @@ struct Harness {
 /// host's sandbox availability.
 async fn harness() -> Harness {
     let (session, mut turn, rx) = make_session_and_context_with_rx().await;
-    let mut collaboration_mode = session.collaboration_mode().await;
-    collaboration_mode.mode = ModeKind::Plan;
+    let collaboration_mode = codex_protocol::config_types::CollaborationMode {
+        mode: ModeKind::Plan,
+        ..session.collaboration_mode().await
+    };
     session
-        .state
-        .lock()
+        .update_settings(crate::session::SessionSettingsUpdate {
+            collaboration_mode: Some(collaboration_mode),
+            ..Default::default()
+        })
         .await
-        .session_configuration
-        .collaboration_mode = collaboration_mode;
+        .expect("test setup should allow setting Plan mode");
     let turn_mut =
         Arc::get_mut(&mut turn).expect("test turn context must be uniquely owned at setup");
     let mut config = (*turn_mut.config).clone();
