@@ -3198,6 +3198,9 @@ impl Session {
         .await??;
         Ok(Arc::new(StepContext {
             turn: turn_context,
+            response_identity: Arc::new(
+                crate::session::step_context::ResponseIdentityState::default(),
+            ),
             environments,
             selected_capability_roots,
             executor_capability_discovery,

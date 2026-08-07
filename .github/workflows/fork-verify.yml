@@ -109,6 +109,16 @@ jobs:
           cargo test -p codex-core --test suite monitor -- --nocapture
           df -h /
 
+      - name: whoami provenance tests
+        # whoami must distinguish request metadata from the response-scoped
+        # server model, including when a later sampling step has no model
+        # report. Keep this focused so provenance regressions are attributed
+        # separately from the monitor integration suite.
+        working-directory: codex-rs
+        run: |
+          cargo test -p codex-core --lib whoami -- --nocapture
+          cargo test -p codex-core --test suite whoami -- --nocapture
+
       - name: golden tool-name list
         working-directory: codex-rs
         run: cargo test -p codex-core --test suite prompt_caching -- --nocapture || true

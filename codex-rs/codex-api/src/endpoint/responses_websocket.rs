@@ -279,8 +279,11 @@ impl ResponsesWebsocketConnection {
                 reason = "the guard serializes exclusive use of the websocket stream for the lifetime of the response stream"
             )]
             async move {
-                if let Some(model) = server_model {
-                    let _ = tx_event.send(Ok(ResponseEvent::ServerModel(model))).await;
+                if let Some(event) = websocket_connection_model_event(
+                    connection_reused,
+                    server_model.as_deref(),
+                ) {
+                    let _ = tx_event.send(Ok(event)).await;
                 }
                 if let Some(etag) = models_etag {
                     let _ = tx_event.send(Ok(ResponseEvent::ModelsEtag(etag))).await;
@@ -897,6 +900,17 @@ fn serialize_websocket_request(request: &ResponsesWsRequest<'_>) -> Result<Strin
         .map_err(|err| ApiError::Stream(format!("failed to encode websocket request: {err}")))
 }
 
+fn websocket_connection_model_event(
+    connection_reused: bool,
+    server_model: Option<&str>,
+) -> Option<ResponseEvent> {
+    if connection_reused {
+        None
+    } else {
+        server_model.map(|model| ResponseEvent::ServerModel(model.to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -975,6 +989,16 @@ mod tests {
     fn websocket_config_enables_permessage_deflate() {
         let config = websocket_config();
         assert!(config.extensions.permessage_deflate.is_some());
+    }
+
+    #[test]
+    fn websocket_connection_model_is_only_reported_for_new_connections() {
+        assert!(matches!(
+            websocket_connection_model_event(false, Some("gpt-5.2")),
+            Some(ResponseEvent::ServerModel(model)) if model == "gpt-5.2"
+        ));
+        assert!(websocket_connection_model_event(true, Some("gpt-5.2")).is_none());
+        assert!(websocket_connection_model_event(false, None).is_none());
     }
 
     #[test]

@@ -181,6 +181,19 @@ fn reasoning_effort_for_request(effort: ReasoningEffortConfig) -> ReasoningEffor
     }
 }
 
+/// Resolves the reasoning effort that the request builder puts on the wire.
+///
+/// Keep the default selection and the `Ultra` wire spelling in one place so
+/// request metadata reported by tools cannot drift from the request body.
+pub(crate) fn request_reasoning_effort(
+    model_info: &ModelInfo,
+    effort: Option<ReasoningEffortConfig>,
+) -> Option<ReasoningEffortConfig> {
+    effort
+        .or_else(|| model_info.default_reasoning_level.clone())
+        .map(reasoning_effort_for_request)
+}
+
 fn session_telemetry_for_request(
     session_telemetry: &SessionTelemetry,
     request: &ResponsesApiRequest,
@@ -828,9 +841,7 @@ impl ModelClient {
         summary: ReasoningSummaryConfig,
     ) -> Reasoning {
         Reasoning {
-            effort: effort
-                .or_else(|| model_info.default_reasoning_level.clone())
-                .map(reasoning_effort_for_request),
+            effort: request_reasoning_effort(model_info, effort),
             summary: (model_info.supports_reasoning_summary_parameter
                 && summary != ReasoningSummaryConfig::None)
                 .then_some(summary),

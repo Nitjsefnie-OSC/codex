@@ -206,6 +206,7 @@ impl StepContext {
         let environments = turn.environments.clone();
         Arc::new(Self {
             turn: Arc::clone(&turn),
+            response_identity: Arc::new(crate::session::step_context::ResponseIdentityState::default()),
             environments,
             selected_capability_roots: Vec::new(),
             executor_capability_discovery: None,

@@ -1399,6 +1399,7 @@ async fn run_sampling_request(
             tool_runtime.clone(),
             Arc::clone(&sess),
             Arc::clone(&turn_context),
+            Arc::clone(&step_context.response_identity),
             Arc::clone(&turn_store),
             client_session,
             responses_metadata,
@@ -2177,6 +2178,7 @@ async fn try_run_sampling_request(
     tool_runtime: ToolCallRuntime,
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
+    response_identity: Arc<crate::session::step_context::ResponseIdentityState>,
     turn_store: Arc<codex_extension_api::ExtensionData>,
     client_session: &mut ModelClientSession,
     responses_metadata: &CodexResponsesMetadata,
@@ -2184,6 +2186,7 @@ async fn try_run_sampling_request(
     prompt: &Prompt,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
+    let response_generation = response_identity.begin_response().await;
     feedback_tags!(
         model = turn_context.model_info.slug.clone(),
         approval_policy = turn_context.approval_policy(),
@@ -2473,6 +2476,9 @@ async fn try_run_sampling_request(
                 }
             }
             ResponseEvent::ServerModel(server_model) => {
+                response_identity
+                    .record_server_model_for_response(response_generation, server_model.clone())
+                    .await;
                 if !turn_context
                     .server_model_warning_emitted
                     .load(Ordering::Relaxed)
