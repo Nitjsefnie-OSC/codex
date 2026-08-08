@@ -85,6 +85,12 @@ const REMOTE_EXEC_SERVER_URL_ENV_VAR: &str = "CODEX_TEST_REMOTE_EXEC_SERVER_URL"
 static REMOTE_TEST_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 const SUBMIT_TURN_COMPLETE_TIMEOUT: Duration = Duration::from_secs(30);
 
+fn stack_probe(stage: &str) {
+    if std::env::var_os("CODEX_STACK_PROBE").is_some() {
+        eprintln!("[codex-stack-probe] test_support:{stage}");
+    }
+}
+
 pub struct RecordingUserInstructionsProvider {
     inner: Arc<dyn UserInstructionsProvider>,
     load_count: AtomicUsize,
@@ -581,6 +587,7 @@ impl TestCodexBuilder {
         test_env: TestEnv,
         include_local_environment: bool,
     ) -> anyhow::Result<TestCodex> {
+        stack_probe("build_with_home_and_base_url:enter");
         let (config, fallback_cwd) = self
             .prepare_config(base_url, &home, test_env.cwd().clone())
             .await?;
@@ -612,6 +619,7 @@ impl TestCodexBuilder {
             )
             .await
         });
+        stack_probe("build_with_home_and_base_url:after-environment-manager");
         let file_system = test_env.environment().get_filesystem();
         let mut workspace_setups = vec![];
         swap(&mut self.workspace_setups, &mut workspace_setups);
@@ -639,6 +647,7 @@ impl TestCodexBuilder {
         test_env: TestEnv,
         environment_manager: Arc<codex_exec_server::EnvironmentManager>,
     ) -> anyhow::Result<TestCodex> {
+        stack_probe("build_from_config:enter");
         let auth = self.auth.clone();
         let state_db = codex_core::init_state_db(&config).await;
         let thread_store = thread_store_from_config(&config, state_db.clone());
@@ -740,6 +749,7 @@ impl TestCodexBuilder {
                 .await?
             }
         };
+        stack_probe("build_from_config:after-start-thread");
 
         Ok(TestCodex {
             home,
@@ -1178,9 +1188,12 @@ impl TestCodexHarness {
     }
 
     pub async fn submit(&self, prompt: &str) -> Result<()> {
+        stack_probe("test_codex:before-submit");
         // Box the submit-and-wait path so callers do not inline the full turn
         // future into their own async state.
-        Box::pin(self.test.submit_turn(prompt)).await
+        let result = Box::pin(self.test.submit_turn(prompt)).await;
+        stack_probe("test_codex:after-submit");
+        result
     }
 
     pub async fn submit_with_permission_profile(

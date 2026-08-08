@@ -719,9 +719,11 @@ pub(super) async fn submission_loop(
     config: Arc<Config>,
     rx_sub: Receiver<Submission>,
 ) {
+    crate::session::turn::stack_probe("submission_loop:enter");
     // To break out of this loop, send Op::Shutdown.
     let mut shutdown_received = false;
     loop {
+        crate::session::turn::stack_probe("submission_loop:before-select");
         let sub = tokio::select! {
             biased;
             sub = rx_sub.recv() => match sub {
@@ -735,6 +737,7 @@ pub(super) async fn submission_loop(
                 continue;
             }
         };
+        crate::session::turn::stack_probe("submission_loop:after-receive");
         debug!(?sub, "Submission");
         let dispatch_span = submission_dispatch_span(&sub);
         let should_exit = async {
@@ -783,6 +786,7 @@ pub(super) async fn submission_loop(
                     false
                 }
                 Op::UserInput { .. } => {
+                    crate::session::turn::stack_probe("submission_loop:before-user-input");
                     user_input_or_turn(
                         &sess,
                         sub.id.clone(),
@@ -791,6 +795,7 @@ pub(super) async fn submission_loop(
                         sub.parent_turn_id,
                     )
                     .await;
+                    crate::session::turn::stack_probe("submission_loop:after-user-input");
                     false
                 }
                 Op::ThreadSettings { thread_settings } => {

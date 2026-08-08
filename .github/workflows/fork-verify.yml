@@ -105,6 +105,26 @@ jobs:
           cargo test -p codex-api --lib websocket_handshake_model -- --nocapture
           cargo test -p codex-api --lib websocket_response_model_attestation -- --nocapture
 
+      - name: regular-turn stack probes
+        # Keep this diagnostic ahead of the whoami gate so a fixture setup or
+        # submission-loop crash cannot hide the known plan-mode start path.
+        continue-on-error: true
+        timeout-minutes: 15
+        working-directory: codex-rs
+        env:
+          CODEX_STACK_PROBE: "1"
+        run: |
+          set +e
+          timeout 5m cargo test -p codex-core --lib \
+            try_start_turn_if_idle_accepts_user_input_in_plan_mode \
+            -- --exact --nocapture --test-threads=1
+          first=$?
+          timeout 5m cargo test -p codex-core --test all \
+            suite::pending_input::idle_user_input_reaches_the_first_model_request \
+            -- --exact --nocapture --test-threads=1
+          second=$?
+          exit $((first + second))
+
       - name: whoami provenance tests
         # whoami must distinguish request metadata from the response-scoped
         # server model, including when a later sampling step has no model
