@@ -204,7 +204,7 @@ async fn run_turn_inner(
         prewarmed_client_session,
         &cancellation_token,
     )
-    .await
+    .await?
     else {
         return Ok(None);
     };
