@@ -1716,9 +1716,18 @@ impl ModelClientSession {
             client_stack_diagnostic!(
                 "STACK_DIAGNOSTIC stream_responses_websocket_inner.after_client_metadata"
             );
+            client_stack_diagnostic!(
+                "STACK_DIAGNOSTIC stream_responses_websocket_inner.before_turn_state"
+            );
             if let Some(turn_state) = self.turn_state.get() {
                 client_metadata.insert(X_CODEX_TURN_STATE_HEADER.to_string(), turn_state.clone());
             }
+            client_stack_diagnostic!(
+                "STACK_DIAGNOSTIC stream_responses_websocket_inner.after_turn_state"
+            );
+            client_stack_diagnostic!(
+                "STACK_DIAGNOSTIC stream_responses_websocket_inner.before_websocket_connection"
+            );
             match self
                 .websocket_connection(WebsocketConnectParams {
                     session_telemetry,
