@@ -187,13 +187,15 @@ async fn model_stream_future_boundary_is_pointer_sized() {
         turn_context.provider.info().name.as_str(),
     );
 
-    let future = stream_model_request(
-        &mut client_session,
+    let future = client_session.stream(
         &prompt,
-        turn_context.as_ref(),
+        &turn_context.model_info,
+        &turn_context.session_telemetry,
+        turn_context.reasoning_effort.clone(),
+        turn_context.reasoning_summary,
+        turn_context.config.service_tier.clone(),
         &responses_metadata,
         &inference_trace,
-        CancellationToken::new(),
     );
     let future_size = std::mem::size_of_val(&future);
 

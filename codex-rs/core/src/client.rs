@@ -94,6 +94,7 @@ use codex_tools::create_tools_raw_json_for_responses_api;
 use eventsource_stream::Event;
 use eventsource_stream::EventStreamError;
 use futures::StreamExt;
+use futures::future::BoxFuture;
 use http::HeaderMap as ApiHeaderMap;
 use http::HeaderValue;
 use http::StatusCode;
@@ -1864,16 +1865,43 @@ impl ModelClientSession {
     /// fall back to the HTTP Responses API transport otherwise. The trace context may be enabled or
     /// disabled, but is always explicit so transport paths do not need separate trace/no-trace
     /// branches.
-    pub async fn stream(
-        &mut self,
-        prompt: &Prompt,
-        model_info: &ModelInfo,
-        session_telemetry: &SessionTelemetry,
+    pub fn stream<'a>(
+        &'a mut self,
+        prompt: &'a Prompt,
+        model_info: &'a ModelInfo,
+        session_telemetry: &'a SessionTelemetry,
         effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
         service_tier: Option<String>,
-        responses_metadata: &CodexResponsesMetadata,
-        inference_trace: &InferenceTraceContext,
+        responses_metadata: &'a CodexResponsesMetadata,
+        inference_trace: &'a InferenceTraceContext,
+    ) -> BoxFuture<'a, Result<ResponseStream>> {
+        Box::pin(async move {
+            self.stream_inner(
+                prompt,
+                model_info,
+                session_telemetry,
+                effort,
+                summary,
+                service_tier,
+                responses_metadata,
+                inference_trace,
+            )
+            .await
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_inner<'a>(
+        &'a mut self,
+        prompt: &'a Prompt,
+        model_info: &'a ModelInfo,
+        session_telemetry: &'a SessionTelemetry,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        service_tier: Option<String>,
+        responses_metadata: &'a CodexResponsesMetadata,
+        inference_trace: &'a InferenceTraceContext,
     ) -> Result<ResponseStream> {
         let wire_api = self.client.state.provider.info().wire_api;
         match wire_api {
