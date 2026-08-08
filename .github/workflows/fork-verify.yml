@@ -49,7 +49,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: codex-rs
-          shared-key: fork-verify-rust
+          shared-key: check
 
       - name: cargo check --workspace
         working-directory: codex-rs
@@ -217,7 +217,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: codex-rs
-          shared-key: fork-verify-rust
+          shared-key: check
 
       - name: idle-turn stack stage diagnostics
         working-directory: codex-rs
