@@ -112,7 +112,7 @@ jobs:
             --no-run >"$lib_size_log" 2>&1
           lib_status=$?
           echo "lib test future inventory exit status: $lib_status"
-          grep -E -A 28 -B 2 'core/src/session/tests.rs:1067[28]|inject.rs' "$lib_size_log" || true
+          grep -E -A 96 -B 2 'core/src/session/tests.rs:10757|core/src/session/inject.rs:(53|189)|inject.rs' "$lib_size_log" || true
           if [ "$lib_status" -ne 0 ]; then
             sed -n '1,100p' "$lib_size_log"
             tail -n 100 "$lib_size_log"
@@ -123,12 +123,32 @@ jobs:
             --no-run >"$all_size_log" 2>&1
           all_status=$?
           echo "integration test future inventory exit status: $all_status"
-          grep -E -A 28 -B 2 'core/tests/suite/pending_input.rs:49|core/tests/suite/pending_input.rs:126|inject.rs' "$all_size_log" || true
+          grep -E -A 96 -B 2 'core/tests/suite/pending_input.rs:(49|54|108)|core/src/session/inject.rs:(53|189)|inject.rs' "$all_size_log" || true
           if [ "$all_status" -ne 0 ]; then
             sed -n '1,100p' "$all_size_log"
             tail -n 100 "$all_size_log"
           fi
           exit 0
+
+      - name: temporary large-stack diagnostics
+        # Diagnostic-only: rerun the exact paths with an 8 MiB test/Tokio worker
+        # stack. A pass here distinguishes finite stack exhaustion from a
+        # poll/drop recursion that survives a substantially larger stack.
+        continue-on-error: true
+        timeout-minutes: 20
+        working-directory: codex-rs
+        run: |
+          set +e
+          timeout 5m cargo test -p codex-core --lib \
+            session::tests::diagnostic_try_start_turn_if_idle_accepts_user_input_on_large_stack \
+            -- --exact --nocapture --test-threads=1
+          large_unit=$?
+          timeout 5m cargo test -p codex-core --test all \
+            suite::pending_input::diagnostic_idle_user_input_reaches_the_first_model_request_on_large_worker_stack \
+            -- --exact --nocapture --test-threads=1
+          large_integration=$?
+          echo "large-stack diagnostic status: unit=$large_unit integration=$large_integration"
+          exit $((large_unit + large_integration))
 
       - name: codex-api WebSocket provenance tests
         # Run transport provenance before the monitor gate so a model identity
