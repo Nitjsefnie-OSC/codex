@@ -1076,7 +1076,8 @@ impl ModelClient {
         );
         let websocket_connect_timeout = self.state.provider.info().websocket_connect_timeout();
         let start = Instant::now();
-        let websocket_connect = ApiWebSocketResponsesClient::new(api_provider, api_auth)
+        let websocket_client = ApiWebSocketResponsesClient::new(api_provider, api_auth);
+        let websocket_connect = websocket_client
             .connect(
                 &self.http_client_factory,
                 headers,
