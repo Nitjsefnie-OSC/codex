@@ -1270,12 +1270,32 @@ async fn maybe_run_previous_model_inline_compact(
     Ok(())
 }
 
+fn run_auto_compact<'a>(
+    sess: &'a Arc<Session>,
+    step_context: Arc<StepContext>,
+    fallback_step_context: Option<Arc<StepContext>>,
+    client_session: &'a mut ModelClientSession,
+    initial_context_injection: InitialContextInjection,
+    reason: CompactionReason,
+    phase: CompactionPhase,
+) -> BoxFuture<'a, CodexResult<()>> {
+    Box::pin(run_auto_compact_inner(
+        sess,
+        step_context,
+        fallback_step_context,
+        client_session,
+        initial_context_injection,
+        reason,
+        phase,
+    ))
+}
+
 #[instrument(
     level = "trace",
     skip_all,
     fields(reason = ?reason, phase = ?phase)
 )]
-async fn run_auto_compact(
+async fn run_auto_compact_inner(
     sess: &Arc<Session>,
     step_context: Arc<StepContext>,
     fallback_step_context: Option<Arc<StepContext>>,
