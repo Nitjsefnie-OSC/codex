@@ -208,6 +208,8 @@ async fn run_turn_inner(
     else {
         return Ok(None);
     };
+    eprintln!("STACK_DIAGNOSTIC turn.after_prepare_turn_setup");
+    eprintln!("STACK_DIAGNOSTIC turn.before_sampling_loop");
     run_turn_sampling_loop(
         sess,
         turn_context,
@@ -233,6 +235,7 @@ async fn run_turn_sampling_loop(
     turn_diff_tracker: SharedTurnDiffTracker,
     mut can_drain_pending_input: bool,
 ) -> CodexResult<Option<String>> {
+    eprintln!("STACK_DIAGNOSTIC sampling_loop.enter");
     let mut last_agent_message: Option<String> = None;
     let mut stop_hook_active = false;
     let mut next_step_context = Some(first_step_context);

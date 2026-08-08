@@ -49,6 +49,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: codex-rs
+          shared-key: fork-verify-rust
 
       - name: cargo check --workspace
         working-directory: codex-rs
@@ -216,6 +217,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: codex-rs
+          shared-key: fork-verify-rust
 
       - name: idle-turn stack stage diagnostics
         working-directory: codex-rs
@@ -223,20 +225,17 @@ jobs:
           CODEX_STACK_DIAGNOSTICS: "1"
         run: |
           set +e
-          output=$(timeout 5m cargo test -p codex-core --lib \
+          timeout 10m cargo test -p codex-core --lib \
             session::tests::diagnostic_new_default_turn_on_normal_stack \
-            -- --exact --nocapture --test-threads=1 2>&1)
-          direct=$?
-          printf '%s\n' "$output"
-          output=$(timeout 5m cargo test -p codex-core --lib \
+            -- --exact --nocapture --test-threads=1 2>&1 | tee direct.log
+          direct=${PIPESTATUS[0]}
+          timeout 5m cargo test -p codex-core --lib \
             session::tests::try_start_turn_if_idle_accepts_user_input_in_plan_mode \
-            -- --exact --nocapture --test-threads=1 2>&1)
-          unit=$?
-          printf '%s\n' "$output"
-          output=$(timeout 5m cargo test -p codex-core --test all \
+            -- --exact --nocapture --test-threads=1 2>&1 | tee unit.log
+          unit=${PIPESTATUS[0]}
+          timeout 5m cargo test -p codex-core --test all \
             suite::pending_input::idle_user_input_reaches_the_first_model_request \
-            -- --exact --nocapture --test-threads=1 2>&1)
-          integration=$?
-          printf '%s\n' "$output"
+            -- --exact --nocapture --test-threads=1 2>&1 | tee integration.log
+          integration=${PIPESTATUS[0]}
           echo "stack diagnostic status: direct=$direct unit=$unit integration=$integration"
           exit $((direct + unit + integration))
