@@ -41,6 +41,14 @@
       "config_key": null,
       "default_enabled": true,
       "summary": "Stop and SubagentStop hook payloads carry a `background` object with live monitor and background-terminal state — what is still running, and how much delivered output was never read — so a hook can refuse to let a turn end on top of work it walked away from."
+    },
+    {
+      "id": "hook.skill_activations",
+      "kind": "hook_field",
+      "name": "skill_activations",
+      "config_key": null,
+      "default_enabled": true,
+      "summary": "PreToolUse and PostToolUse hook payloads carry `skill_activations` for the current turn, including each explicit or implicit activation's name, source path, scope, invocation kind, turn id, and content SHA-256."
     }
   ]
 }

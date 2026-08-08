@@ -246,6 +246,17 @@ mod tests {
         assert!(manifest.has_capability("tool.whoami"));
         assert!(manifest.has_capability("tool.monitor"));
         assert!(manifest.has_capability("hook.stop_background_state"));
+
+        let skill_activations = manifest
+            .capability("hook.skill_activations")
+            .unwrap_or_else(|| panic!("skill_activations hook capability should be declared"));
+        assert_eq!(skill_activations.kind, CapabilityKind::HookField);
+        assert_eq!(skill_activations.name, "skill_activations");
+        assert_eq!(skill_activations.config_key, None);
+        assert!(skill_activations.default_enabled);
+        assert!(skill_activations.summary.contains("PreToolUse"));
+        assert!(skill_activations.summary.contains("PostToolUse"));
+
         assert!(!manifest.has_capability("tool.not-a-thing"));
     }
 
