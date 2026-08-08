@@ -2385,7 +2385,7 @@ fn stream_model_request<'a>(
     cancellation_token: CancellationToken,
 ) -> BoxFuture<'a, CodexResult<ResponseStream>> {
     Box::pin(async move {
-        client_session
+        Ok(client_session
             .stream(
                 prompt,
                 &turn_context.model_info,
@@ -2398,7 +2398,7 @@ fn stream_model_request<'a>(
             )
             .instrument(trace_span!("stream_request"))
             .or_cancel(&cancellation_token)
-            .await??
+            .await??)
     })
 }
 
