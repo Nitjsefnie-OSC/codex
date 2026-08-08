@@ -162,3 +162,45 @@ async fn try_sampling_request_future_boundary_is_pointer_sized() {
         "try sampling request API future boundary is {future_size} bytes"
     );
 }
+
+#[tokio::test]
+async fn model_stream_future_boundary_is_pointer_sized() {
+    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let sess = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+    let mut client_session = crate::session::tests::test_model_client_session();
+    let responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(
+        sess.installation_id.clone(),
+        sess.current_window_id().await,
+        CodexResponsesRequestKind::Turn,
+    );
+    let step_context = StepContext::for_test(Arc::clone(&turn_context));
+    let prompt = build_prompt(
+        Vec::new(),
+        step_context.tool_router.as_ref(),
+        turn_context.as_ref(),
+        sess.get_base_instructions().await,
+    );
+    let inference_trace = sess.services.rollout_thread_trace.inference_trace_context(
+        turn_context.sub_id.as_str(),
+        turn_context.model_info.slug.as_str(),
+        turn_context.provider.info().name.as_str(),
+    );
+
+    let future = client_session.stream(
+        &prompt,
+        &turn_context.model_info,
+        &turn_context.session_telemetry,
+        turn_context.reasoning_effort.clone(),
+        turn_context.reasoning_summary,
+        turn_context.config.service_tier.clone(),
+        &responses_metadata,
+        &inference_trace,
+    );
+    let future_size = std::mem::size_of_val(&future);
+
+    assert!(
+        future_size <= 2 * std::mem::size_of::<usize>(),
+        "model stream API future boundary is {future_size} bytes"
+    );
+}
