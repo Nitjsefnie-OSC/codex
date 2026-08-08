@@ -103,12 +103,18 @@ jobs:
         timeout-minutes: 20
         working-directory: codex-rs
         run: |
+          set +e
           lib_size_log=$(mktemp)
           RUSTC_BOOTSTRAP=1 cargo rustc -p codex-core --lib --tests -- -Zprint-type-sizes >"$lib_size_log" 2>&1
-          grep -E -A 24 -B 2 'core/src/session/tests.rs:10(67|68)' "$lib_size_log" || true
+          lib_status=$?
+          echo "lib inventory cargo rustc exit status: $lib_status"
+          cat "$lib_size_log"
           all_size_log=$(mktemp)
           RUSTC_BOOTSTRAP=1 cargo rustc -p codex-core --test all -- -Zprint-type-sizes >"$all_size_log" 2>&1
-          grep -E -A 24 -B 2 'core/tests/suite/pending_input.rs:[0-9]+' "$all_size_log" || true
+          all_status=$?
+          echo "integration inventory cargo rustc exit status: $all_status"
+          cat "$all_size_log"
+          exit 0
 
       - name: codex-api WebSocket provenance tests
         # Run transport provenance before the monitor gate so a model identity
