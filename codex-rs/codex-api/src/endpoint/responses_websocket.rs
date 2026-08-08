@@ -15,7 +15,6 @@ use codex_client::TransportError;
 use codex_http_client::HttpClientFactory;
 use codex_websocket_client::WebSocketConnection;
 use codex_websocket_client::WebSocketConnector;
-use futures::FutureExt;
 use futures::SinkExt;
 use futures::StreamExt;
 use http::HeaderMap;
@@ -506,10 +505,7 @@ async fn connect_websocket(
 
     let connector = WebSocketConnector::new(http_client_factory)
         .map_err(|err| ApiError::Stream(format!("failed to configure websocket TLS: {err}")))?;
-    let response = connector
-        .connect(request, websocket_config())
-        .boxed()
-        .await;
+    let response = Box::pin(connector.connect(request, websocket_config())).await;
 
     let (stream, response) = match response {
         Ok((stream, response)) => {
