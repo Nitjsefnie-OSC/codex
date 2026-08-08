@@ -1574,6 +1574,37 @@ impl ModelClientSession {
 
     /// Streams a turn via the Responses API over WebSocket transport.
     #[allow(clippy::too_many_arguments)]
+    fn stream_responses_websocket<'a>(
+        &'a mut self,
+        prompt: &'a Prompt,
+        model_info: &'a ModelInfo,
+        session_telemetry: &'a SessionTelemetry,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        service_tier: Option<String>,
+        responses_metadata: &'a CodexResponsesMetadata,
+        warmup: bool,
+        request_trace: Option<W3cTraceContext>,
+        inference_trace: &'a InferenceTraceContext,
+    ) -> BoxFuture<'a, Result<WebsocketStreamOutcome>> {
+        Box::pin(async move {
+            self.stream_responses_websocket_inner(
+                prompt,
+                model_info,
+                session_telemetry,
+                effort,
+                summary,
+                service_tier,
+                responses_metadata,
+                warmup,
+                request_trace,
+                inference_trace,
+            )
+            .await
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     #[instrument(
         name = "model_client.stream_responses_websocket",
         level = "info",
@@ -1587,18 +1618,18 @@ impl ModelClientSession {
             websocket.warmup = warmup
         )
     )]
-    async fn stream_responses_websocket(
-        &mut self,
-        prompt: &Prompt,
-        model_info: &ModelInfo,
-        session_telemetry: &SessionTelemetry,
+    async fn stream_responses_websocket_inner<'a>(
+        &'a mut self,
+        prompt: &'a Prompt,
+        model_info: &'a ModelInfo,
+        session_telemetry: &'a SessionTelemetry,
         effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
         service_tier: Option<String>,
-        responses_metadata: &CodexResponsesMetadata,
+        responses_metadata: &'a CodexResponsesMetadata,
         warmup: bool,
         request_trace: Option<W3cTraceContext>,
-        inference_trace: &InferenceTraceContext,
+        inference_trace: &'a InferenceTraceContext,
     ) -> Result<WebsocketStreamOutcome> {
         let auth_manager = self.client.state.provider.auth_manager();
 
