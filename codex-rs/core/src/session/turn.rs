@@ -156,7 +156,23 @@ const POST_SAMPLING_TOKEN_ESTIMATE_TARGET: &str = "codex_core::post_sampling_tok
 /// - If the model sends only an assistant message, we record it in the
 ///   conversation history and consider the turn complete.
 ///
-pub(crate) async fn run_turn(
+pub(crate) fn run_turn(
+    sess: Arc<Session>,
+    turn_context: Arc<TurnContext>,
+    input: Vec<TurnInput>,
+    prewarmed_client_session: Option<ModelClientSession>,
+    cancellation_token: CancellationToken,
+) -> BoxFuture<'static, CodexResult<Option<String>>> {
+    Box::pin(run_turn_inner(
+        sess,
+        turn_context,
+        input,
+        prewarmed_client_session,
+        cancellation_token,
+    ))
+}
+
+async fn run_turn_inner(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     input: Vec<TurnInput>,

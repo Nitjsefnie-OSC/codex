@@ -123,13 +123,13 @@ impl Session {
         } else {
             input
         };
-        Box::pin(self.start_task(
+        self.start_task(
             turn_context,
             task_input,
             RegularTask::new(),
             input_persisted_sender,
             MailboxParentProvenance::Ignore,
-        ))
+        )
         .await;
         if let Some(receiver) = input_persisted_receiver {
             return receiver

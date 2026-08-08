@@ -11,7 +11,6 @@ use crate::session_startup_prewarm::SessionStartupPrewarmResolution;
 use crate::state::TaskKind;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TurnStartedEvent;
-use futures::future::BoxFuture;
 use tracing::Instrument;
 use tracing::trace_span;
 
@@ -74,13 +73,13 @@ impl SessionTask for RegularTask {
         let mut next_input = input;
         let mut prewarmed_client_session = prewarmed_client_session;
         loop {
-            let run_turn_future: BoxFuture<'static, SessionTaskResult> = Box::pin(run_turn(
+            let run_turn_future = run_turn(
                 Arc::clone(&sess),
                 Arc::clone(&ctx),
                 next_input,
                 prewarmed_client_session.take(),
                 cancellation_token.child_token(),
-            ));
+            );
             let last_agent_message = run_turn_future
                 .instrument(run_turn_span.clone())
                 .await?;
