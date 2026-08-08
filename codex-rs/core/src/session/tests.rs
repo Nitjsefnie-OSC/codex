@@ -10754,9 +10754,7 @@ async fn try_start_turn_if_idle_rejects_plan_mode_without_injecting() {
 
 #[tokio::test]
 async fn try_start_turn_if_idle_accepts_user_input_in_plan_mode() {
-    eprintln!("STACK_DIAGNOSTIC unit.before_setup");
     let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
-    eprintln!("STACK_DIAGNOSTIC unit.after_setup");
     let mut collaboration_mode = sess.collaboration_mode().await;
     collaboration_mode.mode = ModeKind::Plan;
     {
@@ -10765,35 +10763,33 @@ async fn try_start_turn_if_idle_accepts_user_input_in_plan_mode() {
         state.merge_connector_selection(["calendar".to_string()]);
     }
 
-    eprintln!("STACK_DIAGNOSTIC unit.before_admission_future");
-    let admission = sess.try_start_turn_if_idle(vec![TurnInput::UserInput {
+    sess.try_start_turn_if_idle(vec![TurnInput::UserInput {
         content: vec![UserInput::Text {
             text: "queued user input".to_string(),
             text_elements: Vec::new(),
         }],
         client_id: Some("queued-user-message".to_string()),
-    }]);
-    eprintln!("STACK_DIAGNOSTIC unit.after_admission_future");
-    admission
+    }])
     .await
     .expect("plan mode should accept user-authored idle input");
-    eprintln!("STACK_DIAGNOSTIC unit.after_admission");
 
     assert!(sess.state.lock().await.get_connector_selection().is_empty());
 
-    eprintln!("STACK_DIAGNOSTIC unit.before_abort");
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
-    eprintln!("STACK_DIAGNOSTIC unit.after_abort");
 }
 
 #[tokio::test]
-async fn diagnostic_new_default_turn_on_normal_stack() {
-    eprintln!("STACK_DIAGNOSTIC direct.before_setup");
+async fn default_turn_construction_future_stays_small() {
     let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
-    eprintln!("STACK_DIAGNOSTIC direct.after_setup");
-    eprintln!("STACK_DIAGNOSTIC direct.before_new_default");
-    let _turn_context = sess.new_default_turn().await;
-    eprintln!("STACK_DIAGNOSTIC direct.after_new_default");
+    let future_size = {
+        let future = sess.new_default_turn_with_sub_id("future-size-regression".to_string());
+        std::mem::size_of_val(&future)
+    };
+
+    assert!(
+        future_size <= 8 * 1024,
+        "default turn construction future is {future_size} bytes"
+    );
 }
 
 #[tokio::test]

@@ -732,18 +732,14 @@ impl Session {
         final_output_json_schema: Option<Option<Value>>,
     ) -> BoxFuture<'_, Arc<TurnContext>> {
         Box::pin(async move {
-            eprintln!("STACK_DIAGNOSTIC factory.before_inner");
-            let turn_context = self
-                .new_turn_context_from_configuration(
-                    sub_id,
-                    session_configuration,
-                    final_output_json_schema,
-                    TurnMultiAgentRuntime::ResolveAndStore,
-                    self.git_enrichment_policy,
-                )
-                .await;
-            eprintln!("STACK_DIAGNOSTIC factory.after_inner");
-            turn_context
+            self.new_turn_context_from_configuration(
+                sub_id,
+                session_configuration,
+                final_output_json_schema,
+                TurnMultiAgentRuntime::ResolveAndStore,
+                self.git_enrichment_policy,
+            )
+            .await
         })
     }
 
@@ -771,10 +767,7 @@ impl Session {
         multi_agent_runtime: TurnMultiAgentRuntime,
         git_enrichment_policy: GitEnrichmentPolicy,
     ) -> Arc<TurnContext> {
-        eprintln!("STACK_DIAGNOSTIC turn_context.enter");
-        eprintln!("STACK_DIAGNOSTIC turn_context.before_environment_snapshot");
         let turn_environments = self.services.turn_environments.snapshot().await;
-        eprintln!("STACK_DIAGNOSTIC turn_context.after_environment_snapshot");
         let primary_turn_environment = turn_environments.primary();
         // TODO(anp): Migrate per-turn config and legacy TurnContext cwd consumers to PathUri so
         // a foreign primary environment does not fall back to the session's host cwd.
@@ -783,7 +776,6 @@ impl Session {
             .and_then(|turn_environment| turn_environment.cwd().to_abs_path().ok())
             .unwrap_or_else(|| session_configuration.cwd().clone());
         let per_turn_config = Self::build_per_turn_config(&session_configuration, cwd.clone());
-        eprintln!("STACK_DIAGNOSTIC turn_context.before_model_info");
         let model_info = self
             .services
             .models_manager
@@ -792,7 +784,6 @@ impl Session {
                 &per_turn_config.to_models_manager_config(),
             )
             .await;
-        eprintln!("STACK_DIAGNOSTIC turn_context.after_model_info");
         self.services
             .thread_extension_data
             .insert(model_info.clone());
@@ -807,13 +798,11 @@ impl Session {
             ),
         };
         let plugins_input = per_turn_config.plugins_config_input();
-        eprintln!("STACK_DIAGNOSTIC turn_context.before_plugins");
         let plugin_outcome = self
             .services
             .plugins_manager
             .plugins_for_config(&plugins_input)
             .await;
-        eprintln!("STACK_DIAGNOSTIC turn_context.after_plugins");
         let trusted_plugin_roots = TrustedPluginRoots::from_plugin_load_outcome(
             &plugin_outcome,
             per_turn_config.codex_home.as_path(),
@@ -827,13 +816,11 @@ impl Session {
             .with_plugin_skill_snapshots(plugin_skill_snapshots);
         let fs = primary_turn_environment
             .map(|turn_environment| turn_environment.environment.get_filesystem());
-        eprintln!("STACK_DIAGNOSTIC turn_context.before_skills");
         let skills_snapshot = self
             .services
             .skills_service
             .snapshot_for_config(&skills_input, fs)
             .await;
-        eprintln!("STACK_DIAGNOSTIC turn_context.after_skills");
         let mut turn_context: TurnContext = Self::make_turn_context(
             self.thread_id(),
             self.session_id(),
@@ -865,9 +852,7 @@ impl Session {
         );
         turn_context.code_mode_available = self.services.code_mode_service.is_available();
         turn_context.extension_data.insert(trusted_plugin_roots);
-        eprintln!("STACK_DIAGNOSTIC turn_context.before_realtime_state");
         turn_context.realtime_active = self.conversation.running_state().await.is_some();
-        eprintln!("STACK_DIAGNOSTIC turn_context.after_realtime_state");
 
         if let Some(final_schema) = final_output_json_schema {
             turn_context.final_output_json_schema = final_schema;
@@ -927,19 +912,13 @@ impl Session {
     }
 
     pub(crate) async fn new_default_turn_with_sub_id(&self, sub_id: String) -> Arc<TurnContext> {
-        eprintln!("STACK_DIAGNOSTIC default.before_configuration");
         let session_configuration = self.default_turn_configuration().await;
-        eprintln!("STACK_DIAGNOSTIC default.after_configuration");
-        eprintln!("STACK_DIAGNOSTIC default.before_factory");
-        let turn_context = self
-            .new_turn_from_configuration(
-                sub_id,
-                session_configuration,
-                /*final_output_json_schema*/ None,
-            )
-            .await;
-        eprintln!("STACK_DIAGNOSTIC default.after_factory");
-        turn_context
+        self.new_turn_from_configuration(
+            sub_id,
+            session_configuration,
+            /*final_output_json_schema*/ None,
+        )
+        .await
     }
 
     pub(crate) async fn new_startup_prewarm_turn_with_sub_id(

@@ -148,7 +148,16 @@ jobs:
             echo "::error::pending-input exact filter did not run at least one passing test"
             second=1
           fi
-          exit $((first + second))
+          output=$(timeout 5m cargo test -p codex-core --lib \
+            session::tests::default_turn_construction_future_stays_small \
+            -- --exact --nocapture --test-threads=1 2>&1)
+          third=$?
+          printf '%s\n' "$output"
+          if ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+            echo "::error::turn-construction future-size filter did not run at least one passing test"
+            third=1
+          fi
+          exit $((first + second + third))
 
       - name: whoami provenance tests
         # whoami must distinguish request metadata from the response-scoped
@@ -219,27 +228,35 @@ jobs:
           workspaces: codex-rs
           shared-key: check
 
-      - name: idle-turn stack stage diagnostics
+      - name: targeted future-size and regular-turn regressions
         working-directory: codex-rs
-        env:
-          CODEX_STACK_DIAGNOSTICS: "1"
         run: |
           set +e
-          timeout 5m cargo test -p codex-core --lib \
+          output=$(timeout 5m cargo test -p codex-core --lib \
             session::tests::sampling_loop_future_stays_small_on_normal_stack \
-            -- --exact --nocapture --test-threads=1 2>&1 | tee regression.log
-          regression=${PIPESTATUS[0]}
-          timeout 10m cargo test -p codex-core --lib \
-            session::tests::diagnostic_new_default_turn_on_normal_stack \
-            -- --exact --nocapture --test-threads=1 2>&1 | tee direct.log
-          direct=${PIPESTATUS[0]}
-          timeout 5m cargo test -p codex-core --lib \
+            -- --exact --nocapture --test-threads=1 2>&1)
+          size=$?
+          printf '%s\n' "$output"
+          if ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+            echo "::error::sampling-loop future-size filter did not run at least one passing test"
+            size=1
+          fi
+          output=$(timeout 5m cargo test -p codex-core --lib \
             session::tests::try_start_turn_if_idle_accepts_user_input_in_plan_mode \
-            -- --exact --nocapture --test-threads=1 2>&1 | tee unit.log
-          unit=${PIPESTATUS[0]}
-          timeout 5m cargo test -p codex-core --test all \
+            -- --exact --nocapture --test-threads=1 2>&1)
+          unit=$?
+          printf '%s\n' "$output"
+          if ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+            echo "::error::plan-mode exact filter did not run at least one passing test"
+            unit=1
+          fi
+          output=$(timeout 5m cargo test -p codex-core --test all \
             suite::pending_input::idle_user_input_reaches_the_first_model_request \
-            -- --exact --nocapture --test-threads=1 2>&1 | tee integration.log
-          integration=${PIPESTATUS[0]}
-          echo "stack diagnostic status: regression=$regression direct=$direct unit=$unit integration=$integration"
-          exit $((regression + direct + unit + integration))
+            -- --exact --nocapture --test-threads=1 2>&1)
+          integration=$?
+          printf '%s\n' "$output"
+          if ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+            echo "::error::pending-input exact filter did not run at least one passing test"
+            integration=1
+          fi
+          exit $((size + unit + integration))

@@ -208,9 +208,7 @@ async fn run_turn_inner(
     else {
         return Ok(None);
     };
-    eprintln!("STACK_DIAGNOSTIC turn.after_prepare_turn_setup");
-    eprintln!("STACK_DIAGNOSTIC turn.before_sampling_loop");
-    let sampling_future = run_turn_sampling_loop(
+    run_turn_sampling_loop(
         sess,
         turn_context,
         cancellation_token,
@@ -219,12 +217,8 @@ async fn run_turn_inner(
         world_state,
         turn_diff_tracker,
         can_drain_pending_input,
-    );
-    eprintln!(
-        "STACK_DIAGNOSTIC turn.sampling_future_size={}",
-        std::mem::size_of_val(&sampling_future)
-    );
-    sampling_future.await
+    )
+    .await
 }
 
 // Keep the request loop in its own future. The setup path must not retain the
@@ -239,7 +233,6 @@ pub(crate) async fn run_turn_sampling_loop(
     turn_diff_tracker: SharedTurnDiffTracker,
     mut can_drain_pending_input: bool,
 ) -> CodexResult<Option<String>> {
-    eprintln!("STACK_DIAGNOSTIC sampling_loop.enter");
     let mut last_agent_message: Option<String> = None;
     let mut stop_hook_active = false;
     let mut next_step_context = Some(first_step_context);
@@ -247,7 +240,6 @@ pub(crate) async fn run_turn_sampling_loop(
         // Note that pending_input would be something like a message the user
         // submitted through the UI while the model was running. Though the UI
         // may support this, the model might not.
-        eprintln!("STACK_DIAGNOSTIC sampling_loop.before_pending_input");
         let pending_input = if can_drain_pending_input {
             sess.input_queue
                 .get_pending_input(&sess.active_turn)
@@ -256,28 +248,20 @@ pub(crate) async fn run_turn_sampling_loop(
         } else {
             Vec::new()
         };
-        eprintln!("STACK_DIAGNOSTIC sampling_loop.after_pending_input");
 
-        eprintln!("STACK_DIAGNOSTIC sampling_loop.before_hooks");
         if run_hooks_and_record_inputs(&sess, &turn_context, &pending_input).await {
             break;
         }
-        eprintln!("STACK_DIAGNOSTIC sampling_loop.after_hooks");
 
-        eprintln!("STACK_DIAGNOSTIC sampling_loop.before_window_id");
         let window_id = sess.current_window_id().await;
-        eprintln!("STACK_DIAGNOSTIC sampling_loop.after_window_id");
-        eprintln!("STACK_DIAGNOSTIC sampling_loop.before_reminder");
         super::rollout_budget::maybe_record_reminder(
             sess.as_ref(),
             turn_context.as_ref(),
             &window_id,
         )
         .await;
-        eprintln!("STACK_DIAGNOSTIC sampling_loop.after_reminder");
 
         // Capture once so context, advertised tools, and tool calls share one request view.
-        eprintln!("STACK_DIAGNOSTIC sampling_loop.before_step_context_match");
         let step_context = match next_step_context.take() {
             Some(step_context) => step_context,
             None if pending_input.is_empty() => {
@@ -301,7 +285,6 @@ pub(crate) async fn run_turn_sampling_loop(
                 .await?
             }
         };
-        eprintln!("STACK_DIAGNOSTIC sampling_loop.after_step_context_match");
         let sampling_request_result: CodexResult<_> = async {
             super::time_reminder::maybe_record_current_time_reminder(
                 sess.as_ref(),
@@ -347,6 +330,7 @@ pub(crate) async fn run_turn_sampling_loop(
             )
             .await
         }
+        .boxed()
         .await;
         match sampling_request_result {
             Ok((sampling_request_output, sampling_request_input)) => {

@@ -59,12 +59,10 @@ impl Session {
         self: Arc<Self>,
         input: Vec<TurnInput>,
     ) -> Result<(), TryStartTurnIfIdleError> {
-        eprintln!("STACK_DIAGNOSTIC admission.enter");
         if input.is_empty() {
             return Ok(());
         }
         let _turn_start_guard = self.input_queue.lock_turn_start().await;
-        eprintln!("STACK_DIAGNOSTIC admission.after_turn_start_lock");
         if self
             .shutdown_started
             .load(std::sync::atomic::Ordering::Acquire)
@@ -97,11 +95,9 @@ impl Session {
             ));
         }
 
-        eprintln!("STACK_DIAGNOSTIC admission.before_new_default");
         let turn_context = self
             .new_default_turn_with_sub_id(uuid::Uuid::new_v4().to_string())
             .await;
-        eprintln!("STACK_DIAGNOSTIC admission.after_new_default");
         if !has_user_input && turn_context.mode == ModeKind::Plan {
             return Err(TryStartTurnIfIdleError::new(
                 TryStartTurnIfIdleRejectionReason::PlanMode,
@@ -137,7 +133,6 @@ impl Session {
         } else {
             input
         };
-        eprintln!("STACK_DIAGNOSTIC admission.before_start_task");
         self.start_task(
             turn_context,
             task_input,
@@ -146,7 +141,6 @@ impl Session {
             MailboxParentProvenance::Ignore,
         )
         .await;
-        eprintln!("STACK_DIAGNOSTIC admission.after_start_task");
         if let Some(receiver) = input_persisted_receiver {
             return receiver
                 .await
