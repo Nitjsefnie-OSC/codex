@@ -102,7 +102,7 @@ pub async fn user_input_or_turn(
         "user_input_or_turn:inner-future",
         std::mem::size_of_val(&admission_future),
     );
-    let admission = admission_future.await;
+    let admission = Box::pin(admission_future).await;
     crate::session::turn::stack_probe("user_input_or_turn:after-inner");
     sess.pending_user_message_admissions
         .complete(&sub_id, admission);
