@@ -1186,6 +1186,24 @@ async fn maybe_run_previous_model_inline_compact(
     let Some(previous_turn_settings) = sess.previous_turn_settings().await else {
         return Ok(());
     };
+    maybe_run_previous_model_inline_compact_after_settings(
+        sess,
+        turn_context,
+        client_session,
+        cancellation_token,
+        previous_turn_settings,
+    )
+    .await
+}
+
+fn maybe_run_previous_model_inline_compact_after_settings<'a>(
+    sess: &'a Arc<Session>,
+    turn_context: &'a Arc<TurnContext>,
+    client_session: &'a mut ModelClientSession,
+    cancellation_token: &'a CancellationToken,
+    previous_turn_settings: PreviousTurnSettings,
+) -> BoxFuture<'a, CodexResult<()>> {
+    Box::pin(async move {
     let should_compact_for_comp_hash_change = comp_hash_changed(
         previous_turn_settings.comp_hash.as_deref(),
         turn_context.model_info.comp_hash.as_deref(),
@@ -1268,6 +1286,7 @@ async fn maybe_run_previous_model_inline_compact(
         .await?;
     }
     Ok(())
+    })
 }
 
 fn run_auto_compact<'a>(
