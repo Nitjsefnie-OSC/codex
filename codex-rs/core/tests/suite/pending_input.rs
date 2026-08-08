@@ -108,6 +108,7 @@ async fn idle_response_items_include_pending_mailbox_in_first_request() -> anyho
 async fn assert_idle_user_input_reaches_the_first_model_request(
     mode: ModeKind,
 ) -> anyhow::Result<()> {
+    eprintln!("STACK_DIAGNOSTIC integration.before_setup");
     let server = responses::start_mock_server().await;
     let response = responses::mount_sse_once(
         &server,
@@ -118,6 +119,7 @@ async fn assert_idle_user_input_reaches_the_first_model_request(
     )
     .await;
     let test = test_codex().build_with_auto_env(&server).await?;
+    eprintln!("STACK_DIAGNOSTIC integration.after_setup");
 
     if mode == ModeKind::Plan {
         core_test_support::submit_thread_settings(
@@ -141,14 +143,18 @@ async fn assert_idle_user_input_reaches_the_first_model_request(
         text: "queued user input reaches the first request".to_string(),
         text_elements: Vec::new(),
     }];
-    test.codex
-        .try_start_turn_if_idle(vec![TurnInput::UserInput {
+    eprintln!("STACK_DIAGNOSTIC integration.before_admission_future");
+    let admission = test.codex.try_start_turn_if_idle(vec![TurnInput::UserInput {
             content: expected_input.clone(),
             client_id: Some("queued-user-message".to_string()),
-        }])
+        }]);
+    eprintln!("STACK_DIAGNOSTIC integration.after_admission_future");
+    admission
         .await
         .map_err(|error| anyhow::anyhow!("idle user input was rejected: {:?}", error.reason()))?;
+    eprintln!("STACK_DIAGNOSTIC integration.after_admission");
 
+    eprintln!("STACK_DIAGNOSTIC integration.before_first_model_event");
     let user_message = core_test_support::wait_for_event_match(test.codex.as_ref(), |event| {
         let EventMsg::ItemCompleted(event) = event else {
             return None;
@@ -159,6 +165,7 @@ async fn assert_idle_user_input_reaches_the_first_model_request(
         Some(item.clone())
     })
     .await;
+    eprintln!("STACK_DIAGNOSTIC integration.after_first_model_event");
     assert_eq!(
         Some("queued-user-message".to_string()),
         user_message.client_id
