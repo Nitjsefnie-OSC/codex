@@ -229,7 +229,7 @@ async fn run_turn_inner(
 
 // Keep the request loop in its own future. The setup path must not retain the
 // loop's monitor-delivery and tool-sampling state while it is being polled.
-async fn run_turn_sampling_loop(
+pub(crate) async fn run_turn_sampling_loop(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     cancellation_token: CancellationToken,

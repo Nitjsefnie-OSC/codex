@@ -10797,6 +10797,28 @@ async fn diagnostic_new_default_turn_on_normal_stack() {
 }
 
 #[tokio::test]
+async fn sampling_loop_future_stays_small_on_normal_stack() {
+    let (sess, turn_context) = make_session_and_context().await;
+    let sess = Arc::new(sess);
+    let turn_context = Arc::new(turn_context);
+    let future = super::turn::run_turn_sampling_loop(
+        Arc::clone(&sess),
+        Arc::clone(&turn_context),
+        CancellationToken::new(),
+        test_model_client_session(),
+        Arc::new(StepContext::for_test(Arc::clone(&turn_context))),
+        WorldState::default(),
+        Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        true,
+    );
+    let future_size = std::mem::size_of_val(&future);
+    assert!(
+        future_size <= 32 * 1024,
+        "sampling loop future is {future_size} bytes"
+    );
+}
+
+#[tokio::test]
 async fn try_start_turn_if_idle_rejects_empty_user_input_in_plan_mode() {
     let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
     let mut collaboration_mode = sess.collaboration_mode().await;

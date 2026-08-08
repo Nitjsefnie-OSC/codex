@@ -225,6 +225,10 @@ jobs:
           CODEX_STACK_DIAGNOSTICS: "1"
         run: |
           set +e
+          timeout 5m cargo test -p codex-core --lib \
+            session::tests::sampling_loop_future_stays_small_on_normal_stack \
+            -- --exact --nocapture --test-threads=1 2>&1 | tee regression.log
+          regression=${PIPESTATUS[0]}
           timeout 10m cargo test -p codex-core --lib \
             session::tests::diagnostic_new_default_turn_on_normal_stack \
             -- --exact --nocapture --test-threads=1 2>&1 | tee direct.log
@@ -237,5 +241,5 @@ jobs:
             suite::pending_input::idle_user_input_reaches_the_first_model_request \
             -- --exact --nocapture --test-threads=1 2>&1 | tee integration.log
           integration=${PIPESTATUS[0]}
-          echo "stack diagnostic status: direct=$direct unit=$unit integration=$integration"
-          exit $((direct + unit + integration))
+          echo "stack diagnostic status: regression=$regression direct=$direct unit=$unit integration=$integration"
+          exit $((regression + direct + unit + integration))
