@@ -244,6 +244,15 @@ jobs:
             size=1
           fi
           output=$(timeout 5m cargo test -p codex-core --lib \
+            session::turn::tests::sampling_request_future_boundary_is_pointer_sized \
+            -- --exact --nocapture --test-threads=1 2>&1)
+          request=$?
+          printf '%s\n' "$output"
+          if ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+            echo "::error::sampling-request future-boundary filter did not run at least one passing test"
+            request=1
+          fi
+          output=$(timeout 5m cargo test -p codex-core --lib \
             session::tests::try_start_turn_if_idle_accepts_user_input_in_plan_mode \
             -- --exact --nocapture --test-threads=1 2>&1)
           unit=$?
@@ -261,4 +270,4 @@ jobs:
             echo "::error::pending-input exact filter did not run at least one passing test"
             integration=1
           fi
-          exit $((size + unit + integration))
+          exit $((size + request + unit + integration))

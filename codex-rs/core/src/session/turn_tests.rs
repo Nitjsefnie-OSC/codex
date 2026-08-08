@@ -85,3 +85,35 @@ async fn plan_mode_uses_contributed_turn_item_for_last_agent_message() {
         Some("plan contributed assistant text")
     );
 }
+
+#[tokio::test]
+async fn sampling_request_future_boundary_is_pointer_sized() {
+    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let sess = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+    let step_context = StepContext::for_test(Arc::clone(&turn_context));
+    let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+    let mut client_session = crate::session::tests::test_model_client_session();
+    let responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(
+        sess.installation_id.clone(),
+        sess.current_window_id().await,
+        CodexResponsesRequestKind::Turn,
+    );
+
+    let future = run_sampling_request(
+        Arc::clone(&sess),
+        step_context,
+        Arc::clone(&turn_context.extension_data),
+        turn_diff_tracker,
+        &mut client_session,
+        &responses_metadata,
+        Vec::new(),
+        CancellationToken::new(),
+    );
+    let future_size = std::mem::size_of_val(&future);
+
+    assert!(
+        future_size <= 2 * std::mem::size_of::<usize>(),
+        "sampling request API future boundary is {future_size} bytes"
+    );
+}
