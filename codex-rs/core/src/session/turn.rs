@@ -2418,12 +2418,15 @@ async fn try_run_sampling_request(
     stack_diagnostic!("STACK_DIAGNOSTIC try_run_sampling_request.before_sampling_timing");
     let sampling_timing_guard = turn_context.turn_timing_state.begin_sampling();
     stack_diagnostic!("STACK_DIAGNOSTIC try_run_sampling_request.after_sampling_timing");
+    stack_diagnostic!("STACK_DIAGNOSTIC try_run_sampling_request.before_cutoff_flag");
     let uses_sequential_cutoff_reasoning_summaries = turn_context
         .config
         .features
         .enabled(Feature::ConcurrentReasoningSummaries)
         && turn_context.provider.info().is_openai();
-    let mut stream = client_session
+    stack_diagnostic!("STACK_DIAGNOSTIC try_run_sampling_request.after_cutoff_flag");
+    stack_diagnostic!("STACK_DIAGNOSTIC try_run_sampling_request.before_stream_construct");
+    let stream_future = client_session
         .stream(
             prompt,
             &turn_context.model_info,
@@ -2433,10 +2436,17 @@ async fn try_run_sampling_request(
             turn_context.config.service_tier.clone(),
             responses_metadata,
             &inference_trace,
-        )
+        );
+    stack_diagnostic!(
+        "STACK_DIAGNOSTIC try_run_sampling_request.after_stream_construct size={}",
+        std::mem::size_of_val(&stream_future)
+    );
+    stack_diagnostic!("STACK_DIAGNOSTIC try_run_sampling_request.before_stream_poll");
+    let mut stream = stream_future
         .instrument(trace_span!("stream_request"))
         .or_cancel(&cancellation_token)
         .await??;
+    stack_diagnostic!("STACK_DIAGNOSTIC try_run_sampling_request.after_stream_poll");
     let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
         FuturesOrdered::new();
     let mut needs_follow_up = false;
