@@ -140,6 +140,14 @@ use codex_response_debug_context::extract_response_debug_context_from_api_error;
 use codex_response_debug_context::telemetry_api_error_message;
 use codex_response_debug_context::telemetry_transport_error_message;
 
+macro_rules! client_stack_diagnostic {
+    ($message:literal) => {
+        if std::env::var_os("CODEX_STACK_DIAGNOSTICS").is_some() {
+            eprintln!($message);
+        }
+    };
+}
+
 pub const OPENAI_BETA_HEADER: &str = "OpenAI-Beta";
 pub const X_CODEX_INSTALLATION_ID_HEADER: &str = "x-codex-installation-id";
 pub const X_CODEX_ROUTING_HINT_HEADER: &str = "x-codex-routing-hint";
@@ -1631,6 +1639,9 @@ impl ModelClientSession {
         request_trace: Option<W3cTraceContext>,
         inference_trace: &'a InferenceTraceContext,
     ) -> Result<WebsocketStreamOutcome> {
+        client_stack_diagnostic!(
+            "STACK_DIAGNOSTIC stream_responses_websocket_inner.first_poll"
+        );
         let auth_manager = self.client.state.provider.auth_manager();
 
         let mut auth_recovery = auth_manager
@@ -1638,7 +1649,13 @@ impl ModelClientSession {
             .map(AuthManager::unauthorized_recovery);
         let mut pending_retry = PendingUnauthorizedRetry::default();
         loop {
+            client_stack_diagnostic!(
+                "STACK_DIAGNOSTIC stream_responses_websocket_inner.before_current_client_setup"
+            );
             let client_setup = self.client.current_client_setup().await?;
+            client_stack_diagnostic!(
+                "STACK_DIAGNOSTIC stream_responses_websocket_inner.after_current_client_setup"
+            );
             let request_auth_context = AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
                 client_setup.api_auth.as_ref(),
