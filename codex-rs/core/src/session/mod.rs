@@ -3127,7 +3127,6 @@ impl Session {
         cancellation_token: &CancellationToken,
         required_servers: &[String],
     ) -> CodexResult<Arc<StepContext>> {
-        turn::stack_probe("capture_step_context:enter");
         // Keep selections fixed for the turn while allowing their startup work to finish.
         let environments = turn_context.environments.refresh_readiness();
         self.services
@@ -3197,7 +3196,6 @@ impl Session {
         )
         .or_cancel(cancellation_token)
         .await??;
-        turn::stack_probe("capture_step_context:after-built-tools");
         Ok(Arc::new(StepContext {
             turn: turn_context,
             response_identity: Arc::new(
@@ -4040,22 +4038,12 @@ impl Session {
         client_user_message_id: Option<String>,
         responsesapi_client_metadata: Option<HashMap<String, String>>,
     ) -> Result<String, SteerInputError> {
-        crate::session::turn::stack_probe("steer_input:enter");
-        crate::session::turn::stack_probe("steer_input:before-active-lock");
-        let active_lock_future = self.active_turn.lock();
-        crate::session::turn::stack_probe_size(
-            "steer_input:active-lock-future",
-            std::mem::size_of_val(&active_lock_future),
-        );
-        let mut active = active_lock_future.await;
-        crate::session::turn::stack_probe("steer_input:after-active-lock");
+        let mut active = self.active_turn.lock().await;
         let Some(active_turn) = active.as_mut() else {
-            crate::session::turn::stack_probe("steer_input:no-active-turn");
             return Err(SteerInputError::NoActiveTurn(input));
         };
 
         let Some(active_task) = active_turn.task.as_ref() else {
-            crate::session::turn::stack_probe("steer_input:no-active-task");
             return Err(SteerInputError::NoActiveTurn(input));
         };
         let active_turn_id = active_task.turn_context.sub_id.clone();
@@ -4118,7 +4106,6 @@ impl Session {
             self.pending_user_message_admissions
                 .associate_steered_by_client_id(client_id, &active_turn_id);
         }
-        crate::session::turn::stack_probe("steer_input:success");
         Ok(active_turn_id)
     }
 

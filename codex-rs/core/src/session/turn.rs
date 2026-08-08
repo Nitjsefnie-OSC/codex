@@ -142,18 +142,6 @@ use tracing::warn;
 
 const POST_SAMPLING_TOKEN_ESTIMATE_TARGET: &str = "codex_core::post_sampling_token_estimate";
 
-pub(crate) fn stack_probe(stage: &str) {
-    if std::env::var_os("CODEX_STACK_PROBE").is_some() {
-        eprintln!("[codex-stack-probe] {stage}");
-    }
-}
-
-pub(crate) fn stack_probe_size(stage: &str, size: usize) {
-    if std::env::var_os("CODEX_STACK_PROBE").is_some() {
-        eprintln!("[codex-stack-probe] {stage} size={size}");
-    }
-}
-
 /// Takes initial turn input and runs a loop where, at each sampling request,
 /// the model replies with either:
 ///
@@ -178,7 +166,6 @@ pub(crate) async fn run_turn(
     // Record results from hooks that finished after the previous turn before this turn's user prompt.
     drain_async_hook_results(&sess, &turn_context, /*before_user_prompt*/ true).await;
 
-    stack_probe("run_turn:enter");
     let mut client_session =
         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
     // TODO(ccunningham): Pre-turn compaction runs before context updates and the
@@ -206,8 +193,6 @@ pub(crate) async fn run_turn(
         error!("Failed to run pre-sampling compact");
         return Ok(None);
     }
-    stack_probe("run_turn:after-pre-sampling-compact");
-
     let user_input = turn_user_input(&input);
     let (required_servers, mentioned_plugins) =
         match required_mcp_servers_for_input(&sess, turn_context.as_ref(), &user_input)
@@ -237,7 +222,6 @@ pub(crate) async fn run_turn(
         }
         Err(err) => return Err(err),
     };
-    stack_probe("run_turn:after-capture-step-context");
     // Keep the exact model-visible state used by this turn and its inline compactions.
     let (world_state, display_roots) = tokio::join!(
         sess.record_context_updates_and_set_reference_context_item(first_step_context.as_ref()),
@@ -256,8 +240,6 @@ pub(crate) async fn run_turn(
     else {
         return Ok(None);
     };
-    stack_probe("run_turn:after-build-skills-and-plugins");
-
     if run_pending_session_start_hooks(&sess, &turn_context).await {
         return Ok(None);
     }
@@ -347,7 +329,6 @@ pub(crate) async fn run_turn(
             }
         };
         let sampling_request_result: CodexResult<_> = async {
-            stack_probe("run_turn:before-sampling-request");
             super::time_reminder::maybe_record_current_time_reminder(
                 sess.as_ref(),
                 turn_context.as_ref(),
@@ -372,7 +353,6 @@ pub(crate) async fn run_turn(
             }
             .instrument(trace_span!("run_turn.prepare_sampling_request_input"))
             .await;
-            stack_probe("run_turn:after-history-snapshot");
             sess.input_queue.claim_monitor_wake();
             drop(monitor_delivery_guard);
 
@@ -1380,7 +1360,6 @@ async fn run_sampling_request(
     input: Vec<ResponseItem>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<(SamplingRequestResult, Vec<ResponseItem>)> {
-    stack_probe("run_sampling_request:enter");
     let turn_context = Arc::clone(&step_context.turn);
     let router = Arc::clone(&step_context.tool_router);
 
@@ -1422,7 +1401,6 @@ async fn run_sampling_request(
             turn_context.as_ref(),
             base_instructions.clone(),
         );
-        stack_probe("run_sampling_request:before-stream");
         let err = match try_run_sampling_request(
             tool_runtime.clone(),
             Arc::clone(&sess),
@@ -2248,7 +2226,6 @@ async fn try_run_sampling_request(
         .instrument(trace_span!("stream_request"))
         .or_cancel(&cancellation_token)
         .await??;
-    stack_probe("try_sampling:after-stream-open");
     let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
         FuturesOrdered::new();
     let mut needs_follow_up = false;
@@ -2297,7 +2274,6 @@ async fn try_run_sampling_request(
                 break Err(CodexErr::TurnAborted);
             }
         };
-        stack_probe("try_sampling:after-stream-event");
 
         let event = match event {
             Some(Ok(event)) => event,
@@ -2405,7 +2381,6 @@ async fn try_run_sampling_request(
                 };
 
                 let output_result = {
-                    stack_probe("try_sampling:before-tool-dispatch");
                     handle_output_item_done(&mut ctx, item, previously_streamed_item)
                 }
                 .instrument(handle_responses)

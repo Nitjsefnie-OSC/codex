@@ -105,14 +105,12 @@ jobs:
           cargo test -p codex-api --lib websocket_handshake_model -- --nocapture
           cargo test -p codex-api --lib websocket_response_model_attestation -- --nocapture
 
-      - name: regular-turn stack probes
-        # Keep this diagnostic ahead of the whoami gate so a fixture setup or
-        # submission-loop crash cannot hide the known plan-mode start path.
-        continue-on-error: true
+      - name: regular-turn regression tests
+        # Keep the known plan-mode and pending-input start paths ahead of the
+        # provenance gates, with exact filters so a renamed test cannot make
+        # this check vacuous.
         timeout-minutes: 15
         working-directory: codex-rs
-        env:
-          CODEX_STACK_PROBE: "1"
         run: |
           set +e
           output=$(timeout 5m cargo test -p codex-core --lib \
@@ -140,12 +138,10 @@ jobs:
         # server model, including when a later sampling step has no model
         # report. Keep this focused so provenance regressions are attributed
         # separately from the monitor integration suite. Run each integration
-        # case in its own process so a stack overflow identifies the case
+        # case in its own process so a provenance failure identifies the case
         # instead of aborting a parallel test binary.
         timeout-minutes: 25
         working-directory: codex-rs
-        env:
-          CODEX_STACK_PROBE: "1"
         run: |
           cargo test -p codex-core --lib whoami -- --nocapture
           set +e
@@ -177,15 +173,8 @@ jobs:
         # stop-leaves-no-orphan, readable retained output, and idle-session
         # wake-up through a second Responses inference.
         working-directory: codex-rs
-        env:
-          CODEX_STACK_PROBE: "1"
         run: |
           cargo test -p codex-core --lib monitor -- --nocapture
-          timeout 5m cargo test -p codex-core --lib try_start_turn_if_idle_accepts_user_input_in_plan_mode \
-            -- --exact --nocapture --test-threads=1
-          timeout 5m cargo test -p codex-core --test all \
-            suite::pending_input::idle_user_input_reaches_the_first_model_request \
-            -- --exact --nocapture --test-threads=1
           cargo test -p codex-core --lib try_start_turn_if_idle -- --nocapture
           cargo test -p codex-core --test all monitor -- --nocapture
           df -h /

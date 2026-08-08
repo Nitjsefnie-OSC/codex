@@ -300,38 +300,17 @@ impl Session {
         input: Vec<TurnInput>,
         task: T,
     ) {
-        crate::session::turn::stack_probe("spawn_task:enter");
-        crate::session::turn::stack_probe("spawn_task:before-turn-start-lock");
-        let lock_future = self.input_queue.lock_turn_start();
-        crate::session::turn::stack_probe_size(
-            "spawn_task:turn-start-lock-future",
-            std::mem::size_of_val(&lock_future),
-        );
-        let _turn_start_guard = lock_future.await;
-        crate::session::turn::stack_probe("spawn_task:after-turn-start-lock");
-        crate::session::turn::stack_probe("spawn_task:before-abort-all-tasks");
-        let abort_future = self.abort_all_tasks(TurnAbortReason::Replaced);
-        crate::session::turn::stack_probe_size(
-            "spawn_task:abort-all-tasks-future",
-            std::mem::size_of_val(&abort_future),
-        );
-        abort_future.await;
-        crate::session::turn::stack_probe("spawn_task:after-abort-all-tasks");
+        let _turn_start_guard = self.input_queue.lock_turn_start().await;
+        self.abort_all_tasks(TurnAbortReason::Replaced).await;
         self.clear_connector_selection().await;
-        crate::session::turn::stack_probe("spawn_task:before-start-task");
-        let start_task_future = self.start_task(
+        self.start_task(
             turn_context,
             input,
             task,
             /*input_persisted*/ None,
             MailboxParentProvenance::Ignore,
-        );
-        crate::session::turn::stack_probe_size(
-            "spawn_task:start-task-future",
-            std::mem::size_of_val(&start_task_future),
-        );
-        start_task_future.await;
-        crate::session::turn::stack_probe("spawn_task:after-start-task");
+        )
+        .await;
     }
 
     pub(crate) async fn start_task<T: SessionTask>(
@@ -344,7 +323,6 @@ impl Session {
         >,
         mailbox_parent_provenance: MailboxParentProvenance,
     ) {
-        crate::session::turn::stack_probe("start_task:enter");
         let task: Arc<dyn AnySessionTask> = Arc::new(task);
         let task_kind = task.kind();
         let span_name = task.span_name();
@@ -421,7 +399,6 @@ impl Session {
         );
         let handle = tokio::spawn(
             async move {
-                crate::session::turn::stack_probe("start_task:spawned");
                 // The active task must be published before the model can
                 // clone history. Monitor delivery uses that publication as
                 // its startup barrier, avoiding a history/wake race.

@@ -43,7 +43,6 @@ impl SessionTask for RegularTask {
         input: Vec<TurnInput>,
         cancellation_token: CancellationToken,
     ) -> SessionTaskResult {
-        crate::session::turn::stack_probe("regular_task:enter");
         let run_turn_span = trace_span!("run_turn");
         // Regular turns emit `TurnStarted` inline so first-turn lifecycle does
         // not wait on startup prewarm resolution.
@@ -75,23 +74,13 @@ impl SessionTask for RegularTask {
         let mut next_input = input;
         let mut prewarmed_client_session = prewarmed_client_session;
         loop {
-            crate::session::turn::stack_probe("regular_task:before-run-turn");
-            let run_turn_future = run_turn(
+            let run_turn_future: BoxFuture<'static, SessionTaskResult> = Box::pin(run_turn(
                 Arc::clone(&sess),
                 Arc::clone(&ctx),
                 next_input,
                 prewarmed_client_session.take(),
                 cancellation_token.child_token(),
-            );
-            crate::session::turn::stack_probe_size(
-                "regular_task:run-turn-future",
-                std::mem::size_of_val(&run_turn_future),
-            );
-            let run_turn_future: BoxFuture<'static, SessionTaskResult> = Box::pin(run_turn_future);
-            crate::session::turn::stack_probe_size(
-                "regular_task:boxed-run-turn-future",
-                std::mem::size_of_val(&run_turn_future),
-            );
+            ));
             let last_agent_message = run_turn_future
                 .instrument(run_turn_span.clone())
                 .await?;
