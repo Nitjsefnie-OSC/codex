@@ -6,6 +6,7 @@ use crate::realtime_conversation::handle_text as handle_realtime_conversation_te
 use async_channel::Receiver;
 use codex_otel::set_parent_from_w3c_trace_context;
 use codex_protocol::protocol::Submission;
+use futures::future::BoxFuture;
 use tracing::Instrument;
 use tracing::debug_span;
 use tracing::info_span;
@@ -740,7 +741,40 @@ pub(super) async fn submission_loop(
         crate::session::turn::stack_probe("submission_loop:after-receive");
         debug!(?sub, "Submission");
         let dispatch_span = submission_dispatch_span(&sub);
-        let should_exit = async {
+        let should_exit = dispatch_submission(
+            Arc::clone(&sess),
+            Arc::clone(&config),
+            sub,
+            dispatch_span,
+        )
+        .await;
+        if should_exit {
+            shutdown_received = true;
+            break;
+        }
+    }
+    // If the submission loop exits because the channel closed without an
+    // explicit shutdown op, still run session teardown.
+    if !shutdown_received {
+        shutdown_session_runtime(&sess).await;
+        emit_thread_stop_lifecycle(sess.as_ref()).await;
+        if let Some(live_thread) = sess.live_thread()
+            && let Err(err) = live_thread.shutdown().await
+        {
+            warn!("failed to shutdown thread persistence after submission channel closed: {err}");
+        }
+    }
+    debug!("Agent loop exited");
+}
+
+fn dispatch_submission(
+    sess: Arc<Session>,
+    config: Arc<Config>,
+    sub: Submission,
+    dispatch_span: tracing::Span,
+) -> BoxFuture<'static, bool> {
+    Box::pin(async move {
+        async {
             match sub.op.clone() {
                 Op::Interrupt => {
                     interrupt(&sess).await;
@@ -884,24 +918,8 @@ pub(super) async fn submission_loop(
             }
         }
         .instrument(dispatch_span)
-        .await;
-        if should_exit {
-            shutdown_received = true;
-            break;
-        }
-    }
-    // If the submission loop exits because the channel closed without an
-    // explicit shutdown op, still run session teardown.
-    if !shutdown_received {
-        shutdown_session_runtime(&sess).await;
-        emit_thread_stop_lifecycle(sess.as_ref()).await;
-        if let Some(live_thread) = sess.live_thread()
-            && let Err(err) = live_thread.shutdown().await
-        {
-            warn!("failed to shutdown thread persistence after submission channel closed: {err}");
-        }
-    }
-    debug!("Agent loop exited");
+        .await
+    })
 }
 
 async fn approve_guardian_denied_action(sess: &Arc<Session>, event: GuardianAssessmentEvent) {
