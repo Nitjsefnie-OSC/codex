@@ -64,10 +64,12 @@ jobs:
         # exact-record activation state must fail before later hook suites run.
         working-directory: codex-rs
         run: |
-          cargo test -p codex-core-skills --lib plugin_skill_injection_digest
+          cargo test -p codex-skills-extension --lib host_prompt::tests::host_skill_prompt_digest_uses_full_source_before_truncation -- --exact
           cargo test -p codex-core --lib skill_activation_store
           cargo test -p codex-core --lib pending_skill_activation
           cargo test -p codex-core --lib implicit_skill_activation_candidate
+          cargo test -p codex-core --lib hook_runtime::tests::production_pre_tool_use_hook_receives_turn_local_skill_activation_snapshot -- --exact --nocapture --test-threads=1
+          cargo test -p codex-core --lib hook_runtime::tests::production_post_tool_use_hook_receives_turn_local_skill_activation_snapshot -- --exact --nocapture --test-threads=1
 
       - name: classic shell skill activation handler tests
         # These tests execute real handlers. Bound the family so an approval

@@ -112,3 +112,65 @@ impl HostSkillsSnapshot {
 pub fn sha256_hex(contents: &str) -> String {
     format!("{:x}", Sha256::digest(contents.as_bytes()))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    use codex_exec_server::LOCAL_FS;
+    use codex_extension_api::ContextualUserFragment;
+    use codex_protocol::protocol::SkillScope;
+    use codex_skills::SkillMetadata;
+    use codex_utils_absolute_path::AbsolutePathBuf;
+    use tempfile::tempdir;
+
+    use super::HostSkillsSnapshot;
+    use super::sha256_hex;
+    use crate::SkillLoadOutcome;
+
+    #[tokio::test]
+    async fn host_skill_prompt_digest_uses_full_source_before_truncation() {
+        let temp_dir = tempdir().expect("create temporary skill directory");
+        let path = temp_dir.path().join("SKILL.md");
+        let source = "a".repeat(8_001);
+        std::fs::write(&path, &source).expect("write skill source");
+        let path = AbsolutePathBuf::from_absolute_path(
+            std::fs::canonicalize(path).expect("canonicalize skill source"),
+        )
+        .expect("skill source should be absolute");
+        let skill = SkillMetadata {
+            name: "large-skill".to_string(),
+            description: "A large skill".to_string(),
+            short_description: None,
+            interface: None,
+            dependencies: None,
+            policy: None,
+            path_to_skills_md: path.clone(),
+            scope: SkillScope::User,
+            plugin_id: Some("fixture-plugin".to_string()),
+            remote_plugin_id: None,
+        };
+        let outcome = SkillLoadOutcome::from_parts(
+            vec![skill.clone()],
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashSet::from([path.clone()]),
+            HashMap::from([(path, Arc::clone(&LOCAL_FS))]),
+        );
+
+        let prompts = HostSkillsSnapshot::new(Arc::new(outcome))
+            .load_skill_prompts(std::slice::from_ref(&skill))
+            .await;
+        let body = prompts.fragments[0].body();
+
+        assert!(body.contains(&source[..8_000]));
+        assert!(!body.contains(&source));
+        assert_eq!(prompts.warnings.len(), 1);
+        assert_eq!(prompts.injected[0].skill, skill);
+        assert_eq!(prompts.injected[0].content_sha256, sha256_hex(&source));
+    }
+}

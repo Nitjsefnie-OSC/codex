@@ -52,6 +52,7 @@ use crate::event_mapping::parse_turn_item;
 use crate::session::TurnInput;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
+use crate::skills::skill_activation_snapshot;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::sandboxing::PermissionRequestPayload;
 use crate::unified_exec::MonitorInfo;
@@ -191,7 +192,7 @@ pub(crate) async fn run_pre_tool_use_hooks(
         matcher_aliases: tool_name.matcher_aliases().to_vec(),
         tool_use_id,
         tool_input: tool_input.clone(),
-        skill_activations: Vec::new(),
+        skill_activations: skill_activation_snapshot(turn_context),
     };
     let hooks = sess.hooks();
     let preview_runs = hooks.preview_pre_tool_use(&request);
@@ -296,7 +297,7 @@ pub(crate) async fn run_post_tool_use_hooks(
         tool_use_id,
         tool_input,
         tool_response,
-        skill_activations: Vec::new(),
+        skill_activations: skill_activation_snapshot(turn_context),
     };
     let hooks = sess.hooks();
     let preview_runs = hooks.preview_post_tool_use(&request);
@@ -1029,6 +1030,13 @@ fn compaction_trigger_label(value: CompactionTrigger) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use codex_hooks::HooksConfig;
+    use codex_hooks::SkillActivation;
+    use codex_hooks::SkillActivationKind;
+    use codex_hooks::SkillActivationScope;
     use codex_protocol::models::ContentItem;
     use codex_protocol::protocol::HookEventName;
     use codex_protocol::protocol::HookExecutionMode;
@@ -1045,6 +1053,12 @@ mod tests {
     use super::hook_run_metric_tags;
     use crate::session::tests::make_session_and_context;
     use crate::session::tests::make_session_and_context_with_rx;
+    use crate::session::session::Session;
+    use crate::session::turn_context::TurnContext;
+    use crate::skills::record_skill_activation;
+    use crate::skills::skill_activation_snapshot;
+    use crate::tools::hook_names::HookToolName;
+    use core_test_support::hooks::trusted_config_layer_stack;
     use codex_protocol::protocol::HookCompletedEvent;
     use codex_protocol::protocol::HookRunSummary;
     use codex_utils_absolute_path::test_support::PathBufExt;
@@ -1210,6 +1224,221 @@ mod tests {
                 ("status", "completed"),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn production_pre_tool_use_hook_receives_turn_local_skill_activation_snapshot() {
+        let (mut session_a, mut turn_a) = make_session_and_context().await;
+        let (mut session_b, mut turn_b) = make_session_and_context().await;
+        turn_a.sub_id = "turn-a".to_string();
+        turn_b.sub_id = "turn-b".to_string();
+        let log_a = install_tool_hooks(&mut session_a, &turn_a);
+        let log_b = install_tool_hooks(&mut session_b, &turn_b);
+
+        let activation_a = activation("alpha", &turn_a.sub_id, 'a');
+        let activation_b = activation("beta", &turn_b.sub_id, 'b');
+        record_skill_activation(&turn_a, activation_a.clone());
+        record_skill_activation(&turn_b, activation_b.clone());
+
+        let session_a = Arc::new(session_a);
+        let turn_a = Arc::new(turn_a);
+        let session_b = Arc::new(session_b);
+        let turn_b = Arc::new(turn_b);
+
+        assert!(matches!(
+            super::run_pre_tool_use_hooks(
+                &session_a,
+                &turn_a,
+                "pre-a".to_string(),
+                &HookToolName::bash(),
+                &serde_json::json!({"command": "echo alpha"}),
+            )
+            .await,
+            super::PreToolUseHookResult::Continue { .. }
+        ));
+        assert!(matches!(
+            super::run_pre_tool_use_hooks(
+                &session_b,
+                &turn_b,
+                "pre-b".to_string(),
+                &HookToolName::bash(),
+                &serde_json::json!({"command": "echo beta"}),
+            )
+            .await,
+            super::PreToolUseHookResult::Continue { .. }
+        ));
+
+        let inputs_a = read_hook_inputs(&log_a);
+        let inputs_b = read_hook_inputs(&log_b);
+        assert_eq!(inputs_a.len(), 1);
+        assert_eq!(inputs_b.len(), 1);
+        assert_eq!(
+            inputs_a[0]["skill_activations"],
+            serde_json::to_value(vec![activation_a]).expect("serialize turn A activation")
+        );
+        assert_eq!(
+            inputs_b[0]["skill_activations"],
+            serde_json::to_value(vec![activation_b]).expect("serialize turn B activation")
+        );
+        assert_eq!(inputs_a[0]["turn_id"], "turn-a");
+        assert_eq!(inputs_b[0]["turn_id"], "turn-b");
+
+        let activation_a_later = activation("later", &turn_a.sub_id, 'c');
+        record_skill_activation(&turn_a, activation_a_later);
+        super::run_pre_tool_use_hooks(
+            &session_a,
+            &turn_a,
+            "pre-a-later".to_string(),
+            &HookToolName::bash(),
+            &serde_json::json!({"command": "echo later"}),
+        )
+        .await;
+        let inputs_a = read_hook_inputs(&log_a);
+        assert_eq!(inputs_a.len(), 2);
+        assert_eq!(
+            inputs_a[1]["skill_activations"],
+            serde_json::to_value(skill_activation_snapshot(&turn_a))
+                .expect("serialize current turn A snapshot")
+        );
+    }
+
+    #[tokio::test]
+    async fn production_post_tool_use_hook_receives_turn_local_skill_activation_snapshot() {
+        let (mut session_a, mut turn_a) = make_session_and_context().await;
+        let (mut session_b, mut turn_b) = make_session_and_context().await;
+        turn_a.sub_id = "turn-a-post".to_string();
+        turn_b.sub_id = "turn-b-post".to_string();
+        let log_a = install_tool_hooks(&mut session_a, &turn_a);
+        let log_b = install_tool_hooks(&mut session_b, &turn_b);
+
+        let activation_a = activation("alpha", &turn_a.sub_id, 'd');
+        let activation_b = activation("beta", &turn_b.sub_id, 'e');
+        record_skill_activation(&turn_a, activation_a.clone());
+        record_skill_activation(&turn_b, activation_b.clone());
+
+        let session_a = Arc::new(session_a);
+        let turn_a = Arc::new(turn_a);
+        let session_b = Arc::new(session_b);
+        let turn_b = Arc::new(turn_b);
+
+        super::run_post_tool_use_hooks(
+            &session_a,
+            &turn_a,
+            "post-a".to_string(),
+            "Bash".to_string(),
+            Vec::new(),
+            serde_json::json!({"command": "echo alpha"}),
+            serde_json::json!({"stdout": "alpha"}),
+        )
+        .await;
+        super::run_post_tool_use_hooks(
+            &session_b,
+            &turn_b,
+            "post-b".to_string(),
+            "Bash".to_string(),
+            Vec::new(),
+            serde_json::json!({"command": "echo beta"}),
+            serde_json::json!({"stdout": "beta"}),
+        )
+        .await;
+
+        let inputs_a = read_hook_inputs(&log_a);
+        let inputs_b = read_hook_inputs(&log_b);
+        assert_eq!(inputs_a.len(), 1);
+        assert_eq!(inputs_b.len(), 1);
+        assert_eq!(inputs_a[0]["turn_id"], "turn-a-post");
+        assert_eq!(inputs_b[0]["turn_id"], "turn-b-post");
+        assert_eq!(
+            inputs_a[0]["skill_activations"],
+            serde_json::to_value(vec![activation_a]).expect("serialize post turn A activation")
+        );
+        assert_eq!(
+            inputs_b[0]["skill_activations"],
+            serde_json::to_value(vec![activation_b]).expect("serialize post turn B activation")
+        );
+    }
+
+    fn activation(name: &str, turn_id: &str, digest_character: char) -> SkillActivation {
+        SkillActivation::new(
+            name.to_string(),
+            format!("/skills/{name}/SKILL.md"),
+            SkillActivationScope::Repo,
+            SkillActivationKind::Explicit,
+            turn_id.to_string(),
+            digest_character.to_string().repeat(64),
+        )
+        .expect("valid skill activation")
+    }
+
+    fn install_tool_hooks(session: &mut Session, turn_context: &TurnContext) -> PathBuf {
+        let codex_home = turn_context.config.codex_home.as_path();
+        std::fs::create_dir_all(codex_home).expect("create codex home");
+        let script_path = codex_home.join("tool_activation_hook.py");
+        let log_path = codex_home.join("tool_activation_hook_log.jsonl");
+        std::fs::write(
+            &script_path,
+            format!(
+                "import json\nfrom pathlib import Path\nimport sys\npayload = json.load(sys.stdin)\nwith Path(r\"{}\").open(\"a\", encoding=\"utf-8\") as handle:\n    handle.write(json.dumps(payload) + \"\\n\")\n",
+                log_path.display()
+            ),
+        )
+        .expect("write tool activation hook script");
+        std::fs::write(
+            codex_home.join("hooks.json"),
+            serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": "Bash",
+                        "hooks": [{
+                            "type": "command",
+                            "command": format!("python3 {}", script_path.display()),
+                        }]
+                    }],
+                    "PostToolUse": [{
+                        "matcher": "Bash",
+                        "hooks": [{
+                            "type": "command",
+                            "command": format!("python3 {}", script_path.display()),
+                        }]
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .expect("write tool activation hooks config");
+
+        let listed = codex_hooks::list_hooks(HooksConfig {
+            feature_enabled: true,
+            config_layer_stack: Some(turn_context.config.config_layer_stack.clone()),
+            ..HooksConfig::default()
+        });
+        assert_eq!(listed.hooks.len(), 2);
+        let trusted_config_layer_stack = trusted_config_layer_stack(
+            &turn_context.config.config_layer_stack,
+            &turn_context.config.codex_home,
+            listed.hooks,
+        );
+        let hooks = session.hooks().reconfigured(HooksConfig {
+            feature_enabled: true,
+            config_layer_stack: Some(trusted_config_layer_stack),
+            shell_program: (!cfg!(windows)).then_some("/bin/sh".to_string()),
+            shell_args: if cfg!(windows) {
+                Vec::new()
+            } else {
+                vec!["-c".to_string()]
+            },
+            ..HooksConfig::default()
+        });
+        session.services.hooks.store(Arc::new(hooks));
+        log_path
+    }
+
+    fn read_hook_inputs(path: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .expect("read tool activation hook log")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("parse tool activation hook input"))
+            .collect()
     }
 
     fn sample_hook_run(status: HookRunStatus, source: HookSource) -> HookRunSummary {

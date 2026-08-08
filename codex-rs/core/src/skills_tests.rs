@@ -1,9 +1,7 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use codex_core_skills::loader::MAX_CONCURRENT_ROOT_SCANS;
-use codex_core_skills::loader::SkillRoot;
-use codex_core_skills::loader::load_skills_from_roots;
 use codex_exec_server::LOCAL_FS;
 use codex_extension_api::ExtensionData;
 use codex_hooks::SkillActivation;
@@ -13,12 +11,12 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::SkillScope;
 use codex_skills_extension::HostSkillsSnapshot;
+use codex_skills_extension::SkillLoadOutcome;
+use codex_skills::SkillMetadata;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::test_support::PathBufExt;
-use codex_utils_plugins::SkillDiscoveryMode;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
-use tokio::sync::Semaphore;
 
 use super::discard_pending_skill_activation;
 use super::prepare_implicit_skill_activation;
@@ -52,20 +50,28 @@ pub(crate) async fn implicit_skill_fixture(scope: SkillScope) -> ImplicitSkillFi
     std::fs::create_dir_all(&skill_dir).expect("create skill dir");
     let skill_path = skill_dir.join("SKILL.md");
     std::fs::write(&skill_path, ORIGINAL_SKILL_SOURCE).expect("write skill source");
-    let outcome = load_skills_from_roots(
-        [SkillRoot {
-            path: skills_root.abs(),
-            scope,
-            file_system: Arc::clone(&LOCAL_FS),
-            plugin_identity: None,
-            plugin_namespace: None,
-            plugin_root: None,
-            discovery_mode: SkillDiscoveryMode::Recursive,
-        }],
-        None,
-        Arc::new(Semaphore::new(MAX_CONCURRENT_ROOT_SCANS)),
+    let skill_path = skill_path.abs();
+    let skill = SkillMetadata {
+        name: "audit-skill".to_string(),
+        description: "Audit reads.".to_string(),
+        short_description: None,
+        interface: None,
+        dependencies: None,
+        policy: None,
+        path_to_skills_md: skill_path.clone(),
+        scope,
+        plugin_id: None,
+        remote_plugin_id: None,
+    };
+    let outcome = SkillLoadOutcome::from_parts(
+        vec![skill],
+        Vec::new(),
+        vec![skills_root.abs()],
+        HashMap::from([(skill_path.clone(), skills_root.abs())]),
+        HashMap::from([(skill_path.clone(), skill_path.clone())]),
+        Default::default(),
+        HashMap::from([(skill_path.clone(), Arc::clone(&LOCAL_FS))]),
     )
-    .await
     .with_disabled_paths(Default::default());
     assert_eq!(outcome.errors, Vec::new());
     assert_eq!(outcome.skills.len(), 1);
@@ -77,7 +83,7 @@ pub(crate) async fn implicit_skill_fixture(scope: SkillScope) -> ImplicitSkillFi
         session,
         turn,
         _temp_dir: temp_dir,
-        skill_path: skill_path.abs(),
+        skill_path,
         workdir: skill_dir.abs(),
     }
 }
