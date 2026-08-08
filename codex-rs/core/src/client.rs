@@ -93,7 +93,6 @@ use codex_tools::create_tools_json_for_responses_lite;
 use codex_tools::create_tools_raw_json_for_responses_api;
 use eventsource_stream::Event;
 use eventsource_stream::EventStreamError;
-use futures::FutureExt;
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use http::HeaderMap as ApiHeaderMap;
@@ -1076,19 +1075,15 @@ impl ModelClient {
         );
         let websocket_connect_timeout = self.state.provider.info().websocket_connect_timeout();
         let start = Instant::now();
-        let websocket_client = ApiWebSocketResponsesClient::new(api_provider, api_auth);
-        let websocket_connect = websocket_client
-            .connect(
+        let result = match tokio::time::timeout(
+            websocket_connect_timeout,
+            ApiWebSocketResponsesClient::new(api_provider, api_auth).connect(
                 &self.http_client_factory,
                 headers,
                 codex_login::default_client::default_headers(),
                 /*turn_state*/ None,
                 Some(websocket_telemetry),
-            )
-            .boxed();
-        let result = match tokio::time::timeout(
-            websocket_connect_timeout,
-            websocket_connect,
+            ),
         )
         .await
         {
