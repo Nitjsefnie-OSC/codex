@@ -221,9 +221,32 @@ async fn run_turn_inner(
     .await
 }
 
-// Keep the request loop in its own future. The setup path must not retain the
-// loop's monitor-delivery and tool-sampling state while it is being polled.
-pub(crate) async fn run_turn_sampling_loop(
+// Keep the request loop behind a heap boundary. The setup path must not retain
+// the loop's monitor-delivery and tool-sampling state while it is being polled,
+// and the loop's concrete future includes several large asynchronous branches.
+pub(crate) fn run_turn_sampling_loop(
+    sess: Arc<Session>,
+    turn_context: Arc<TurnContext>,
+    cancellation_token: CancellationToken,
+    client_session: ModelClientSession,
+    first_step_context: Arc<StepContext>,
+    world_state: Arc<WorldState>,
+    turn_diff_tracker: SharedTurnDiffTracker,
+    can_drain_pending_input: bool,
+) -> BoxFuture<'static, CodexResult<Option<String>>> {
+    Box::pin(run_turn_sampling_loop_inner(
+        sess,
+        turn_context,
+        cancellation_token,
+        client_session,
+        first_step_context,
+        world_state,
+        turn_diff_tracker,
+        can_drain_pending_input,
+    ))
+}
+
+async fn run_turn_sampling_loop_inner(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     cancellation_token: CancellationToken,
@@ -330,7 +353,6 @@ pub(crate) async fn run_turn_sampling_loop(
             )
             .await
         }
-        .boxed()
         .await;
         match sampling_request_result {
             Ok((sampling_request_output, sampling_request_input)) => {
