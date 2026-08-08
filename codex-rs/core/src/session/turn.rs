@@ -1516,7 +1516,33 @@ pub(crate) fn build_prompt(
 
 #[allow(clippy::too_many_arguments)]
 #[allow(deprecated)]
-#[instrument(level = "trace",
+fn run_sampling_request<'a>(
+    sess: Arc<Session>,
+    step_context: Arc<StepContext>,
+    turn_store: Arc<codex_extension_api::ExtensionData>,
+    turn_diff_tracker: SharedTurnDiffTracker,
+    client_session: &'a mut ModelClientSession,
+    responses_metadata: &'a CodexResponsesMetadata,
+    input: Vec<ResponseItem>,
+    cancellation_token: CancellationToken,
+) -> BoxFuture<'a, CodexResult<(SamplingRequestResult, Vec<ResponseItem>)>> {
+    Box::pin(run_sampling_request_inner(
+        sess,
+        step_context,
+        turn_store,
+        turn_diff_tracker,
+        client_session,
+        responses_metadata,
+        input,
+        cancellation_token,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(deprecated)]
+#[instrument(
+    name = "run_sampling_request",
+    level = "trace",
     skip_all,
     fields(
         turn_id = %step_context.turn.sub_id,
@@ -1524,13 +1550,13 @@ pub(crate) fn build_prompt(
         cwd = %step_context.turn.cwd.display()
     )
 )]
-async fn run_sampling_request(
+async fn run_sampling_request_inner<'a>(
     sess: Arc<Session>,
     step_context: Arc<StepContext>,
     turn_store: Arc<codex_extension_api::ExtensionData>,
     turn_diff_tracker: SharedTurnDiffTracker,
-    client_session: &mut ModelClientSession,
-    responses_metadata: &CodexResponsesMetadata,
+    client_session: &'a mut ModelClientSession,
+    responses_metadata: &'a CodexResponsesMetadata,
     input: Vec<ResponseItem>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<(SamplingRequestResult, Vec<ResponseItem>)> {
