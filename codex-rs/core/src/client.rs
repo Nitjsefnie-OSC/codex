@@ -140,14 +140,6 @@ use codex_response_debug_context::extract_response_debug_context_from_api_error;
 use codex_response_debug_context::telemetry_api_error_message;
 use codex_response_debug_context::telemetry_transport_error_message;
 
-macro_rules! client_stack_diagnostic {
-    ($message:literal) => {
-        if std::env::var_os("CODEX_STACK_DIAGNOSTICS").is_some() {
-            eprintln!($message);
-        }
-    };
-}
-
 pub const OPENAI_BETA_HEADER: &str = "OpenAI-Beta";
 pub const X_CODEX_INSTALLATION_ID_HEADER: &str = "x-codex-installation-id";
 pub const X_CODEX_ROUTING_HINT_HEADER: &str = "x-codex-routing-hint";
@@ -1385,9 +1377,6 @@ impl ModelClientSession {
         &'a mut self,
         params: WebsocketConnectParams<'a>,
     ) -> std::result::Result<&'a ApiWebSocketConnection, ApiError> {
-        client_stack_diagnostic!(
-            "STACK_DIAGNOSTIC websocket_connection_inner.first_poll"
-        );
         let WebsocketConnectParams {
             session_telemetry,
             api_provider,
@@ -1396,17 +1385,10 @@ impl ModelClientSession {
             auth_context,
             request_route_telemetry,
         } = params;
-        client_stack_diagnostic!(
-            "STACK_DIAGNOSTIC websocket_connection_inner.before_needs_new"
-        );
         let needs_new = match self.websocket_session.connection.as_ref() {
             Some(conn) => conn.is_closed().await,
             None => true,
         };
-        client_stack_diagnostic!(
-            "STACK_DIAGNOSTIC websocket_connection_inner.after_needs_new"
-        );
-
         if needs_new {
             self.websocket_session.last_request = None;
             self.websocket_session.last_response_rx = None;
@@ -1655,9 +1637,6 @@ impl ModelClientSession {
         request_trace: Option<W3cTraceContext>,
         inference_trace: &'a InferenceTraceContext,
     ) -> Result<WebsocketStreamOutcome> {
-        client_stack_diagnostic!(
-            "STACK_DIAGNOSTIC stream_responses_websocket_inner.first_poll"
-        );
         let auth_manager = self.client.state.provider.auth_manager();
 
         let mut auth_recovery = auth_manager
@@ -1665,27 +1644,12 @@ impl ModelClientSession {
             .map(AuthManager::unauthorized_recovery);
         let mut pending_retry = PendingUnauthorizedRetry::default();
         loop {
-            client_stack_diagnostic!(
-                "STACK_DIAGNOSTIC stream_responses_websocket_inner.before_current_client_setup"
-            );
             let client_setup = self.client.current_client_setup().await?;
-            client_stack_diagnostic!(
-                "STACK_DIAGNOSTIC stream_responses_websocket_inner.after_current_client_setup"
-            );
-            client_stack_diagnostic!(
-                "STACK_DIAGNOSTIC stream_responses_websocket_inner.before_request_auth_context"
-            );
             let request_auth_context = AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
                 client_setup.api_auth.as_ref(),
                 client_setup.agent_identity_telemetry.clone(),
                 pending_retry,
-            );
-            client_stack_diagnostic!(
-                "STACK_DIAGNOSTIC stream_responses_websocket_inner.after_request_auth_context"
-            );
-            client_stack_diagnostic!(
-                "STACK_DIAGNOSTIC stream_responses_websocket_inner.before_build_responses_request"
             );
             let mut request = self.client.build_responses_request(
                 &client_setup.api_provider,
@@ -1696,23 +1660,11 @@ impl ModelClientSession {
                 service_tier.clone(),
                 responses_metadata,
             )?;
-            client_stack_diagnostic!(
-                "STACK_DIAGNOSTIC stream_responses_websocket_inner.after_build_responses_request"
-            );
-            client_stack_diagnostic!(
-                "STACK_DIAGNOSTIC stream_responses_websocket_inner.before_websocket_metadata"
-            );
             let mut websocket_metadata = responses_metadata.clone();
             websocket_metadata.routing_hint = self.client.build_routing_hint_header(
                 client_setup.auth.as_ref(),
                 &request.model,
                 request.service_tier.as_deref(),
-            );
-            client_stack_diagnostic!(
-                "STACK_DIAGNOSTIC stream_responses_websocket_inner.after_websocket_metadata"
-            );
-            client_stack_diagnostic!(
-                "STACK_DIAGNOSTIC stream_responses_websocket_inner.before_request_session_telemetry"
             );
             let request_session_telemetry = if warmup {
                 // `generate=false` prewarm is connection setup, not an inference request.
@@ -1720,30 +1672,12 @@ impl ModelClientSession {
             } else {
                 session_telemetry_for_request(session_telemetry, &request)
             };
-            client_stack_diagnostic!(
-                "STACK_DIAGNOSTIC stream_responses_websocket_inner.after_request_session_telemetry"
-            );
-            client_stack_diagnostic!(
-                "STACK_DIAGNOSTIC stream_responses_websocket_inner.before_client_metadata"
-            );
             let mut client_metadata = self
                 .client
                 .build_ws_client_metadata(responses_metadata, model_info.use_responses_lite);
-            client_stack_diagnostic!(
-                "STACK_DIAGNOSTIC stream_responses_websocket_inner.after_client_metadata"
-            );
-            client_stack_diagnostic!(
-                "STACK_DIAGNOSTIC stream_responses_websocket_inner.before_turn_state"
-            );
             if let Some(turn_state) = self.turn_state.get() {
                 client_metadata.insert(X_CODEX_TURN_STATE_HEADER.to_string(), turn_state.clone());
             }
-            client_stack_diagnostic!(
-                "STACK_DIAGNOSTIC stream_responses_websocket_inner.after_turn_state"
-            );
-            client_stack_diagnostic!(
-                "STACK_DIAGNOSTIC stream_responses_websocket_inner.before_websocket_connection"
-            );
             match self
                 .websocket_connection(WebsocketConnectParams {
                     session_telemetry,

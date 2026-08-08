@@ -230,8 +230,6 @@ jobs:
 
       - name: targeted future-size and regular-turn regressions
         working-directory: codex-rs
-        env:
-          CODEX_STACK_DIAGNOSTICS: "1"
         run: |
           set +e
           output=$(timeout 5m cargo test -p codex-core --lib \
