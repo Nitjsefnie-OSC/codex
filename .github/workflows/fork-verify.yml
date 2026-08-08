@@ -109,11 +109,29 @@ jobs:
         # whoami must distinguish request metadata from the response-scoped
         # server model, including when a later sampling step has no model
         # report. Keep this focused so provenance regressions are attributed
-        # separately from the monitor integration suite.
+        # separately from the monitor integration suite. Run each integration
+        # case in its own process so a stack overflow identifies the case
+        # instead of aborting a parallel test binary.
+        timeout-minutes: 25
         working-directory: codex-rs
         run: |
           cargo test -p codex-core --lib whoami -- --nocapture
-          cargo test -p codex-core --test all whoami -- --nocapture
+          set +e
+          failures=0
+          for test_name in \
+            whoami_reports_server_routed_model_and_request_provenance \
+            whoami_does_not_reuse_server_identity_across_sampling_steps \
+            whoami_does_not_attest_websocket_handshake_model \
+            whoami_retry_clears_stale_model_in_the_same_sampling_step
+          do
+            timeout 5m cargo test -p codex-core --test all "$test_name" -- \
+              --exact --nocapture --test-threads=1
+            status=$?
+            if [ "$status" -ne 0 ]; then
+              failures=$((failures + 1))
+            fi
+          done
+          exit "$failures"
 
       - name: monitor tool tests
         # The dev box may not run cargo test, so this is where the monitor's
