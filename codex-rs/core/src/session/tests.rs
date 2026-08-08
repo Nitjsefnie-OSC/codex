@@ -10807,7 +10807,7 @@ async fn sampling_loop_future_stays_small_on_normal_stack() {
         CancellationToken::new(),
         test_model_client_session(),
         Arc::new(StepContext::for_test(Arc::clone(&turn_context))),
-        WorldState::default(),
+        Arc::new(WorldState::default()),
         Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
         true,
     );
