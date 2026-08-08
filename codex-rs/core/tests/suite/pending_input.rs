@@ -44,32 +44,11 @@ use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::from_slice;
 use serde_json::json;
-use std::time::Duration;
 use tokio::sync::oneshot;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn idle_user_input_reaches_the_first_model_request() -> anyhow::Result<()> {
     assert_idle_user_input_reaches_the_first_model_request(ModeKind::Default).await
-}
-
-// Diagnostic-only companion for the deterministic stack-overflow investigation.
-// The ordinary #[tokio::test] above remains unchanged; this uses an explicit
-// worker stack so the result distinguishes finite stack exhaustion from a
-// poll/drop recursion that survives a larger Tokio worker stack.
-#[test]
-fn diagnostic_idle_user_input_reaches_the_first_model_request_on_large_worker_stack()
-    -> anyhow::Result<()>
-{
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .thread_stack_size(8 * 1024 * 1024)
-        .enable_all()
-        .build()?;
-    let result = runtime.block_on(assert_idle_user_input_reaches_the_first_model_request(
-        ModeKind::Default,
-    ));
-    runtime.shutdown_timeout(Duration::from_secs(5));
-    result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

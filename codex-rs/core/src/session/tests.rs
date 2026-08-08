@@ -10778,46 +10778,18 @@ async fn try_start_turn_if_idle_accepts_user_input_in_plan_mode() {
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }
 
-// Diagnostic-only companion for the deterministic stack-overflow investigation.
-// Keep the production regression test above unchanged so this does not alter its
-// runtime composition; this test only distinguishes a finite test/runtime stack
-// from a poll/drop recursion that survives a substantially larger stack.
-#[test]
-fn diagnostic_try_start_turn_if_idle_accepts_user_input_on_large_stack() {
-    let handle = std::thread::Builder::new()
-        .name("large-stack-plan-mode-diagnostic".to_string())
-        .stack_size(8 * 1024 * 1024)
-        .spawn(|| {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("build diagnostic runtime");
-            runtime.block_on(async {
-                let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
-                let mut collaboration_mode = sess.collaboration_mode().await;
-                collaboration_mode.mode = ModeKind::Plan;
-                {
-                    let mut state = sess.state.lock().await;
-                    state.session_configuration.collaboration_mode = collaboration_mode;
-                    state.merge_connector_selection(["calendar".to_string()]);
-                }
+#[tokio::test]
+async fn default_turn_construction_future_stays_small() {
+    let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
+    let future_size = {
+        let future = sess.new_default_turn_with_sub_id("future-size-regression".to_string());
+        std::mem::size_of_val(&future)
+    };
 
-                sess.try_start_turn_if_idle(vec![TurnInput::UserInput {
-                    content: vec![UserInput::Text {
-                        text: "queued user input".to_string(),
-                        text_elements: Vec::new(),
-                    }],
-                    client_id: Some("queued-user-message".to_string()),
-                }])
-                .await
-                .expect("plan mode should accept user-authored idle input");
-
-                assert!(sess.state.lock().await.get_connector_selection().is_empty());
-                sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
-            });
-        })
-        .expect("spawn large-stack diagnostic thread");
-    handle.join().expect("large-stack diagnostic thread");
+    assert!(
+        future_size <= 8 * 1024,
+        "default turn construction future is {future_size} bytes"
+    );
 }
 
 #[tokio::test]

@@ -725,20 +725,22 @@ impl Session {
             .await)
     }
 
-    async fn new_turn_from_configuration(
+    fn new_turn_from_configuration(
         &self,
         sub_id: String,
         session_configuration: SessionConfiguration,
         final_output_json_schema: Option<Option<Value>>,
-    ) -> Arc<TurnContext> {
-        self.new_turn_context_from_configuration(
-            sub_id,
-            session_configuration,
-            final_output_json_schema,
-            TurnMultiAgentRuntime::ResolveAndStore,
-            self.git_enrichment_policy,
-        )
-        .await
+    ) -> BoxFuture<'_, Arc<TurnContext>> {
+        Box::pin(async move {
+            self.new_turn_context_from_configuration(
+                sub_id,
+                session_configuration,
+                final_output_json_schema,
+                TurnMultiAgentRuntime::ResolveAndStore,
+                self.git_enrichment_policy,
+            )
+            .await
+        })
     }
 
     async fn new_startup_prewarm_turn_from_configuration(
