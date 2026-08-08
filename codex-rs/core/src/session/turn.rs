@@ -143,6 +143,14 @@ use tracing::warn;
 
 const POST_SAMPLING_TOKEN_ESTIMATE_TARGET: &str = "codex_core::post_sampling_token_estimate";
 
+macro_rules! stack_diagnostic {
+    ($($arg:tt)*) => {
+        if std::env::var_os("CODEX_STACK_DIAGNOSTICS").is_some() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 struct TurnSetup {
     client_session: ModelClientSession,
     first_step_context: Arc<StepContext>,
@@ -308,24 +316,33 @@ async fn run_turn_sampling_loop_inner(
                 .await?
             }
         };
-        let sampling_request_result: CodexResult<_> = async {
+        stack_diagnostic!("STACK_DIAGNOSTIC sampling_request.before_construct");
+        let sampling_request_future = async {
+            stack_diagnostic!("STACK_DIAGNOSTIC sampling_request.first_poll");
+            stack_diagnostic!("STACK_DIAGNOSTIC sampling_request.before_time_reminder");
             super::time_reminder::maybe_record_current_time_reminder(
                 sess.as_ref(),
                 turn_context.as_ref(),
                 &window_id,
             )
             .await?;
+            stack_diagnostic!("STACK_DIAGNOSTIC sampling_request.after_time_reminder");
 
+            stack_diagnostic!("STACK_DIAGNOSTIC sampling_request.before_world_state");
             world_state = sess
                 .record_step_world_state_if_changed(&world_state, step_context.as_ref())
                 .await?;
+            stack_diagnostic!("STACK_DIAGNOSTIC sampling_request.after_world_state");
 
             // Construct the input that we will send to the model.
             // Serialize the history snapshot and wake consumption with
             // monitor delivery. A notification arriving before this lock is
             // included in the request and can be claimed; one arriving after
             // it is released retains its durable wake for a later request.
+            stack_diagnostic!("STACK_DIAGNOSTIC sampling_request.before_monitor_lock");
             let monitor_delivery_guard = sess.input_queue.lock_monitor_delivery().await;
+            stack_diagnostic!("STACK_DIAGNOSTIC sampling_request.after_monitor_lock");
+            stack_diagnostic!("STACK_DIAGNOSTIC sampling_request.before_history");
             let sampling_request_input: Vec<ResponseItem> = async {
                 sess.clone_history()
                     .await
@@ -333,6 +350,7 @@ async fn run_turn_sampling_loop_inner(
             }
             .instrument(trace_span!("run_turn.prepare_sampling_request_input"))
             .await;
+            stack_diagnostic!("STACK_DIAGNOSTIC sampling_request.after_history");
             sess.input_queue.claim_monitor_wake();
             drop(monitor_delivery_guard);
 
@@ -341,6 +359,7 @@ async fn run_turn_sampling_loop_inner(
                 window_id,
                 CodexResponsesRequestKind::Turn,
             );
+            stack_diagnostic!("STACK_DIAGNOSTIC sampling_request.before_run_sampling_request");
             run_sampling_request(
                 Arc::clone(&sess),
                 Arc::clone(&step_context),
@@ -352,9 +371,14 @@ async fn run_turn_sampling_loop_inner(
                 cancellation_token.child_token(),
             )
             .await
-        }
-        .boxed()
-        .await;
+        };
+        stack_diagnostic!(
+            "STACK_DIAGNOSTIC sampling_request.after_construct size={}",
+            std::mem::size_of_val(&sampling_request_future)
+        );
+        stack_diagnostic!("STACK_DIAGNOSTIC sampling_request.before_boxed_poll");
+        let sampling_request_result: CodexResult<_> = sampling_request_future.boxed().await;
+        stack_diagnostic!("STACK_DIAGNOSTIC sampling_request.after_boxed_poll");
         match sampling_request_result {
             Ok((sampling_request_output, sampling_request_input)) => {
                 let SamplingRequestResult {
