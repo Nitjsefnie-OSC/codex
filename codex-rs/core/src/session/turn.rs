@@ -353,6 +353,7 @@ async fn run_turn_sampling_loop_inner(
             )
             .await
         }
+        .boxed()
         .await;
         match sampling_request_result {
             Ok((sampling_request_output, sampling_request_input)) => {

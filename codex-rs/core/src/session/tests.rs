@@ -10793,7 +10793,7 @@ async fn default_turn_construction_future_stays_small() {
 }
 
 #[tokio::test]
-async fn sampling_loop_future_stays_small_on_normal_stack() {
+async fn sampling_loop_future_boundary_is_pointer_sized() {
     let (sess, turn_context) = make_session_and_context().await;
     let sess = Arc::new(sess);
     let turn_context = Arc::new(turn_context);
@@ -10809,8 +10809,8 @@ async fn sampling_loop_future_stays_small_on_normal_stack() {
     );
     let future_size = std::mem::size_of_val(&future);
     assert!(
-        future_size <= 32 * 1024,
-        "sampling loop future is {future_size} bytes"
+        future_size <= 2 * std::mem::size_of::<usize>(),
+        "sampling loop API future boundary is {future_size} bytes"
     );
 }
 

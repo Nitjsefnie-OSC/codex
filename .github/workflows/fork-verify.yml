@@ -18,7 +18,7 @@ on:
           - stack-diagnostics
 
 concurrency:
-  group: fork-verify-${{ github.ref }}
+  group: fork-verify-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'stack-diagnostics' && 'stack-diagnostics' || 'full' }}
   cancel-in-progress: true
 
 jobs:
@@ -233,12 +233,12 @@ jobs:
         run: |
           set +e
           output=$(timeout 5m cargo test -p codex-core --lib \
-            session::tests::sampling_loop_future_stays_small_on_normal_stack \
+            session::tests::sampling_loop_future_boundary_is_pointer_sized \
             -- --exact --nocapture --test-threads=1 2>&1)
           size=$?
           printf '%s\n' "$output"
           if ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
-            echo "::error::sampling-loop future-size filter did not run at least one passing test"
+            echo "::error::sampling-loop future-boundary filter did not run at least one passing test"
             size=1
           fi
           output=$(timeout 5m cargo test -p codex-core --lib \
