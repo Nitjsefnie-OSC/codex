@@ -313,8 +313,32 @@ impl Session {
         .await;
     }
 
-    pub(crate) async fn start_task<T: SessionTask>(
+    pub(crate) fn start_task<T: SessionTask>(
         self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        input: Vec<TurnInput>,
+        task: T,
+        input_persisted: Option<
+            tokio::sync::oneshot::Sender<Result<(), TryStartTurnIfIdleRejectionReason>>,
+        >,
+        mailbox_parent_provenance: MailboxParentProvenance,
+    ) -> BoxFuture<'static, ()> {
+        let session = Arc::clone(self);
+        Box::pin(async move {
+            session
+                .start_task_inner(
+                    turn_context,
+                    input,
+                    task,
+                    input_persisted,
+                    mailbox_parent_provenance,
+                )
+                .await;
+        })
+    }
+
+    async fn start_task_inner<T: SessionTask>(
+        self: Arc<Self>,
         turn_context: Arc<TurnContext>,
         input: Vec<TurnInput>,
         task: T,
