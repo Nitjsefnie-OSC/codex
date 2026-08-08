@@ -1385,6 +1385,9 @@ impl ModelClientSession {
         &'a mut self,
         params: WebsocketConnectParams<'a>,
     ) -> std::result::Result<&'a ApiWebSocketConnection, ApiError> {
+        client_stack_diagnostic!(
+            "STACK_DIAGNOSTIC websocket_connection_inner.first_poll"
+        );
         let WebsocketConnectParams {
             session_telemetry,
             api_provider,
@@ -1393,10 +1396,16 @@ impl ModelClientSession {
             auth_context,
             request_route_telemetry,
         } = params;
+        client_stack_diagnostic!(
+            "STACK_DIAGNOSTIC websocket_connection_inner.before_needs_new"
+        );
         let needs_new = match self.websocket_session.connection.as_ref() {
             Some(conn) => conn.is_closed().await,
             None => true,
         };
+        client_stack_diagnostic!(
+            "STACK_DIAGNOSTIC websocket_connection_inner.after_needs_new"
+        );
 
         if needs_new {
             self.websocket_session.last_request = None;
