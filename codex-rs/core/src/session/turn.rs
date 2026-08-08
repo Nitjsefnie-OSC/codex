@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 use crate::client::ModelClientSession;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
+use crate::client_common::ResponseStream;
 use crate::collect_explicit_skill_mentions;
 use crate::compact::InitialContextInjection;
 use crate::compact::run_inline_auto_compact_task;
@@ -113,6 +114,7 @@ use codex_protocol::protocol::SkillScope;
 use codex_protocol::protocol::TurnDiffEvent;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
+use codex_rollout_trace::InferenceTraceContext;
 use codex_skills::ToolMentionKind;
 use codex_skills::app_id_from_path;
 use codex_skills::tool_kind_for_path;
@@ -2374,6 +2376,32 @@ fn assign_missing_streamed_response_item_id(
     Session::assign_missing_response_item_id(item);
 }
 
+fn stream_model_request<'a>(
+    client_session: &'a mut ModelClientSession,
+    prompt: &'a Prompt,
+    turn_context: &'a TurnContext,
+    responses_metadata: &'a CodexResponsesMetadata,
+    inference_trace: &'a InferenceTraceContext,
+    cancellation_token: CancellationToken,
+) -> BoxFuture<'a, CodexResult<ResponseStream>> {
+    Box::pin(async move {
+        client_session
+            .stream(
+                prompt,
+                &turn_context.model_info,
+                &turn_context.session_telemetry,
+                turn_context.reasoning_effort.clone(),
+                turn_context.reasoning_summary,
+                turn_context.config.service_tier.clone(),
+                responses_metadata,
+                inference_trace,
+            )
+            .instrument(trace_span!("stream_request"))
+            .or_cancel(&cancellation_token)
+            .await??
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn try_run_sampling_request<'a>(
     tool_runtime: ToolCallRuntime,
@@ -2452,20 +2480,15 @@ async fn try_run_sampling_request_inner<'a>(
         .features
         .enabled(Feature::ConcurrentReasoningSummaries)
         && turn_context.provider.info().is_openai();
-    let mut stream = client_session
-        .stream(
-            prompt,
-            &turn_context.model_info,
-            &turn_context.session_telemetry,
-            turn_context.reasoning_effort.clone(),
-            turn_context.reasoning_summary,
-            turn_context.config.service_tier.clone(),
-            responses_metadata,
-            &inference_trace,
-        )
-        .instrument(trace_span!("stream_request"))
-        .or_cancel(&cancellation_token)
-        .await??;
+    let mut stream = stream_model_request(
+        client_session,
+        prompt,
+        &turn_context,
+        responses_metadata,
+        &inference_trace,
+        cancellation_token.clone(),
+    )
+    .await?;
     let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
         FuturesOrdered::new();
     let mut needs_follow_up = false;
