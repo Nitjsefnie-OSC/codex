@@ -398,7 +398,7 @@ impl Session {
             &turn_context.session_source,
         );
         let done_clone = Arc::clone(&done);
-        let session = Arc::clone(self);
+        let session = Arc::clone(&self);
         let ctx = Arc::clone(&turn_context);
         let task_for_run = Arc::clone(&task);
         let task_input = input;
