@@ -3127,6 +3127,7 @@ impl Session {
         cancellation_token: &CancellationToken,
         required_servers: &[String],
     ) -> CodexResult<Arc<StepContext>> {
+        turn::stack_probe("capture_step_context:enter");
         // Keep selections fixed for the turn while allowing their startup work to finish.
         let environments = turn_context.environments.refresh_readiness();
         self.services
@@ -3196,6 +3197,7 @@ impl Session {
         )
         .or_cancel(cancellation_token)
         .await??;
+        turn::stack_probe("capture_step_context:after-built-tools");
         Ok(Arc::new(StepContext {
             turn: turn_context,
             response_identity: Arc::new(

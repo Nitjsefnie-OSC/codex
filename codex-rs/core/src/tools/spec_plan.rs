@@ -1110,7 +1110,9 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, registry: &mut Tool
     }
 
     if environment_mode.has_environment() && features.enabled(Feature::MonitorTool) {
+        crate::session::turn::stack_probe("tool_router:before-monitor-handler");
         registry.add(MonitorHandler);
+        crate::session::turn::stack_probe("tool_router:after-monitor-handler");
     }
 
     if environment_mode.has_environment() && features.enabled(Feature::ViewImage) {

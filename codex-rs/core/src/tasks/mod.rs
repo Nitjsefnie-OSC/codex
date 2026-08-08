@@ -323,6 +323,7 @@ impl Session {
         >,
         mailbox_parent_provenance: MailboxParentProvenance,
     ) {
+        crate::session::turn::stack_probe("start_task:enter");
         let task: Arc<dyn AnySessionTask> = Arc::new(task);
         let task_kind = task.kind();
         let span_name = task.span_name();
@@ -399,6 +400,7 @@ impl Session {
         );
         let handle = tokio::spawn(
             async move {
+                crate::session::turn::stack_probe("start_task:spawned");
                 // The active task must be published before the model can
                 // clone history. Monitor delivery uses that publication as
                 // its startup barrier, avoiding a history/wake race.

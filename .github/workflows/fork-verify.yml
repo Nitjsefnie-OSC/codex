@@ -114,6 +114,8 @@ jobs:
         # instead of aborting a parallel test binary.
         timeout-minutes: 25
         working-directory: codex-rs
+        env:
+          CODEX_STACK_PROBE: "1"
         run: |
           cargo test -p codex-core --lib whoami -- --nocapture
           set +e
@@ -145,8 +147,12 @@ jobs:
         # stop-leaves-no-orphan, readable retained output, and idle-session
         # wake-up through a second Responses inference.
         working-directory: codex-rs
+        env:
+          CODEX_STACK_PROBE: "1"
         run: |
           cargo test -p codex-core --lib monitor -- --nocapture
+          timeout 5m cargo test -p codex-core --lib try_start_turn_if_idle_accepts_user_input_in_plan_mode \
+            -- --exact --nocapture --test-threads=1
           cargo test -p codex-core --lib try_start_turn_if_idle -- --nocapture
           cargo test -p codex-core --test all monitor -- --nocapture
           df -h /

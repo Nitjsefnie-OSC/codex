@@ -42,6 +42,7 @@ impl SessionTask for RegularTask {
         input: Vec<TurnInput>,
         cancellation_token: CancellationToken,
     ) -> SessionTaskResult {
+        crate::session::turn::stack_probe("regular_task:enter");
         let run_turn_span = trace_span!("run_turn");
         // Regular turns emit `TurnStarted` inline so first-turn lifecycle does
         // not wait on startup prewarm resolution.
@@ -73,6 +74,7 @@ impl SessionTask for RegularTask {
         let mut next_input = input;
         let mut prewarmed_client_session = prewarmed_client_session;
         loop {
+            crate::session::turn::stack_probe("regular_task:before-run-turn");
             let last_agent_message = run_turn(
                 Arc::clone(&sess),
                 Arc::clone(&ctx),
