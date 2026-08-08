@@ -1057,12 +1057,35 @@ impl ModelClient {
     /// Both startup prewarm and in-turn `needs_new` reconnects call this path so handshake
     /// behavior remains consistent across both flows.
     #[allow(clippy::too_many_arguments)]
-    async fn connect_websocket(
-        &self,
-        session_telemetry: &SessionTelemetry,
+    fn connect_websocket<'a>(
+        &'a self,
+        session_telemetry: &'a SessionTelemetry,
         api_provider: codex_api::Provider,
         api_auth: SharedAuthProvider,
-        responses_metadata: &CodexResponsesMetadata,
+        responses_metadata: &'a CodexResponsesMetadata,
+        auth_context: AuthRequestTelemetryContext,
+        request_route_telemetry: RequestRouteTelemetry,
+    ) -> BoxFuture<'a, std::result::Result<ApiWebSocketConnection, ApiError>> {
+        Box::pin(async move {
+            self.connect_websocket_inner(
+                session_telemetry,
+                api_provider,
+                api_auth,
+                responses_metadata,
+                auth_context,
+                request_route_telemetry,
+            )
+            .await
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn connect_websocket_inner<'a>(
+        &'a self,
+        session_telemetry: &'a SessionTelemetry,
+        api_provider: codex_api::Provider,
+        api_auth: SharedAuthProvider,
+        responses_metadata: &'a CodexResponsesMetadata,
         auth_context: AuthRequestTelemetryContext,
         request_route_telemetry: RequestRouteTelemetry,
     ) -> std::result::Result<ApiWebSocketConnection, ApiError> {
