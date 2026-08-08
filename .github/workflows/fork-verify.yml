@@ -115,14 +115,24 @@ jobs:
           CODEX_STACK_PROBE: "1"
         run: |
           set +e
-          timeout 5m cargo test -p codex-core --lib \
-            try_start_turn_if_idle_accepts_user_input_in_plan_mode \
-            -- --exact --nocapture --test-threads=1
+          output=$(timeout 5m cargo test -p codex-core --lib \
+            session::tests::try_start_turn_if_idle_accepts_user_input_in_plan_mode \
+            -- --exact --nocapture --test-threads=1 2>&1)
           first=$?
-          timeout 5m cargo test -p codex-core --test all \
+          printf '%s\n' "$output"
+          if ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+            echo "::error::plan-mode exact filter did not run at least one passing test"
+            first=1
+          fi
+          output=$(timeout 5m cargo test -p codex-core --test all \
             suite::pending_input::idle_user_input_reaches_the_first_model_request \
-            -- --exact --nocapture --test-threads=1
+            -- --exact --nocapture --test-threads=1 2>&1)
           second=$?
+          printf '%s\n' "$output"
+          if ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+            echo "::error::pending-input exact filter did not run at least one passing test"
+            second=1
+          fi
           exit $((first + second))
 
       - name: whoami provenance tests
