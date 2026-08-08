@@ -1094,8 +1094,22 @@ async fn track_turn_resolved_config_analytics(
         });
 }
 
+fn run_pre_sampling_compact<'a>(
+    sess: &'a Arc<Session>,
+    turn_context: &'a Arc<TurnContext>,
+    client_session: &'a mut ModelClientSession,
+    cancellation_token: &'a CancellationToken,
+) -> BoxFuture<'a, CodexResult<()>> {
+    Box::pin(run_pre_sampling_compact_inner(
+        sess,
+        turn_context,
+        client_session,
+        cancellation_token,
+    ))
+}
+
 #[instrument(level = "trace", skip_all)]
-async fn run_pre_sampling_compact(
+async fn run_pre_sampling_compact_inner(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     client_session: &mut ModelClientSession,
