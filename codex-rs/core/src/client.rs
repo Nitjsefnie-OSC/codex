@@ -1362,6 +1362,13 @@ impl ModelClientSession {
         Ok(())
     }
     /// Returns a websocket connection for this turn.
+    fn websocket_connection<'a>(
+        &'a mut self,
+        params: WebsocketConnectParams<'a>,
+    ) -> BoxFuture<'a, std::result::Result<&'a ApiWebSocketConnection, ApiError>> {
+        Box::pin(async move { self.websocket_connection_inner(params).await })
+    }
+
     #[instrument(
         name = "model_client.websocket_connection",
         level = "info",
@@ -1374,10 +1381,10 @@ impl ModelClientSession {
             turn.has_metadata_header = params.responses_metadata.has_turn_metadata()
         )
     )]
-    async fn websocket_connection(
-        &mut self,
-        params: WebsocketConnectParams<'_>,
-    ) -> std::result::Result<&ApiWebSocketConnection, ApiError> {
+    async fn websocket_connection_inner<'a>(
+        &'a mut self,
+        params: WebsocketConnectParams<'a>,
+    ) -> std::result::Result<&'a ApiWebSocketConnection, ApiError> {
         let WebsocketConnectParams {
             session_telemetry,
             api_provider,
