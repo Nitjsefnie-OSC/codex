@@ -773,9 +773,8 @@ fn dispatch_submission(
     sub: Submission,
     dispatch_span: tracing::Span,
 ) -> BoxFuture<'static, bool> {
-    Box::pin(async move {
-        async {
-            match sub.op.clone() {
+    let dispatch: BoxFuture<'static, bool> = Box::pin(async move {
+        match sub.op.clone() {
                 Op::Interrupt => {
                     interrupt(&sess).await;
                     false
@@ -915,11 +914,9 @@ fn dispatch_submission(
                     false
                 }
                 _ => false, // Ignore unknown ops; enum is non_exhaustive to allow extensions.
-            }
         }
-        .instrument(dispatch_span)
-        .await
-    })
+    });
+    Box::pin(dispatch.instrument(dispatch_span))
 }
 
 async fn approve_guardian_denied_action(sess: &Arc<Session>, event: GuardianAssessmentEvent) {
