@@ -17,7 +17,6 @@ use codex_websocket_client::WebSocketConnection;
 use codex_websocket_client::WebSocketConnector;
 use futures::SinkExt;
 use futures::StreamExt;
-use futures::future::BoxFuture;
 use http::HeaderMap;
 use http::HeaderName;
 use http::HeaderValue;
@@ -374,35 +373,15 @@ impl ResponsesWebsocketClient {
         Self { provider, auth }
     }
 
-    pub fn connect<'a>(
-        &'a self,
-        http_client_factory: &'a HttpClientFactory,
-        extra_headers: HeaderMap,
-        default_headers: HeaderMap,
-        turn_state: Option<Arc<OnceLock<String>>>,
-        telemetry: Option<Arc<dyn WebsocketTelemetry>>,
-    ) -> BoxFuture<'a, Result<ResponsesWebsocketConnection, ApiError>> {
-        Box::pin(async move {
-            self.connect_inner(
-                http_client_factory,
-                extra_headers,
-                default_headers,
-                turn_state,
-                telemetry,
-            )
-            .await
-        })
-    }
-
     #[instrument(
         name = "responses_websocket.connect",
         level = "info",
         skip_all,
         fields(transport = "responses_websocket", api.path = "responses")
     )]
-    async fn connect_inner<'a>(
-        &'a self,
-        http_client_factory: &'a HttpClientFactory,
+    pub async fn connect(
+        &self,
+        http_client_factory: &HttpClientFactory,
         extra_headers: HeaderMap,
         default_headers: HeaderMap,
         turn_state: Option<Arc<OnceLock<String>>>,
