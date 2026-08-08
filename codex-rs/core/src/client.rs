@@ -1683,11 +1683,20 @@ impl ModelClientSession {
             client_stack_diagnostic!(
                 "STACK_DIAGNOSTIC stream_responses_websocket_inner.after_build_responses_request"
             );
+            client_stack_diagnostic!(
+                "STACK_DIAGNOSTIC stream_responses_websocket_inner.before_websocket_metadata"
+            );
             let mut websocket_metadata = responses_metadata.clone();
             websocket_metadata.routing_hint = self.client.build_routing_hint_header(
                 client_setup.auth.as_ref(),
                 &request.model,
                 request.service_tier.as_deref(),
+            );
+            client_stack_diagnostic!(
+                "STACK_DIAGNOSTIC stream_responses_websocket_inner.after_websocket_metadata"
+            );
+            client_stack_diagnostic!(
+                "STACK_DIAGNOSTIC stream_responses_websocket_inner.before_request_session_telemetry"
             );
             let request_session_telemetry = if warmup {
                 // `generate=false` prewarm is connection setup, not an inference request.
@@ -1695,9 +1704,18 @@ impl ModelClientSession {
             } else {
                 session_telemetry_for_request(session_telemetry, &request)
             };
+            client_stack_diagnostic!(
+                "STACK_DIAGNOSTIC stream_responses_websocket_inner.after_request_session_telemetry"
+            );
+            client_stack_diagnostic!(
+                "STACK_DIAGNOSTIC stream_responses_websocket_inner.before_client_metadata"
+            );
             let mut client_metadata = self
                 .client
                 .build_ws_client_metadata(responses_metadata, model_info.use_responses_lite);
+            client_stack_diagnostic!(
+                "STACK_DIAGNOSTIC stream_responses_websocket_inner.after_client_metadata"
+            );
             if let Some(turn_state) = self.turn_state.get() {
                 client_metadata.insert(X_CODEX_TURN_STATE_HEADER.to_string(), turn_state.clone());
             }
