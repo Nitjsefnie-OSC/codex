@@ -45,8 +45,18 @@ impl Session {
     /// still active. Work without user input is also rejected in Plan mode.
     /// Active Review tasks are covered by the active-task check because Review
     /// turns are not steerable.
-    pub(crate) async fn try_start_turn_if_idle(
+    pub(crate) fn try_start_turn_if_idle(
         self: &Arc<Self>,
+        input: Vec<TurnInput>,
+    ) -> BoxFuture<'static, Result<(), TryStartTurnIfIdleError>> {
+        let session = Arc::clone(self);
+        Box::pin(async move {
+            session.try_start_turn_if_idle_inner(input).await
+        })
+    }
+
+    async fn try_start_turn_if_idle_inner(
+        self: Arc<Self>,
         input: Vec<TurnInput>,
     ) -> Result<(), TryStartTurnIfIdleError> {
         if input.is_empty() {

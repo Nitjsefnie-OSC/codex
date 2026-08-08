@@ -83,23 +83,26 @@ pub async fn realtime_conversation_list_voices(sess: &Session, sub_id: String) {
     .await;
 }
 
-pub async fn user_input_or_turn(
+pub fn user_input_or_turn(
     sess: &Arc<Session>,
     sub_id: String,
     op: Op,
     client_user_message_id: Option<String>,
     parent_turn_id: Option<String>,
-) {
-    let admission = user_input_or_turn_inner(
-        sess,
-        sub_id.clone(),
-        op,
-        client_user_message_id,
-        parent_turn_id,
-    )
-    .await;
-    sess.pending_user_message_admissions
-        .complete(&sub_id, admission);
+) -> BoxFuture<'static, ()> {
+    let sess = Arc::clone(sess);
+    Box::pin(async move {
+        let admission = user_input_or_turn_inner(
+            &sess,
+            sub_id.clone(),
+            op,
+            client_user_message_id,
+            parent_turn_id,
+        )
+        .await;
+        sess.pending_user_message_admissions
+            .complete(&sub_id, admission);
+    })
 }
 
 pub async fn update_thread_settings(
