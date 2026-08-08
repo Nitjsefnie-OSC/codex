@@ -366,6 +366,7 @@ pub(crate) async fn run_turn(
             }
             .instrument(trace_span!("run_turn.prepare_sampling_request_input"))
             .await;
+            stack_probe("run_turn:after-history-snapshot");
             sess.input_queue.claim_monitor_wake();
             drop(monitor_delivery_guard);
 
@@ -2241,6 +2242,7 @@ async fn try_run_sampling_request(
         .instrument(trace_span!("stream_request"))
         .or_cancel(&cancellation_token)
         .await??;
+    stack_probe("try_sampling:after-stream-open");
     let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
         FuturesOrdered::new();
     let mut needs_follow_up = false;
@@ -2289,6 +2291,7 @@ async fn try_run_sampling_request(
                 break Err(CodexErr::TurnAborted);
             }
         };
+        stack_probe("try_sampling:after-stream-event");
 
         let event = match event {
             Some(Ok(event)) => event,
@@ -2395,14 +2398,16 @@ async fn try_run_sampling_request(
                     | ResponseItem::Other => false,
                 };
 
-                let output_result =
-                    match handle_output_item_done(&mut ctx, item, previously_streamed_item)
-                        .instrument(handle_responses)
-                        .await
-                    {
-                        Ok(output_result) => output_result,
-                        Err(err) => break Err(err),
-                    };
+                let output_result = {
+                    stack_probe("try_sampling:before-tool-dispatch");
+                    handle_output_item_done(&mut ctx, item, previously_streamed_item)
+                }
+                .instrument(handle_responses)
+                .await;
+                let output_result = match output_result {
+                    Ok(output_result) => output_result,
+                    Err(err) => break Err(err),
+                };
                 if let Some(tool_future) = output_result.tool_future {
                     in_flight.push_back(tool_future);
                 }

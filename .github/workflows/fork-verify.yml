@@ -153,6 +153,9 @@ jobs:
           cargo test -p codex-core --lib monitor -- --nocapture
           timeout 5m cargo test -p codex-core --lib try_start_turn_if_idle_accepts_user_input_in_plan_mode \
             -- --exact --nocapture --test-threads=1
+          timeout 5m cargo test -p codex-core --test all \
+            suite::pending_input::idle_user_input_reaches_the_first_model_request \
+            -- --exact --nocapture --test-threads=1
           cargo test -p codex-core --lib try_start_turn_if_idle -- --nocapture
           cargo test -p codex-core --test all monitor -- --nocapture
           df -h /
