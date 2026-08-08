@@ -96,6 +96,20 @@ jobs:
           cargo test -p codex-tui --lib update_versions
           cargo test -p codex-cli --bin codex doctor::updates
 
+      - name: temporary regular test future inventory
+        # Diagnostic-only: inspect the exact test generator states that still
+        # overflow after the runtime admission boundaries are boxed. Remove
+        # this step after collecting the compiler-reported sizes.
+        timeout-minutes: 20
+        working-directory: codex-rs
+        run: |
+          lib_size_log=$(mktemp)
+          RUSTC_BOOTSTRAP=1 cargo rustc -p codex-core --lib --tests -- -Zprint-type-sizes >"$lib_size_log" 2>&1
+          grep -E -A 24 -B 2 'core/src/session/tests.rs:10(67|68)' "$lib_size_log" || true
+          all_size_log=$(mktemp)
+          RUSTC_BOOTSTRAP=1 cargo rustc -p codex-core --test all -- -Zprint-type-sizes >"$all_size_log" 2>&1
+          grep -E -A 24 -B 2 'core/tests/suite/pending_input.rs:[0-9]+' "$all_size_log" || true
+
       - name: codex-api WebSocket provenance tests
         # Run transport provenance before the monitor gate so a model identity
         # regression remains independently attributable when monitor coverage
