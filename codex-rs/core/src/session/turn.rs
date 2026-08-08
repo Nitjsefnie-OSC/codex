@@ -2375,23 +2375,52 @@ fn assign_missing_streamed_response_item_id(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[instrument(level = "trace",
+fn try_run_sampling_request<'a>(
+    tool_runtime: ToolCallRuntime,
+    sess: Arc<Session>,
+    turn_context: Arc<TurnContext>,
+    response_identity: Arc<crate::session::step_context::ResponseIdentityState>,
+    turn_store: Arc<codex_extension_api::ExtensionData>,
+    client_session: &'a mut ModelClientSession,
+    responses_metadata: &'a CodexResponsesMetadata,
+    turn_diff_tracker: SharedTurnDiffTracker,
+    prompt: &'a Prompt,
+    cancellation_token: CancellationToken,
+) -> BoxFuture<'a, CodexResult<SamplingRequestResult>> {
+    Box::pin(try_run_sampling_request_inner(
+        tool_runtime,
+        sess,
+        turn_context,
+        response_identity,
+        turn_store,
+        client_session,
+        responses_metadata,
+        turn_diff_tracker,
+        prompt,
+        cancellation_token,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+#[instrument(
+    name = "try_run_sampling_request",
+    level = "trace",
     skip_all,
     fields(
         turn_id = %turn_context.sub_id,
         model = %turn_context.model_info.slug
     )
 )]
-async fn try_run_sampling_request(
+async fn try_run_sampling_request_inner<'a>(
     tool_runtime: ToolCallRuntime,
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     response_identity: Arc<crate::session::step_context::ResponseIdentityState>,
     turn_store: Arc<codex_extension_api::ExtensionData>,
-    client_session: &mut ModelClientSession,
-    responses_metadata: &CodexResponsesMetadata,
+    client_session: &'a mut ModelClientSession,
+    responses_metadata: &'a CodexResponsesMetadata,
     turn_diff_tracker: SharedTurnDiffTracker,
-    prompt: &Prompt,
+    prompt: &'a Prompt,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
     stack_diagnostic!("STACK_DIAGNOSTIC try_run_sampling_request.first_poll");
