@@ -1560,6 +1560,7 @@ async fn run_sampling_request_inner<'a>(
     input: Vec<ResponseItem>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<(SamplingRequestResult, Vec<ResponseItem>)> {
+    stack_diagnostic!("STACK_DIAGNOSTIC sampling_request.inner_first_poll");
     let turn_context = Arc::clone(&step_context.turn);
     let router = Arc::clone(&step_context.tool_router);
 
@@ -1601,6 +1602,7 @@ async fn run_sampling_request_inner<'a>(
             turn_context.as_ref(),
             base_instructions.clone(),
         );
+        stack_diagnostic!("STACK_DIAGNOSTIC sampling_request.before_try_run_sampling_request");
         let err = match try_run_sampling_request(
             tool_runtime.clone(),
             Arc::clone(&sess),
@@ -2392,6 +2394,7 @@ async fn try_run_sampling_request(
     prompt: &Prompt,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
+    stack_diagnostic!("STACK_DIAGNOSTIC try_run_sampling_request.first_poll");
     let response_generation = response_identity.begin_response().await;
     feedback_tags!(
         model = turn_context.model_info.slug.clone(),
