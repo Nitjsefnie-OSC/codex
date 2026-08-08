@@ -90,14 +90,20 @@ pub async fn user_input_or_turn(
     client_user_message_id: Option<String>,
     parent_turn_id: Option<String>,
 ) {
-    let admission = user_input_or_turn_inner(
+    crate::session::turn::stack_probe("user_input_or_turn:enter");
+    let admission_future = user_input_or_turn_inner(
         sess,
         sub_id.clone(),
         op,
         client_user_message_id,
         parent_turn_id,
-    )
-    .await;
+    );
+    crate::session::turn::stack_probe_size(
+        "user_input_or_turn:inner-future",
+        std::mem::size_of_val(&admission_future),
+    );
+    let admission = admission_future.await;
+    crate::session::turn::stack_probe("user_input_or_turn:after-inner");
     sess.pending_user_message_admissions
         .complete(&sub_id, admission);
 }
@@ -200,6 +206,7 @@ pub(super) async fn user_input_or_turn_inner(
     client_user_message_id: Option<String>,
     parent_turn_id: Option<String>,
 ) -> CodexResult<UserMessageAdmission> {
+    crate::session::turn::stack_probe("user_input_or_turn_inner:enter");
     let Op::UserInput {
         items,
         final_output_json_schema,
@@ -219,7 +226,14 @@ pub(super) async fn user_input_or_turn_inner(
     updates.final_output_json_schema = Some(final_output_json_schema);
 
     // new_turn_with_sub_id already emits an error event when settings are invalid.
-    let current_context = sess.new_turn_with_sub_id(sub_id.clone(), updates).await?;
+    crate::session::turn::stack_probe("user_input_or_turn_inner:before-new-turn");
+    let new_turn_future = sess.new_turn_with_sub_id(sub_id.clone(), updates);
+    crate::session::turn::stack_probe_size(
+        "user_input_or_turn_inner:new-turn-future",
+        std::mem::size_of_val(&new_turn_future),
+    );
+    let current_context = new_turn_future.await?;
+    crate::session::turn::stack_probe("user_input_or_turn_inner:after-new-turn");
     if emit_thread_settings_applied {
         sess.send_event_raw_without_materializing_rollout(Event {
             id: sub_id.clone(),
@@ -229,21 +243,27 @@ pub(super) async fn user_input_or_turn_inner(
     }
     sess.maybe_emit_model_warnings_for_turn(current_context.as_ref())
         .await;
-    match sess
-        .steer_input(
-            items.clone(),
-            additional_context.clone(),
-            /*expected_turn_id*/ None,
-            client_user_message_id.clone(),
-            responsesapi_client_metadata.clone(),
-        )
-        .await
+    crate::session::turn::stack_probe("user_input_or_turn_inner:before-steer-input");
+    let steer_future = sess.steer_input(
+        items.clone(),
+        additional_context.clone(),
+        /*expected_turn_id*/ None,
+        client_user_message_id.clone(),
+        responsesapi_client_metadata.clone(),
+    );
+    crate::session::turn::stack_probe_size(
+        "user_input_or_turn_inner:steer-future",
+        std::mem::size_of_val(&steer_future),
+    );
+    match steer_future.await
     {
         Ok(turn_id) => {
+            crate::session::turn::stack_probe("user_input_or_turn_inner:after-steer-input");
             current_context.session_telemetry.user_prompt(&items);
             Ok(UserMessageAdmission::Steered { turn_id })
         }
         Err(SteerInputError::NoActiveTurn(items)) => {
+            crate::session::turn::stack_probe("user_input_or_turn_inner:after-steer-no-active");
             if let Some(id) = parent_turn_id {
                 current_context.turn_metadata_state.set_parent_turn_id(id);
             }
@@ -268,15 +288,22 @@ pub(super) async fn user_input_or_turn_inner(
                     client_id: client_user_message_id,
                 });
             }
-            sess.spawn_task(
+            crate::session::turn::stack_probe("user_input_or_turn_inner:before-spawn-task");
+            let spawn_task_future = sess.spawn_task(
                 Arc::clone(&current_context),
                 task_input,
                 crate::tasks::RegularTask::new(),
-            )
-            .await;
+            );
+            crate::session::turn::stack_probe_size(
+                "user_input_or_turn_inner:spawn-task-future",
+                std::mem::size_of_val(&spawn_task_future),
+            );
+            spawn_task_future.await;
+            crate::session::turn::stack_probe("user_input_or_turn_inner:after-spawn-task");
             Ok(UserMessageAdmission::Started { turn_id: sub_id })
         }
         Err(err) => {
+            crate::session::turn::stack_probe("user_input_or_turn_inner:after-steer-error");
             sess.send_event_raw(Event {
                 id: sub_id.clone(),
                 msg: EventMsg::Error(err.to_error_event()),
@@ -820,14 +847,18 @@ fn dispatch_submission(
                 }
                 Op::UserInput { .. } => {
                     crate::session::turn::stack_probe("submission_loop:before-user-input");
-                    user_input_or_turn(
+                    let user_input_future = user_input_or_turn(
                         &sess,
                         sub.id.clone(),
                         sub.op,
                         sub.client_user_message_id,
                         sub.parent_turn_id,
-                    )
-                    .await;
+                    );
+                    crate::session::turn::stack_probe_size(
+                        "dispatch:user-input-future",
+                        std::mem::size_of_val(&user_input_future),
+                    );
+                    user_input_future.await;
                     crate::session::turn::stack_probe("submission_loop:after-user-input");
                     false
                 }

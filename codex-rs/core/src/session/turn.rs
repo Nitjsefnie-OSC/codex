@@ -148,6 +148,12 @@ pub(crate) fn stack_probe(stage: &str) {
     }
 }
 
+pub(crate) fn stack_probe_size(stage: &str, size: usize) {
+    if std::env::var_os("CODEX_STACK_PROBE").is_some() {
+        eprintln!("[codex-stack-probe] {stage} size={size}");
+    }
+}
+
 /// Takes initial turn input and runs a loop where, at each sampling request,
 /// the model replies with either:
 ///
