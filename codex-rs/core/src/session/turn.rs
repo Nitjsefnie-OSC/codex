@@ -192,11 +192,11 @@ async fn run_turn_inner(
     drain_async_hook_results(&sess, &turn_context, /*before_user_prompt*/ true).await;
 
     let Some(TurnSetup {
-        mut client_session,
+        client_session,
         first_step_context,
-        mut world_state,
+        world_state,
         turn_diff_tracker,
-        mut can_drain_pending_input,
+        can_drain_pending_input,
     }) = prepare_turn_setup(
         &sess,
         &turn_context,
@@ -208,6 +208,31 @@ async fn run_turn_inner(
     else {
         return Ok(None);
     };
+    run_turn_sampling_loop(
+        sess,
+        turn_context,
+        cancellation_token,
+        client_session,
+        first_step_context,
+        world_state,
+        turn_diff_tracker,
+        can_drain_pending_input,
+    )
+    .await
+}
+
+// Keep the request loop in its own future. The setup path must not retain the
+// loop's monitor-delivery and tool-sampling state while it is being polled.
+async fn run_turn_sampling_loop(
+    sess: Arc<Session>,
+    turn_context: Arc<TurnContext>,
+    cancellation_token: CancellationToken,
+    mut client_session: ModelClientSession,
+    first_step_context: Arc<StepContext>,
+    mut world_state: Arc<WorldState>,
+    turn_diff_tracker: SharedTurnDiffTracker,
+    mut can_drain_pending_input: bool,
+) -> CodexResult<Option<String>> {
     let mut last_agent_message: Option<String> = None;
     let mut stop_hook_active = false;
     let mut next_step_context = Some(first_step_context);
