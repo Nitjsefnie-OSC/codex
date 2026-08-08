@@ -1656,11 +1656,20 @@ impl ModelClientSession {
             client_stack_diagnostic!(
                 "STACK_DIAGNOSTIC stream_responses_websocket_inner.after_current_client_setup"
             );
+            client_stack_diagnostic!(
+                "STACK_DIAGNOSTIC stream_responses_websocket_inner.before_request_auth_context"
+            );
             let request_auth_context = AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
                 client_setup.api_auth.as_ref(),
                 client_setup.agent_identity_telemetry.clone(),
                 pending_retry,
+            );
+            client_stack_diagnostic!(
+                "STACK_DIAGNOSTIC stream_responses_websocket_inner.after_request_auth_context"
+            );
+            client_stack_diagnostic!(
+                "STACK_DIAGNOSTIC stream_responses_websocket_inner.before_build_responses_request"
             );
             let mut request = self.client.build_responses_request(
                 &client_setup.api_provider,
@@ -1671,6 +1680,9 @@ impl ModelClientSession {
                 service_tier.clone(),
                 responses_metadata,
             )?;
+            client_stack_diagnostic!(
+                "STACK_DIAGNOSTIC stream_responses_websocket_inner.after_build_responses_request"
+            );
             let mut websocket_metadata = responses_metadata.clone();
             websocket_metadata.routing_hint = self.client.build_routing_hint_header(
                 client_setup.auth.as_ref(),
