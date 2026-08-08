@@ -117,3 +117,48 @@ async fn sampling_request_future_boundary_is_pointer_sized() {
         "sampling request API future boundary is {future_size} bytes"
     );
 }
+
+#[tokio::test]
+async fn try_sampling_request_future_boundary_is_pointer_sized() {
+    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let sess = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+    let step_context = StepContext::for_test(Arc::clone(&turn_context));
+    let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+    let tool_runtime = ToolCallRuntime::new(
+        Arc::clone(&sess),
+        Arc::clone(&step_context),
+        Arc::clone(&turn_diff_tracker),
+    );
+    let mut client_session = crate::session::tests::test_model_client_session();
+    let responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(
+        sess.installation_id.clone(),
+        sess.current_window_id().await,
+        CodexResponsesRequestKind::Turn,
+    );
+    let prompt = build_prompt(
+        Vec::new(),
+        step_context.tool_router.as_ref(),
+        turn_context.as_ref(),
+        sess.get_base_instructions().await,
+    );
+
+    let future = try_run_sampling_request(
+        tool_runtime,
+        Arc::clone(&sess),
+        Arc::clone(&turn_context),
+        Arc::clone(&step_context.response_identity),
+        Arc::clone(&turn_context.extension_data),
+        &mut client_session,
+        &responses_metadata,
+        turn_diff_tracker,
+        &prompt,
+        CancellationToken::new(),
+    );
+    let future_size = std::mem::size_of_val(&future);
+
+    assert!(
+        future_size <= 2 * std::mem::size_of::<usize>(),
+        "try sampling request API future boundary is {future_size} bytes"
+    );
+}
