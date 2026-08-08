@@ -119,14 +119,19 @@ jobs:
           set +e
           failures=0
           for test_name in \
-            whoami_reports_server_routed_model_and_request_provenance \
-            whoami_does_not_reuse_server_identity_across_sampling_steps \
-            whoami_does_not_attest_websocket_handshake_model \
-            whoami_retry_clears_stale_model_in_the_same_sampling_step
+            suite::whoami::whoami_reports_server_routed_model_and_request_provenance \
+            suite::whoami::whoami_does_not_reuse_server_identity_across_sampling_steps \
+            suite::whoami::whoami_does_not_attest_websocket_handshake_model \
+            suite::whoami::whoami_retry_clears_stale_model_in_the_same_sampling_step
           do
-            timeout 5m cargo test -p codex-core --test all "$test_name" -- \
-              --exact --nocapture --test-threads=1
+            output=$(timeout 5m cargo test -p codex-core --test all "$test_name" -- \
+              --exact --nocapture --test-threads=1 2>&1)
             status=$?
+            printf '%s\n' "$output"
+            if ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+              echo "::error::whoami filter $test_name did not run at least one passing test"
+              status=1
+            fi
             if [ "$status" -ne 0 ]; then
               failures=$((failures + 1))
             fi
