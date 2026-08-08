@@ -45,6 +45,16 @@ jobs:
             --exclude codex-code-mode-host
           df -h /
 
+      - name: temporary async future size inventory
+        # Diagnostic only: inspect compiler-reported generator sizes without
+        # changing the runtime stack or adding probes to the tested code.
+        timeout-minutes: 10
+        working-directory: codex-rs
+        run: |
+          size_log=$(mktemp)
+          RUSTC_BOOTSTRAP=1 cargo rustc -p codex-core --lib -- -Zprint-type-sizes >"$size_log" 2>&1
+          grep -E 'session/(turn|handlers|inject)\.rs|tasks/(mod|regular)\.rs' "$size_log" || true
+
       - name: fork manifest tests
         # Cheap and load-bearing: the manifest is what tells an installer which
         # capabilities this build has and which release channel is safe to pull
