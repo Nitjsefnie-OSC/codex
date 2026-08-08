@@ -2395,7 +2395,10 @@ async fn try_run_sampling_request(
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
     stack_diagnostic!("STACK_DIAGNOSTIC try_run_sampling_request.first_poll");
+    stack_diagnostic!("STACK_DIAGNOSTIC try_run_sampling_request.before_response_identity");
     let response_generation = response_identity.begin_response().await;
+    stack_diagnostic!("STACK_DIAGNOSTIC try_run_sampling_request.after_response_identity");
+    stack_diagnostic!("STACK_DIAGNOSTIC try_run_sampling_request.before_feedback_tags");
     feedback_tags!(
         model = turn_context.model_info.slug.clone(),
         approval_policy = turn_context.approval_policy(),
@@ -2404,12 +2407,17 @@ async fn try_run_sampling_request(
         auth_mode = sess.services.auth_manager.auth_mode(),
         features = sess.features.enabled_features(),
     );
+    stack_diagnostic!("STACK_DIAGNOSTIC try_run_sampling_request.after_feedback_tags");
+    stack_diagnostic!("STACK_DIAGNOSTIC try_run_sampling_request.before_inference_trace");
     let inference_trace = sess.services.rollout_thread_trace.inference_trace_context(
         turn_context.sub_id.as_str(),
         turn_context.model_info.slug.as_str(),
         turn_context.provider.info().name.as_str(),
     );
+    stack_diagnostic!("STACK_DIAGNOSTIC try_run_sampling_request.after_inference_trace");
+    stack_diagnostic!("STACK_DIAGNOSTIC try_run_sampling_request.before_sampling_timing");
     let sampling_timing_guard = turn_context.turn_timing_state.begin_sampling();
+    stack_diagnostic!("STACK_DIAGNOSTIC try_run_sampling_request.after_sampling_timing");
     let uses_sequential_cutoff_reasoning_summaries = turn_context
         .config
         .features
