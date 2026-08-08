@@ -202,7 +202,8 @@ async fn monitor_output_waits_behind_standalone_shell_and_wakes_once() -> Result
             None,
             None,
         )
-        .await?;
+        .await
+        .map_err(|err| anyhow::anyhow!("steering input unexpectedly failed: {err:?}"))?;
 
     // The shell task is a Regular task for scheduling, but it does not sample
     // a model or accept monitor input. The monitor notification must remain
