@@ -45,16 +45,6 @@ jobs:
             --exclude codex-code-mode-host
           df -h /
 
-      - name: temporary regular future size inventory
-        # Diagnostic-only: compare the concrete poll-state sizes after the
-        # targeted pre-turn branch split. Remove this step after collecting
-        # the evidence; it is not part of the verification contract.
-        working-directory: codex-rs
-        run: |
-          size_log=$(mktemp)
-          RUSTC_BOOTSTRAP=1 cargo rustc -p codex-core --lib -- -Zprint-type-sizes >"$size_log" 2>&1
-          grep -E -n -A 24 -B 2 'turn\.rs:|regular\.rs:|tasks/mod\.rs:' "$size_log" || true
-
       - name: fork manifest tests
         # Cheap and load-bearing: the manifest is what tells an installer which
         # capabilities this build has and which release channel is safe to pull
