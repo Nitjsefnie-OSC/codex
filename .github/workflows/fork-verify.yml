@@ -69,6 +69,104 @@ jobs:
         working-directory: codex-rs
         run: cargo test -p codex-fork-manifest
 
+      - name: TUI presentation default tests
+        # Fork settings `tui.show_safety_buffering_ui` and
+        # `tui.show_prompt_suggestions`. What has to hold: both default to
+        # upstream behavior through TOML deserialization, explicit false reaches
+        # the resolved `Config`, a suppressed safety-buffering update still runs
+        # the cleanup path without retrying or otherwise touching the in-flight
+        # turn, and the `Create a plan?` nudge renders nowhere while Plan mode
+        # stays reachable. Exact filters, each required to run at least one
+        # passing test, so a rename cannot make this check vacuous. The three
+        # chatwidget/composer filters also carry insta snapshot assertions for
+        # the disabled presentation states; with no locally accepted `.snap`
+        # the first run goes red and leaves `.snap.new` files, uploaded below as
+        # the `tui-presentation-snapshots` artifact. `config_schema_matches_fixture`
+        # is deliberately not in this loop: the checked-in schema can be stale,
+        # and the fixture assertion belongs after regeneration in the
+        # `config schema freshness` step below.
+        timeout-minutes: 30
+        working-directory: codex-rs
+        env:
+          # insta skips writing `.snap.new` under CI by default; the pending
+          # snapshots are the artifact this job exists to produce.
+          INSTA_UPDATE: new
+        run: |
+          set +e
+          failures=0
+          for spec in \
+            "codex-core|config::tests::tui_presentation_defaults_are_enabled_when_unset" \
+            "codex-core|config::tests::tui_presentation_settings_parse_explicit_false" \
+            "codex-tui|chatwidget::tests::app_server::safety_buffering_ui_disabled_clears_stale_ui_and_keeps_turn_waiting" \
+            "codex-tui|chatwidget::tests::plan_mode::plan_mode_nudge_hidden_when_prompt_suggestions_disabled" \
+            "codex-tui|bottom_pane::chat_composer::tests::plan_mode_nudge_render_is_gated_by_prompt_suggestions_setting" \
+            "codex-fork-manifest|tests::every_fork_added_capability_is_declared" \
+            "codex-fork-manifest|tests::a_tui_setting_capability_kind_round_trips_as_snake_case"
+          do
+            package="${spec%%|*}"
+            test_name="${spec#*|}"
+            output=$(timeout 10m cargo test -p "$package" --lib "$test_name" -- \
+              --exact --nocapture --test-threads=1 2>&1)
+            status=$?
+            printf '%s\n' "$output"
+            if ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+              echo "::error::$package filter $test_name did not run at least one passing test"
+              status=1
+            fi
+            if [ "$status" -ne 0 ]; then
+              failures=$((failures + 1))
+            fi
+          done
+          exit "$failures"
+
+      - name: upload pending TUI presentation snapshots
+        # The snapshot-bearing presentation tests above have no locally accepted
+        # `.snap`: the first red run writes the authoritative `.snap.new` files,
+        # and this artifact is where they come from for review and acceptance.
+        # Tolerant once every snapshot has been accepted and none are pending.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tui-presentation-snapshots
+          path: codex-rs/tui/src/**/*.snap.new
+          if-no-files-found: ignore
+
+      - name: config schema freshness
+        if: always()
+        # The checked-in `core/config.schema.json` is generated, never
+        # hand-edited: Rust only runs here, so the runner regenerates it with the
+        # repo's own generator and fails with the diff. `just write-config-schema`
+        # is a one-line wrapper around this same binary, and `just` is not
+        # installed on the runner. The regenerated file is uploaded below so the
+        # checked-in result can be taken from this run rather than invented.
+        # `if: always()` keeps regeneration (and therefore the upload) ahead of
+        # any earlier step failure, so the artifact is always the generator's
+        # output and never the stale checked-in fixture. The freshness diff
+        # against the regenerated output is the fixture assertion; running
+        # `config_schema_matches_fixture` before this step would only fail on a
+        # stale checked-in schema before the generator ever runs.
+        working-directory: codex-rs
+        run: |
+          set +e
+          cargo run -p codex-core --bin codex-write-config-schema
+          if [ $? -ne 0 ]; then
+            echo "::error::config schema generation failed"
+            exit 1
+          fi
+          git diff --exit-code -- core/config.schema.json
+          if [ $? -ne 0 ]; then
+            echo "::error::codex-rs/core/config.schema.json is stale; take the config-schema artifact from this run and commit it"
+            exit 1
+          fi
+
+      - name: upload regenerated config schema
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: config-schema
+          path: codex-rs/core/config.schema.json
+          if-no-files-found: error
+
       - name: hook contract tests
         # Keep load-bearing hook wire/schema tests ahead of unrelated suites so
         # a contract regression reports as soon as the workspace type-checks.

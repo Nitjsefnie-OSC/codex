@@ -396,7 +396,8 @@ impl ChatWidget {
     pub(super) fn should_show_plan_mode_nudge(&self) -> bool {
         let text = self.bottom_pane.composer_text();
         let trimmed = text.trim_start();
-        self.collaboration_modes_enabled()
+        self.config.tui_show_prompt_suggestions
+            && self.collaboration_modes_enabled()
             && collaboration_modes::plan_mask(self.model_catalog.as_ref()).is_some()
             && self.active_mode_kind() != ModeKind::Plan
             && self.bottom_pane.composer_input_enabled()
@@ -408,6 +409,15 @@ impl ChatWidget {
             && !self
                 .dismissed_plan_mode_nudge_scopes
                 .contains(&self.plan_mode_nudge_scope())
+    }
+
+    /// Pushes the resolved `tui.show_prompt_suggestions` setting into the composer.
+    ///
+    /// The composer enforces it a second time at its visibility setter and render
+    /// boundary, so a call site that forces the nudge visible still renders nothing.
+    pub(super) fn sync_prompt_suggestions_enabled(&mut self) {
+        self.bottom_pane
+            .set_prompt_suggestions_enabled(self.config.tui_show_prompt_suggestions);
     }
 
     /// Synchronizes the footer presentation with the current Plan-mode nudge policy.

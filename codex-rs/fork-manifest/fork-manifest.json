@@ -49,6 +49,22 @@
       "config_key": null,
       "default_enabled": true,
       "summary": "PreToolUse and PostToolUse hook payloads carry `skill_activations` for the current turn, including each explicit or implicit activation's name, source path, scope, invocation kind, turn id, and content SHA-256."
+    },
+    {
+      "id": "tui.safety_buffering_ui",
+      "kind": "tui_setting",
+      "name": "show_safety_buffering_ui",
+      "config_key": "tui.show_safety_buffering_ui",
+      "default_enabled": true,
+      "summary": "`tui.show_safety_buffering_ui = false` suppresses the safety-buffering status detail and choice menu. Local presentation only: the same in-flight turn keeps waiting on the same model, with no automatic retry, model or effort change, request cancellation, or change to the server-side safeguard."
+    },
+    {
+      "id": "tui.prompt_suggestions",
+      "kind": "tui_setting",
+      "name": "show_prompt_suggestions",
+      "config_key": "tui.show_prompt_suggestions",
+      "default_enabled": true,
+      "summary": "`tui.show_prompt_suggestions = false` suppresses the composer `Create a plan?` nudge and any future prompt-suggestion surface routed through the same gate. Plan mode and Shift-Tab mode cycling stay available, and `features.tool_suggest` is untouched."
     }
   ]
 }
