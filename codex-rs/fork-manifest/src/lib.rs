@@ -94,6 +94,11 @@ pub enum CapabilityKind {
     HookField,
     /// A CLI subcommand or flag.
     Cli,
+    /// A TUI presentation setting the fork adds to `config.toml`.
+    ///
+    /// Distinct from [`CapabilityKind::Cli`] because it changes nothing a model
+    /// or a script can observe: it only decides what the terminal draws.
+    TuiSetting,
 }
 
 /// One thing this fork adds that upstream does not have.
@@ -257,7 +262,35 @@ mod tests {
         assert!(skill_activations.summary.contains("PreToolUse"));
         assert!(skill_activations.summary.contains("PostToolUse"));
 
+        for (id, config_key) in [
+            ("tui.safety_buffering_ui", "tui.show_safety_buffering_ui"),
+            ("tui.prompt_suggestions", "tui.show_prompt_suggestions"),
+        ] {
+            let capability = manifest
+                .capability(id)
+                .unwrap_or_else(|| panic!("{id} capability should be declared"));
+            assert_eq!(capability.kind, CapabilityKind::TuiSetting);
+            assert_eq!(capability.config_key.as_deref(), Some(config_key));
+            assert!(
+                capability.default_enabled,
+                "{id} must default to upstream behavior"
+            );
+        }
+
         assert!(!manifest.has_capability("tool.not-a-thing"));
+    }
+
+    /// The `tui_setting` kind exists so a TUI presentation setting is not filed
+    /// as a tool or a CLI flag; keep its wire spelling pinned.
+    #[test]
+    fn a_tui_setting_capability_kind_round_trips_as_snake_case() {
+        let json = serde_json::to_string(&CapabilityKind::TuiSetting)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(json, "\"tui_setting\"");
+
+        let parsed: CapabilityKind =
+            serde_json::from_str("\"tui_setting\"").unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(parsed, CapabilityKind::TuiSetting);
     }
 
     #[test]

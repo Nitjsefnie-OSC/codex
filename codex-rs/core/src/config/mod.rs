@@ -754,6 +754,18 @@ pub struct Config {
     /// Show startup tooltips in the TUI welcome screen.
     pub show_tooltips: bool,
 
+    /// Show the TUI safety-buffering status detail and choice menu.
+    ///
+    /// When `false`, the TUI suppresses only that local presentation and keeps
+    /// waiting on the same in-flight turn.
+    pub tui_show_safety_buffering_ui: bool,
+
+    /// Show TUI composer prompt suggestions, such as the `Create a plan?` nudge.
+    ///
+    /// Unrelated to `tool_suggest`, which controls plugin and connector
+    /// installation suggestions.
+    pub tui_show_prompt_suggestions: bool,
+
     /// Persisted startup availability NUX state for model tooltips.
     pub model_availability_nux: ModelAvailabilityNuxConfig,
 
@@ -4251,6 +4263,16 @@ impl Config {
                 .unwrap_or_default(),
             animations: cfg.tui.as_ref().map(|t| t.animations).unwrap_or(true),
             show_tooltips: cfg.tui.as_ref().map(|t| t.show_tooltips).unwrap_or(true),
+            tui_show_safety_buffering_ui: cfg
+                .tui
+                .as_ref()
+                .map(|t| t.show_safety_buffering_ui)
+                .unwrap_or(true),
+            tui_show_prompt_suggestions: cfg
+                .tui
+                .as_ref()
+                .map(|t| t.show_prompt_suggestions)
+                .unwrap_or(true),
             model_availability_nux: cfg
                 .tui
                 .as_ref()

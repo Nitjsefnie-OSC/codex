@@ -1688,7 +1688,7 @@ impl UnifiedExecProcessManager {
         let watcher = spawn_monitor_watcher(
             handle,
             Arc::clone(&context.session),
-            Arc::clone(&context.turn),
+            Arc::clone(&context.step_context.turn),
             attachment.timeout,
             seed.clone(),
             receiver,

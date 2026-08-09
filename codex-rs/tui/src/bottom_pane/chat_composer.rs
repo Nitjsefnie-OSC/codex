@@ -434,6 +434,8 @@ pub(crate) struct ChatComposerConfig {
     pub(crate) slash_commands_enabled: bool,
     /// Whether pasting a file path can attach local images.
     pub(crate) image_paste_enabled: bool,
+    /// Whether composer prompt suggestions (the `Create a plan?` nudge) may render.
+    pub(crate) prompt_suggestions_enabled: bool,
 }
 
 impl Default for ChatComposerConfig {
@@ -442,6 +444,7 @@ impl Default for ChatComposerConfig {
             popups_enabled: true,
             slash_commands_enabled: true,
             image_paste_enabled: true,
+            prompt_suggestions_enabled: true,
         }
     }
 }
@@ -449,13 +452,14 @@ impl Default for ChatComposerConfig {
 impl ChatComposerConfig {
     /// A minimal preset for plain-text inputs embedded in other surfaces.
     ///
-    /// This disables popups, slash commands, and image-path attachment behavior
-    /// so the composer behaves like a simple notes field.
+    /// This disables popups, slash commands, image-path attachment behavior, and
+    /// prompt suggestions so the composer behaves like a simple notes field.
     pub(crate) const fn plain_text() -> Self {
         Self {
             popups_enabled: false,
             slash_commands_enabled: false,
             image_paste_enabled: false,
+            prompt_suggestions_enabled: false,
         }
     }
 }
@@ -1413,11 +1417,26 @@ impl ChatComposer {
         self.footer.hint_override = items;
     }
 
+    /// Updates whether composer prompt suggestions may be shown at all.
+    ///
+    /// Disabling also drops any nudge that is already visible, so flipping the
+    /// setting cannot strand the footer in the suggestion state.
+    pub(crate) fn set_prompt_suggestions_enabled(&mut self, enabled: bool) {
+        self.config.prompt_suggestions_enabled = enabled;
+        if !enabled {
+            self.footer.plan_mode_nudge_visible = false;
+        }
+    }
+
     /// Updates whether the Plan-mode nudge replaces the ambient footer row.
     ///
     /// Returns `true` only when the rendered footer can change so callers can avoid scheduling
     /// redundant redraws while reevaluating nudge policy on routine composer updates.
+    ///
+    /// The request is clamped by `prompt_suggestions_enabled` here rather than only at the
+    /// `ChatWidget` policy, so a future call site cannot bypass the setting.
     pub(crate) fn set_plan_mode_nudge_visible(&mut self, visible: bool) -> bool {
+        let visible = visible && self.config.prompt_suggestions_enabled;
         if self.footer.plan_mode_nudge_visible == visible {
             return false;
         }
@@ -4529,7 +4548,9 @@ impl ChatComposer {
                 };
                 if let Some(line) = self.history_search_footer_line() {
                     render_footer_line(hint_rect, buf, line);
-                } else if self.footer.plan_mode_nudge_visible {
+                } else if self.footer.plan_mode_nudge_visible
+                    && self.config.prompt_suggestions_enabled
+                {
                     let available_width =
                         hint_rect.width.saturating_sub(FOOTER_INDENT_COLS as u16) as usize;
                     render_footer_line(
@@ -5034,6 +5055,56 @@ mod tests {
             "",
             "expected blank spacing row above hints but saw: {spacing_row:?}",
         );
+    }
+
+    /// The render boundary must honor `prompt_suggestions_enabled` on its own, so
+    /// footer state reached by some other path still renders no nudge.
+    #[test]
+    fn plan_mode_nudge_render_is_gated_by_prompt_suggestions_setting() {
+        let render_composer = |composer: &ChatComposer| {
+            let area = Rect::new(0, 0, 80, 6);
+            let mut buf = Buffer::empty(area);
+            composer.render(area, &mut buf);
+            let mut rendered = String::new();
+            for y in 0..area.height {
+                for x in 0..area.width {
+                    rendered.push(buf[(x, y)].symbol().chars().next().unwrap_or(' '));
+                }
+                rendered.push('\n');
+            }
+            rendered
+        };
+
+        let (mut composer, _rx) = new_test_composer();
+        composer.footer.plan_mode_nudge_visible = true;
+        assert!(
+            render_composer(&composer).contains("Create a plan?"),
+            "control: the nudge renders while prompt suggestions are enabled"
+        );
+
+        composer.set_prompt_suggestions_enabled(/*enabled*/ false);
+        assert!(
+            !composer.footer.plan_mode_nudge_visible,
+            "disabling should drop an already-visible nudge"
+        );
+        assert!(
+            !composer.set_plan_mode_nudge_visible(/*visible*/ true),
+            "the setter must refuse to turn the nudge back on"
+        );
+        assert!(!composer.footer.plan_mode_nudge_visible);
+
+        // Force the footer state past the setter to exercise the render guard itself.
+        composer.footer.plan_mode_nudge_visible = true;
+        let rendered = render_composer(&composer);
+        assert!(
+            !rendered.contains("Create a plan?"),
+            "expected the render boundary to suppress the nudge, got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("Ask Codex to do anything"),
+            "the composer and footer must still render with the nudge suppressed, got: {rendered:?}"
+        );
+        insta::assert_snapshot!("plan_mode_nudge_render_prompt_suggestions_disabled", rendered);
     }
 
     #[test]
