@@ -13,6 +13,7 @@ use codex_extension_api::ThreadIdleCause;
 use futures::future::BoxFuture;
 use tokio::select;
 use tokio::sync::Notify;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
@@ -26,6 +27,7 @@ use tracing::warn;
 use crate::codex_thread::BackgroundTerminalInfo;
 use crate::config::Config;
 use crate::context::ContextualUserFragment;
+use crate::context::MonitorNotification;
 use crate::session::TurnInput;
 use crate::session::session::Session;
 use crate::session::turn::run_hooks_and_record_inputs;
@@ -33,6 +35,10 @@ use crate::session::turn_context::TurnContext;
 use crate::state::ActiveTurn;
 use crate::state::RunningTask;
 use crate::state::TaskKind;
+use crate::unified_exec::MonitorAcknowledgement;
+use crate::unified_exec::MonitorInfo;
+use crate::unified_exec::MonitorOutput;
+use crate::unified_exec::MonitorWaitOutcome;
 use codex_analytics::TurnProfileFact;
 use codex_analytics::TurnTokenUsageFact;
 use codex_otel::SessionTelemetry;
@@ -192,6 +198,13 @@ pub(crate) trait SessionTask: Send + Sync + 'static {
     /// Returns the tracing name for a spawned task span.
     fn span_name(&self) -> &'static str;
 
+    /// Whether monitor notifications can be consumed as model-turn input by
+    /// this task. Standalone command tasks share the regular task kind but do
+    /// not sample a model, so they must leave durable monitor wakes intact.
+    fn accepts_monitor_input(&self) -> bool {
+        true
+    }
+
     /// Executes the task until completion or cancellation.
     ///
     /// Implementations typically stream protocol events using `session` and
@@ -231,6 +244,8 @@ pub(crate) trait AnySessionTask: Send + Sync + 'static {
 
     fn span_name(&self) -> &'static str;
 
+    fn accepts_monitor_input(&self) -> bool;
+
     fn run(
         self: Arc<Self>,
         session: Arc<Session>,
@@ -252,6 +267,10 @@ where
 
     fn span_name(&self) -> &'static str {
         SessionTask::span_name(self)
+    }
+
+    fn accepts_monitor_input(&self) -> bool {
+        SessionTask::accepts_monitor_input(self)
     }
 
     fn run(
@@ -282,14 +301,35 @@ impl Session {
         input: Vec<TurnInput>,
         task: T,
     ) {
+        let _turn_start_guard = self.input_queue.lock_turn_start().await;
         self.abort_all_tasks(TurnAbortReason::Replaced).await;
         self.clear_connector_selection().await;
         self.start_task(turn_context, input, task, MailboxParentProvenance::Ignore)
             .await;
     }
 
-    pub(crate) async fn start_task<T: SessionTask>(
+    pub(crate) fn start_task<T: SessionTask>(
         self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        input: Vec<TurnInput>,
+        task: T,
+        mailbox_parent_provenance: MailboxParentProvenance,
+    ) -> BoxFuture<'static, ()> {
+        let session = Arc::clone(self);
+        Box::pin(async move {
+            session
+                .start_task_inner(
+                    turn_context,
+                    input,
+                    task,
+                    mailbox_parent_provenance,
+                )
+                .await;
+        })
+    }
+
+    async fn start_task_inner<T: SessionTask>(
+        self: Arc<Self>,
         turn_context: Arc<TurnContext>,
         input: Vec<TurnInput>,
         task: T,
@@ -310,6 +350,7 @@ impl Session {
 
         let cancellation_token = CancellationToken::new();
         let done = Arc::new(Notify::new());
+        let (startup_tx, startup_rx) = oneshot::channel();
 
         self.services
             .guardian_rejection_circuit_breaker
@@ -356,7 +397,7 @@ impl Session {
             &turn_context.session_source,
         );
         let done_clone = Arc::clone(&done);
-        let session = Arc::clone(self);
+        let session = Arc::clone(&self);
         let ctx = Arc::clone(&turn_context);
         let task_for_run = Arc::clone(&task);
         let task_input = input;
@@ -381,6 +422,12 @@ impl Session {
         );
         let handle = tokio::spawn(
             async move {
+                // The active task must be published before the model can
+                // clone history. Monitor delivery uses that publication as
+                // its startup barrier, avoiding a history/wake race.
+                if startup_rx.await.is_err() {
+                    return;
+                }
                 let ctx_for_finish = Arc::clone(&ctx);
                 let task_result = task_for_run
                     .run(
@@ -429,6 +476,7 @@ impl Session {
             _timer: timer,
         };
         turn.task = Some(running_task);
+        let _ = startup_tx.send(());
     }
 
     /// Returns whether an extension has marked this thread as durably asleep.
@@ -464,6 +512,12 @@ impl Session {
         self: &Arc<Self>,
         sub_id: String,
     ) {
+        if self
+            .shutdown_started
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
         if !self.input_queue.has_pending_mailbox_items().await
             || (!self.input_queue.has_trigger_turn_mailbox_items().await
                 && !self.has_outstanding_durable_sleep())
@@ -471,17 +525,23 @@ impl Session {
             return;
         }
 
+        let _turn_start_guard = self.input_queue.lock_turn_start().await;
+        if self
+            .shutdown_started
+            .load(std::sync::atomic::Ordering::Acquire)
         {
-            let mut active_turn = self.active_turn.lock().await;
-            if active_turn.is_some() {
-                return;
-            }
-            *active_turn = Some(ActiveTurn::default());
+            return;
+        }
+        if self.active_turn.lock().await.is_some() {
+            return;
         }
 
         let turn_context = self.new_default_turn_with_sub_id(sub_id).await;
         self.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
             .await;
+        if self.active_turn.lock().await.is_some() {
+            return;
+        }
         self.start_task(
             turn_context,
             Vec::new(),
@@ -500,6 +560,8 @@ impl Session {
             aborted_turn = task.is_some();
             turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
             if let Some(task) = task {
+                self.persist_pending_monitor_items(&active_turn, task.turn_context.as_ref())
+                    .await;
                 self.handle_task_abort(task, reason.clone()).await;
             }
             if aborted_turn {
@@ -518,6 +580,7 @@ impl Session {
         }
         if reason == TurnAbortReason::Interrupted && aborted_turn {
             self.maybe_start_turn_for_pending_work().await;
+            self.input_queue.notify_monitor_wake();
         }
     }
 
@@ -551,6 +614,8 @@ impl Session {
         let task = active_turn.task.take();
         let turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
         if let Some(task) = task {
+            self.persist_pending_monitor_items(&active_turn, task.turn_context.as_ref())
+                .await;
             self.handle_task_abort(task, reason.clone()).await;
         }
         if let Some(turn_context) = turn_context.as_deref() {
@@ -563,6 +628,7 @@ impl Session {
 
         if reason == TurnAbortReason::Interrupted {
             self.maybe_start_turn_for_pending_work().await;
+            self.input_queue.notify_monitor_wake();
         }
 
         true
@@ -609,10 +675,21 @@ impl Session {
         let Some(turn_state) = turn_state else {
             return;
         };
+        // Keep pending monitor extraction, terminal history, and the wake
+        // generation ordered with watcher delivery. Otherwise a late watcher
+        // can overtake this turn's older notification or leave it without a
+        // follow-up request.
+        let monitor_delivery_guard = self.input_queue.lock_monitor_delivery().await;
         let pending_input = self
             .input_queue
             .take_pending_input_for_turn_state(turn_state.as_ref())
             .await;
+        let has_pending_monitor_items = pending_input.iter().any(|input| {
+            matches!(
+                input,
+                TurnInput::ResponseItem(item) if MonitorNotification::is_response_item(&item.item)
+            )
+        });
         let (turn_had_memory_citation, turn_tool_calls, token_usage_at_turn_start) = {
             let ts = turn_state.lock().await;
             (
@@ -628,6 +705,9 @@ impl Session {
             PersistContext::Standard,
         )
         .await;
+        if has_pending_monitor_items {
+            self.input_queue.request_monitor_wake();
+        }
         // Emit token usage metrics.
         {
             // TODO(jif): drop this
@@ -840,9 +920,38 @@ impl Session {
         if let Err(err) = self.flush_rollout().await {
             warn!("failed to flush rollout after emitting terminal turn event: {err}");
         }
+        drop(monitor_delivery_guard);
+        if has_pending_monitor_items {
+            self.input_queue.notify_monitor_wake();
+        }
         if cleared_active_turn {
             self.maybe_start_turn_for_pending_work().await;
+            self.input_queue.notify_monitor_wake();
         }
+    }
+
+    async fn persist_pending_monitor_items(
+        &self,
+        active_turn: &ActiveTurn,
+        turn_context: &TurnContext,
+    ) {
+        let _delivery_guard = self.input_queue.lock_monitor_delivery().await;
+        let items = self
+            .input_queue
+            .take_pending_monitor_items_for_turn_state(active_turn.turn_state.as_ref())
+            .await;
+        if items.is_empty() {
+            return;
+        }
+        for item in &items {
+            self.record_conversation_items(turn_context, std::slice::from_ref(item))
+                .await;
+        }
+        self.input_queue.request_monitor_wake();
+        if let Err(err) = self.flush_rollout().await {
+            warn!("failed to flush monitor items during task cleanup: {err}");
+        }
+        self.input_queue.notify_monitor_wake();
     }
 
     async fn take_active_turn(&self, reason: &TurnAbortReason) -> Option<ActiveTurn> {
@@ -874,6 +983,39 @@ impl Session {
         self.services
             .unified_exec_manager
             .terminate_process(process_id)
+            .await
+    }
+
+    pub(crate) async fn list_monitors(&self) -> Vec<MonitorInfo> {
+        self.services.unified_exec_manager.list_monitors().await
+    }
+
+    pub(crate) async fn read_monitor_output(
+        &self,
+        process_id: i32,
+        acknowledgement: MonitorAcknowledgement,
+    ) -> Option<MonitorOutput> {
+        self.services
+            .unified_exec_manager
+            .read_monitor_output(process_id, acknowledgement)
+            .await
+    }
+
+    pub(crate) async fn stop_monitor(&self, process_id: i32) -> Option<bool> {
+        self.services
+            .unified_exec_manager
+            .stop_monitor(process_id)
+            .await
+    }
+
+    pub(crate) async fn wait_for_monitor(
+        &self,
+        process_id: i32,
+        timeout: std::time::Duration,
+    ) -> Option<MonitorWaitOutcome> {
+        self.services
+            .unified_exec_manager
+            .wait_for_monitor(process_id, timeout)
             .await
     }
 

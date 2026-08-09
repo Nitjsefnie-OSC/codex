@@ -22,8 +22,28 @@ use super::npm_global_root_check;
 use super::run_command;
 
 const VERSION_FILE_NAME: &str = "version.json";
-const GITHUB_LATEST_RELEASE_URL: &str = "https://api.github.com/repos/openai/codex/releases/latest";
 const HOMEBREW_CASK_API_URL: &str = "https://formulae.brew.sh/api/cask/codex.json";
+
+/// The release channel this build may upgrade from, and the tag prefix that
+/// identifies it. Both come from the fork manifest: probing upstream's releases
+/// would report an "available update" that, if taken, replaces this build with
+/// one that has none of its capabilities.
+fn github_latest_release_url() -> &'static str {
+    &codex_fork_manifest::manifest()
+        .release_channel
+        .latest_release_api_url
+}
+
+fn release_tag_prefix() -> &'static str {
+    &codex_fork_manifest::manifest().release_channel.tag_prefix
+}
+
+/// Whether upstream's package managers and installer scripts ship this build.
+fn upstream_installers_ship_this_build() -> bool {
+    codex_fork_manifest::manifest()
+        .release_channel
+        .package_manager_releases
+}
 
 /// Builds the update-health row for the current installation.
 ///
@@ -33,7 +53,16 @@ const HOMEBREW_CASK_API_URL: &str = "https://formulae.brew.sh/api/cask/codex.jso
 pub(super) fn updates_check(config: &Config) -> DoctorCheck {
     let current_exe = std::env::current_exe().ok();
     let install_context = doctor_install_context(current_exe.as_deref());
+    let fork_manifest = codex_fork_manifest::manifest();
     let mut details = vec![
+        // Which build this is, first: every line below is only interpretable
+        // once you know whether the running binary is the fork or upstream.
+        format!("fork: {}", fork_manifest.fork.slug),
+        format!(
+            "build commit: {} ({})",
+            fork_manifest.build.commit, fork_manifest.build.commit_state
+        ),
+        format!("release channel: {}", github_latest_release_url()),
         format!(
             "check for update on startup: {}",
             config.check_for_update_on_startup
@@ -129,7 +158,22 @@ fn push_cached_version_details(details: &mut Vec<String>, version_file: &Path) {
     }
 }
 
-fn update_action_label(context: &InstallContext) -> &'static str {
+fn update_action_label(context: &InstallContext) -> String {
+    if !upstream_installers_ship_this_build() {
+        // Naming the upstream command anyway would read as a recommendation.
+        // Say what it would actually do, and where the real upgrade lives.
+        return format!(
+            "manual: download from {} ({} would install an upstream build)",
+            codex_fork_manifest::manifest()
+                .release_channel
+                .releases_page_url,
+            upstream_install_command(context),
+        );
+    }
+    upstream_install_command(context).to_string()
+}
+
+fn upstream_install_command(context: &InstallContext) -> &'static str {
     match &context.method {
         InstallMethod::Npm => "npm install -g @openai/codex",
         InstallMethod::Bun => "bun install -g @openai/codex",
@@ -141,9 +185,15 @@ fn update_action_label(context: &InstallContext) -> &'static str {
 }
 
 fn fetch_latest_version(context: &InstallContext) -> Result<String, String> {
+    // The Homebrew cask tracks upstream. Consulting it for a build Homebrew
+    // does not ship would report an upstream version as this build's available
+    // update, so only the fork's own release channel is asked.
     match &context.method {
-        InstallMethod::Brew => fetch_homebrew_cask_version(),
-        InstallMethod::Npm
+        InstallMethod::Brew if upstream_installers_ship_this_build() => {
+            fetch_homebrew_cask_version()
+        }
+        InstallMethod::Brew
+        | InstallMethod::Npm
         | InstallMethod::Bun
         | InstallMethod::Pnpm
         | InstallMethod::Standalone { .. }
@@ -157,9 +207,9 @@ fn fetch_latest_github_release_version() -> Result<String, String> {
         tag_name: String,
     }
 
-    let info = http_get_json::<ReleaseInfo>(GITHUB_LATEST_RELEASE_URL)?;
+    let info = http_get_json::<ReleaseInfo>(github_latest_release_url())?;
     info.tag_name
-        .strip_prefix("rust-v")
+        .strip_prefix(release_tag_prefix())
         .map(str::to_string)
         .ok_or_else(|| format!("failed to parse latest tag {}", info.tag_name))
 }
@@ -219,25 +269,60 @@ mod tests {
     #[test]
     fn update_action_labels_install_contexts() {
         assert_eq!(
-            update_action_label(&InstallContext {
+            upstream_install_command(&InstallContext {
                 method: InstallMethod::Npm,
                 package_layout: None,
             }),
             "npm install -g @openai/codex"
         );
         assert_eq!(
-            update_action_label(&InstallContext {
+            upstream_install_command(&InstallContext {
                 method: InstallMethod::Pnpm,
                 package_layout: None,
             }),
             "pnpm add -g @openai/codex"
         );
         assert_eq!(
-            update_action_label(&InstallContext {
+            upstream_install_command(&InstallContext {
                 method: InstallMethod::Other,
                 package_layout: None,
             }),
             "manual or unknown"
         );
+    }
+
+    #[test]
+    fn the_label_does_not_recommend_a_command_that_installs_upstream() {
+        // The doctor row is read as advice. On a build upstream does not ship,
+        // printing the bare npm command tells the user to overwrite their fork
+        // install with an upstream binary.
+        assert!(!upstream_installers_ship_this_build());
+
+        let label = update_action_label(&InstallContext {
+            method: InstallMethod::Npm,
+            package_layout: None,
+        });
+
+        assert!(label.starts_with("manual: download from "), "got: {label}");
+        assert!(
+            label.contains(
+                &codex_fork_manifest::manifest()
+                    .release_channel
+                    .releases_page_url
+            ),
+            "got: {label}"
+        );
+        assert!(
+            label.contains("would install an upstream build"),
+            "got: {label}"
+        );
+    }
+
+    #[test]
+    fn the_release_probe_targets_the_fork_channel() {
+        let manifest = codex_fork_manifest::manifest();
+        assert!(github_latest_release_url().contains(&manifest.fork.slug));
+        assert!(!github_latest_release_url().contains(&manifest.upstream.slug));
+        assert_eq!(release_tag_prefix(), manifest.release_channel.tag_prefix);
     }
 }

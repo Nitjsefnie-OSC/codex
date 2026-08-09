@@ -4,6 +4,10 @@ use crate::elicitation::ElicitationRegistration;
 use crate::session::SessionIo;
 use crate::session::SessionSettingsUpdate;
 use crate::session::session::Session;
+use crate::unified_exec::MonitorAcknowledgement;
+use crate::unified_exec::MonitorInfo;
+use crate::unified_exec::MonitorOutput;
+use crate::unified_exec::MonitorWaitOutcome;
 use codex_diagnostics::Gauge;
 use codex_diagnostics::GaugeGuard;
 use codex_exec_server::SelectedCapabilityRootsStatus;
@@ -60,6 +64,7 @@ use codex_utils_path_uri::PathUri;
 use rmcp::model::ReadResourceRequestParams;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -497,6 +502,37 @@ impl CodexThread {
 
     pub async fn terminate_background_terminal(&self, process_id: i32) -> bool {
         self.session.terminate_background_terminal(process_id).await
+    }
+
+    /// Every monitor this thread has started, running or finished.
+    pub async fn list_monitors(&self) -> Vec<MonitorInfo> {
+        self.session.list_monitors().await
+    }
+
+    /// A monitor's bounded retained output. `None` when no such monitor exists.
+    pub async fn read_monitor_output(
+        &self,
+        process_id: i32,
+        acknowledgement: MonitorAcknowledgement,
+    ) -> Option<MonitorOutput> {
+        self.session
+            .read_monitor_output(process_id, acknowledgement)
+            .await
+    }
+
+    /// Stop a monitor. `None` when no such monitor exists; `Some(false)` when it
+    /// had already finished.
+    pub async fn stop_monitor(&self, process_id: i32) -> Option<bool> {
+        self.session.stop_monitor(process_id).await
+    }
+
+    /// Wait for a monitor to finish, giving up after `timeout`.
+    pub async fn wait_for_monitor(
+        &self,
+        process_id: i32,
+        timeout: Duration,
+    ) -> Option<MonitorWaitOutcome> {
+        self.session.wait_for_monitor(process_id, timeout).await
     }
 
     pub(crate) fn subscribe_status(&self) -> watch::Receiver<AgentStatus> {

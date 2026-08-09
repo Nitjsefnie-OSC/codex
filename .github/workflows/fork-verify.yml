@@ -1,0 +1,338 @@
+name: fork-verify
+
+# Verifies that fork main — upstream/main plus our whoami and monitor tools —
+# type-checks across the whole workspace. Runs on GitHub's runners because a
+# full codex-rs target tree is ~45G, which is not something to put on a dev box.
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Select the verification path to run
+        required: true
+        default: full
+        type: choice
+        options:
+          - full
+          - stack-diagnostics
+          - whoami-regression
+
+concurrency:
+  group: fork-verify-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'stack-diagnostics' && 'stack-diagnostics' || github.event_name == 'workflow_dispatch' && inputs.mode == 'whoami-regression' && 'whoami-regression' || 'full' }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    if: github.event_name == 'push' || inputs.mode == '' || inputs.mode == 'full'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Reclaim runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: System build deps
+        # codex-bwrap links libcap via pkg-config; without it the whole
+        # workspace fails at build-script time, not at type-check time.
+        run: sudo apt-get update -qq && sudo apt-get install -y libcap-dev
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs
+          shared-key: check
+
+      - name: cargo check --workspace
+        working-directory: codex-rs
+        run: |
+          cargo check --workspace \
+            --exclude codex-v8-poc \
+            --exclude codex-code-mode-runtime \
+            --exclude codex-code-mode-host
+          df -h /
+
+      - name: fork manifest tests
+        # Cheap and load-bearing: the manifest is what tells an installer which
+        # capabilities this build has and which release channel is safe to pull
+        # from, so a manifest that stops parsing — or one whose update channel
+        # drifts back to upstream — has to fail here rather than in the field.
+        working-directory: codex-rs
+        run: cargo test -p codex-fork-manifest
+
+      - name: hook contract tests
+        # Keep load-bearing hook wire/schema tests ahead of unrelated suites so
+        # a contract regression reports as soon as the workspace type-checks.
+        working-directory: codex-rs
+        run: cargo test -p codex-hooks
+
+      - name: skill activation audit state tests
+        # Focused fork enforcement coverage: full-source digests and turn-local
+        # exact-record activation state must fail before later hook suites run.
+        working-directory: codex-rs
+        run: |
+          cargo test -p codex-skills-extension --lib host_prompt::tests::host_skill_prompt_digest_uses_full_source_before_truncation -- --exact
+          cargo test -p codex-core --lib skill_activation_store
+          cargo test -p codex-core --lib pending_skill_activation
+          cargo test -p codex-core --lib implicit_skill_activation_candidate
+          cargo test -p codex-core --lib hook_runtime::tests::production_pre_tool_use_hook_receives_turn_local_skill_activation_snapshot -- --exact --nocapture --test-threads=1
+          cargo test -p codex-core --lib hook_runtime::tests::production_post_tool_use_hook_receives_turn_local_skill_activation_snapshot -- --exact --nocapture --test-threads=1
+
+      - name: classic shell skill activation handler tests
+        # These tests execute real handlers. Bound the family so an approval
+        # fixture regression fails promptly and is attributed to this backend.
+        timeout-minutes: 5
+        working-directory: codex-rs
+        run: cargo test -p codex-core --lib classic_shell_implicit_skill_activation -- --nocapture --test-threads=1
+
+      - name: unified exec skill activation handler tests
+        timeout-minutes: 5
+        working-directory: codex-rs
+        run: cargo test -p codex-core --lib unified_exec_implicit_skill_activation -- --nocapture --test-threads=1
+
+      - name: write stdin skill activation handler tests
+        timeout-minutes: 5
+        working-directory: codex-rs
+        run: cargo test -p codex-core --lib write_stdin_implicit_skill_activation -- --nocapture --test-threads=1
+
+      - name: fork-safe update channel tests
+        # These assert the negative that matters: no code path offers an
+        # upgrade that would install an upstream build over a fork one, and an
+        # upstream release tag does not parse as an available fork upgrade.
+        working-directory: codex-rs
+        run: |
+          cargo test -p codex-tui --lib update_action
+          cargo test -p codex-tui --lib update_versions
+          cargo test -p codex-cli --bin codex doctor::updates
+
+      - name: codex-api WebSocket provenance tests
+        # Run transport provenance before the monitor gate so a model identity
+        # regression remains independently attributable when monitor coverage
+        # is unavailable or fails for an unrelated reason.
+        working-directory: codex-rs
+        run: |
+          cargo test -p codex-api --lib websocket_handshake_model -- --nocapture
+          cargo test -p codex-api --lib websocket_response_model_attestation -- --nocapture
+
+      - name: regular-turn regression tests
+        # Keep the known plan-mode and pending-input start paths ahead of the
+        # provenance gates, with exact filters so a renamed test cannot make
+        # this check vacuous.
+        timeout-minutes: 15
+        working-directory: codex-rs
+        run: |
+          set +e
+          output=$(timeout 5m cargo test -p codex-core --lib \
+            session::tests::try_start_turn_if_idle_accepts_user_input_in_plan_mode \
+            -- --exact --nocapture --test-threads=1 2>&1)
+          first=$?
+          printf '%s\n' "$output"
+          if ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+            echo "::error::plan-mode exact filter did not run at least one passing test"
+            first=1
+          fi
+          output=$(timeout 5m cargo test -p codex-core --test all \
+            suite::pending_input::idle_user_input_reaches_the_first_model_request \
+            -- --exact --nocapture --test-threads=1 2>&1)
+          second=$?
+          printf '%s\n' "$output"
+          if ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+            echo "::error::pending-input exact filter did not run at least one passing test"
+            second=1
+          fi
+          output=$(timeout 5m cargo test -p codex-core --lib \
+            session::tests::default_turn_construction_future_stays_small \
+            -- --exact --nocapture --test-threads=1 2>&1)
+          third=$?
+          printf '%s\n' "$output"
+          if ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+            echo "::error::turn-construction future-size filter did not run at least one passing test"
+            third=1
+          fi
+          exit $((first + second + third))
+
+      - name: whoami provenance tests
+        # whoami must distinguish request metadata from the response-scoped
+        # server model, including when a later sampling step has no model
+        # report. Keep this focused so provenance regressions are attributed
+        # separately from the monitor integration suite. Run each integration
+        # case in its own process so a provenance failure identifies the case
+        # instead of aborting a parallel test binary.
+        timeout-minutes: 25
+        working-directory: codex-rs
+        run: |
+          cargo test -p codex-core --lib whoami -- --nocapture
+          set +e
+          failures=0
+          for test_name in \
+            suite::whoami::whoami_reports_server_routed_model_and_request_provenance \
+            suite::whoami::whoami_does_not_reuse_server_identity_across_sampling_steps \
+            suite::whoami::whoami_does_not_attest_websocket_handshake_model \
+            suite::whoami::whoami_retry_clears_stale_model_in_the_same_sampling_step
+          do
+            output=$(timeout 5m cargo test -p codex-core --test all "$test_name" -- \
+              --exact --nocapture --test-threads=1 2>&1)
+            status=$?
+            printf '%s\n' "$output"
+            if ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+              echo "::error::whoami filter $test_name did not run at least one passing test"
+              status=1
+            fi
+            if [ "$status" -ne 0 ]; then
+              failures=$((failures + 1))
+            fi
+          done
+          exit "$failures"
+
+      - name: monitor tool tests
+        # The dev box may not run cargo test, so this is where the monitor's
+        # contract is actually executed: notification batching and sequencing,
+        # the per-monitor cap, the always-exactly-one terminal notification,
+        # stop-leaves-no-orphan, readable retained output, and idle-session
+        # wake-up through a second Responses inference.
+        working-directory: codex-rs
+        run: |
+          cargo test -p codex-core --lib monitor -- --nocapture
+          cargo test -p codex-core --lib try_start_turn_if_idle -- --nocapture
+          cargo test -p codex-core --test all monitor -- --nocapture
+          df -h /
+
+      - name: golden tool-name list
+        working-directory: codex-rs
+        run: cargo test -p codex-core --test all prompt_caching -- --nocapture || true
+
+  stack-diagnostics:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'stack-diagnostics'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: System build deps
+        run: sudo apt-get update -qq && sudo apt-get install -y libcap-dev
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs
+          shared-key: check
+
+      - name: targeted future-size and regular-turn regressions
+        working-directory: codex-rs
+        run: |
+          set +e
+          output=$(timeout 5m cargo test -p codex-core --lib \
+            session::tests::sampling_loop_future_boundary_is_pointer_sized \
+            -- --exact --nocapture --test-threads=1 2>&1)
+          size=$?
+          printf '%s\n' "$output"
+          if ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+            echo "::error::sampling-loop future-boundary filter did not run at least one passing test"
+            size=1
+          fi
+          output=$(timeout 5m cargo test -p codex-core --lib \
+            session::turn::tests::sampling_request_future_boundary_is_pointer_sized \
+            -- --exact --nocapture --test-threads=1 2>&1)
+          request=$?
+          printf '%s\n' "$output"
+          if ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+            echo "::error::sampling-request future-boundary filter did not run at least one passing test"
+            request=1
+          fi
+          output=$(timeout 5m cargo test -p codex-core --lib \
+            session::turn::tests::try_sampling_request_future_boundary_is_pointer_sized \
+            -- --exact --nocapture --test-threads=1 2>&1)
+          try_request=$?
+          printf '%s\n' "$output"
+          if ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+            echo "::error::try-sampling-request future-boundary filter did not run at least one passing test"
+            try_request=1
+          fi
+          output=$(timeout 5m cargo test -p codex-core --lib \
+            session::turn::tests::model_stream_future_boundary_is_pointer_sized \
+            -- --exact --nocapture --test-threads=1 2>&1)
+          stream=$?
+          printf '%s\n' "$output"
+          if ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+            echo "::error::model-stream future-boundary filter did not run at least one passing test"
+            stream=1
+          fi
+          output=$(timeout 5m cargo test -p codex-core --lib \
+            session::tests::try_start_turn_if_idle_accepts_user_input_in_plan_mode \
+            -- --exact --nocapture --test-threads=1 2>&1)
+          unit=$?
+          printf '%s\n' "$output"
+          if ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+            echo "::error::plan-mode exact filter did not run at least one passing test"
+            unit=1
+          fi
+          output=$(timeout 5m cargo test -p codex-core --test all \
+            suite::pending_input::idle_user_input_reaches_the_first_model_request \
+            -- --exact --nocapture --test-threads=1 2>&1)
+          integration=$?
+          printf '%s\n' "$output"
+          if ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+            echo "::error::pending-input exact filter did not run at least one passing test"
+            integration=1
+          fi
+          exit $((size + request + try_request + stream + unit + integration))
+
+  whoami-regression:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'whoami-regression'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: System build deps
+        run: sudo apt-get update -qq && sudo apt-get install -y libcap-dev
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs
+          shared-key: whoami-regression
+
+      - name: whoami integration regression tests
+        working-directory: codex-rs
+        run: |
+          set +e
+          if ! timeout 10m cargo test -p codex-core --test all --no-run; then
+            echo "::error::whoami regression test binary failed to build"
+            exit 1
+          fi
+          failures=0
+          for test_name in \
+            suite::whoami::whoami_reports_server_routed_model_and_request_provenance \
+            suite::whoami::whoami_does_not_reuse_server_identity_across_sampling_steps \
+            suite::whoami::whoami_does_not_attest_websocket_handshake_model \
+            suite::whoami::whoami_retry_clears_stale_model_in_the_same_sampling_step
+          do
+            output=$(timeout 5m cargo test -p codex-core --test all "$test_name" -- \
+              --exact --nocapture --test-threads=1 2>&1)
+            status=$?
+            printf '%s\n' "$output"
+            if ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+              echo "::error::whoami filter $test_name did not run at least one passing test"
+              status=1
+            fi
+            if [ "$status" -ne 0 ]; then
+              failures=$((failures + 1))
+            fi
+          done
+          exit "$failures"

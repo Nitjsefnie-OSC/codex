@@ -74,15 +74,16 @@ impl SessionTask for RegularTask {
         let mut next_input = input;
         let mut prewarmed_client_session = prewarmed_client_session;
         loop {
-            let last_agent_message = run_turn(
+            let run_turn_future = run_turn(
                 Arc::clone(&sess),
                 Arc::clone(&ctx),
                 next_input,
                 prewarmed_client_session.take(),
                 cancellation_token.child_token(),
-            )
-            .instrument(run_turn_span.clone())
-            .await?;
+            );
+            let last_agent_message = run_turn_future
+                .instrument(run_turn_span.clone())
+                .await?;
             if !sess.input_queue.has_pending_input(&sess.active_turn).await {
                 return Ok(last_agent_message);
             }

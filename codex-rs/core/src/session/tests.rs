@@ -6,6 +6,7 @@ use crate::config::ConfigBuilder;
 use crate::config::ConfigOverrides;
 use crate::config::test_config;
 use crate::context::ContextualUserFragment;
+use crate::context::MonitorNotification;
 use crate::context::TurnAborted;
 use crate::environment_selection::ThreadEnvironments;
 use crate::environment_selection::TurnEnvironmentState;
@@ -78,6 +79,7 @@ use codex_protocol::turn_input::TurnInputSubmission;
 use codex_tools::ToolSpec;
 use codex_utils_path_uri::PathUri;
 use std::collections::BTreeMap;
+use std::sync::atomic::AtomicBool;
 use tracing::Span;
 
 use crate::connectors::AppInfo;
@@ -209,6 +211,7 @@ impl StepContext {
         let environments = turn.environments.clone();
         Arc::new(Self {
             turn: Arc::clone(&turn),
+            response_identity: Arc::new(crate::session::step_context::ResponseIdentityState::default()),
             environments,
             selected_capability_roots: Vec::new(),
             executor_capability_discovery: None,
@@ -639,7 +642,7 @@ async fn interrupting_regular_turn_waiting_on_startup_prewarm_emits_turn_aborted
     assert!(duration_ms.is_some());
 }
 
-fn test_model_client_session() -> crate::client::ModelClientSession {
+pub(crate) fn test_model_client_session() -> crate::client::ModelClientSession {
     let thread_id = ThreadId::try_from("00000000-0000-4000-8000-000000000001")
         .expect("test thread id should be valid");
     crate::client::ModelClient::new(
@@ -5946,6 +5949,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         conversation: Arc::new(RealtimeConversationManager::new()),
         active_turn: Mutex::new(None),
         async_hook_results,
+        shutdown_started: AtomicBool::new(false),
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         services,
@@ -7491,6 +7495,9 @@ async fn shutdown_complete_does_not_append_to_thread_store_after_shutdown() {
     assert!(session.async_hook_results.is_closed());
     assert!(session.async_hook_results.is_empty());
     assert!(result_sender.is_closed());
+    assert!(session
+        .shutdown_started
+        .load(std::sync::atomic::Ordering::Acquire));
 
     assert_eq!(
         codex_thread_store::InMemoryThreadStoreCalls {
@@ -8139,6 +8146,7 @@ where
         conversation: Arc::new(RealtimeConversationManager::new()),
         active_turn: Mutex::new(None),
         async_hook_results,
+        shutdown_started: AtomicBool::new(false),
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         services,
@@ -10561,6 +10569,41 @@ async fn task_finish_emits_thread_idle_lifecycle_after_active_turn_clears() {
     assert!(session.active_turn.lock().await.is_none());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_idle_monitor_notifications_are_persisted_once_and_coalesce_wake() {
+    let (session, turn_context, _rx) = make_session_and_context_with_rx().await;
+    let notification = |seq| MonitorNotification {
+        process_id: 17,
+        seq,
+        command: "watch".to_string(),
+        kind: "watcher",
+        terminal_state: None,
+        lines: vec![format!("line-{seq}")],
+        omitted_lines: 0,
+        suppressed_notifications: 0,
+        note: None,
+    };
+
+    tokio::join!(
+        session.deliver_monitor_notification(notification(1), turn_context.as_ref()),
+        session.deliver_monitor_notification(notification(2), turn_context.as_ref()),
+    );
+
+    let history = session.clone_history().await;
+    assert_eq!(
+        2,
+        history
+            .raw_items()
+            .iter()
+            .filter(|item| MonitorNotification::is_response_item(item))
+            .count(),
+        "racing idle notifications must not be dropped or duplicated"
+    );
+    assert!(session.input_queue.monitor_wake_requested());
+    assert!(session.input_queue.claim_monitor_wake());
+    assert!(!session.input_queue.claim_monitor_wake());
+}
+
 #[tokio::test]
 async fn thread_idle_lifecycle_waits_for_trigger_turn_mailbox_work() {
     struct ThreadIdleRecorder {
@@ -10605,6 +10648,42 @@ async fn thread_idle_lifecycle_waits_for_trigger_turn_mailbox_work() {
         .await;
 
     assert_eq!(0, calls.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn default_turn_construction_future_stays_small() {
+    let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
+    let future_size = {
+        let future = sess.new_default_turn_with_sub_id("future-size-regression".to_string());
+        std::mem::size_of_val(&future)
+    };
+
+    assert!(
+        future_size <= 8 * 1024,
+        "default turn construction future is {future_size} bytes"
+    );
+}
+
+#[tokio::test]
+async fn sampling_loop_future_boundary_is_pointer_sized() {
+    let (sess, turn_context) = make_session_and_context().await;
+    let sess = Arc::new(sess);
+    let turn_context = Arc::new(turn_context);
+    let future = super::turn::run_turn_sampling_loop(
+        Arc::clone(&sess),
+        Arc::clone(&turn_context),
+        CancellationToken::new(),
+        test_model_client_session(),
+        StepContext::for_test(Arc::clone(&turn_context)),
+        Arc::new(WorldState::default()),
+        Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        true,
+    );
+    let future_size = std::mem::size_of_val(&future);
+    assert!(
+        future_size <= 2 * std::mem::size_of::<usize>(),
+        "sampling loop API future boundary is {future_size} bytes"
+    );
 }
 
 #[tokio::test]

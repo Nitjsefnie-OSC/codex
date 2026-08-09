@@ -1,10 +1,16 @@
 use super::TurnInput as PendingTurnInput;
 use super::session::Session;
 use super::turn_context::TurnContext;
+use crate::context::ContextualUserFragment;
+use crate::context::MonitorNotification;
 use codex_features::Feature;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::turn_input::TurnInputMode;
+use codex_protocol::turn_input::TurnInputRequest;
+use futures::future::BoxFuture;
+use std::sync::Arc;
 
 impl Session {
     /// Returns the input if there is no active turn to inject into.
@@ -112,6 +118,59 @@ impl Session {
         }
         self.record_prepared_conversation_items(turn_context, annotated_items, image_preparations)
             .await;
+    /// Persist one monitor notification and request one coalesced idle wake.
+    ///
+    /// Active regular turns receive the item directly. At every other turn
+    /// boundary the item is recorded first, so interruption, shutdown, and a
+    /// competing user submission cannot erase it before the next model request.
+    pub(crate) async fn deliver_monitor_notification(
+        self: &Arc<Self>,
+        notification: MonitorNotification,
+        fallback_turn_context: &TurnContext,
+    ) {
+        let _delivery_guard = self.input_queue.lock_monitor_delivery().await;
+        let item = ContextualUserFragment::into(notification);
+        if self
+            .input_queue
+            .inject_monitor_if_running(&self.active_turn, item.clone())
+            .await
+        {
+            return;
+        }
+
+        self.record_conversation_items(fallback_turn_context, std::slice::from_ref(&item))
+            .await;
+        self.input_queue.request_monitor_wake();
+        if let Err(err) = self.flush_rollout().await {
+            tracing::warn!("failed to flush monitor notification before wake: {err}");
+        }
+        self.input_queue.notify_monitor_wake();
+    }
+
+    /// Start at most one regular turn for monitor history waiting for a model
+    /// request. The same lock is used by user/task starts, so no taskless
+    /// `ActiveTurn` can steal a submission race.
+    pub(crate) fn maybe_start_monitor_turn_if_idle(self: &Arc<Self>) -> BoxFuture<'static, ()> {
+        let session = Arc::clone(self);
+        Box::pin(async move {
+            if session
+                .shutdown_started
+                .load(std::sync::atomic::Ordering::Acquire)
+                || !session.input_queue.monitor_wake_requested()
+            {
+                return;
+            }
+            if let Err(error) = super::turn_input::handle(
+                &session,
+                TurnInputRequest::user_input(Vec::new()),
+                TurnInputMode::StartIfIdle,
+                uuid::Uuid::now_v7().to_string(),
+            )
+            .await
+            {
+                tracing::warn!("failed to start monitor wake turn: {error}");
+            }
+        })
     }
 
     /// Injects items into active work, or records them without starting a turn.

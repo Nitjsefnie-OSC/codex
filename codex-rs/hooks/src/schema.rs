@@ -12,7 +12,9 @@ use serde_json::Value;
 use std::path::Path;
 use std::path::PathBuf;
 
+use crate::background_state::BackgroundState;
 use crate::events::common::SubagentHookContext;
+use crate::skill_activation::SkillActivation;
 
 const GENERATED_DIR: &str = "generated";
 const POST_TOOL_USE_INPUT_FIXTURE: &str = "post-tool-use.command.input.schema.json";
@@ -289,6 +291,7 @@ pub(crate) struct PreToolUseCommandInput {
     pub tool_name: String,
     pub tool_input: Value,
     pub tool_use_id: String,
+    pub skill_activations: Vec<SkillActivation>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -335,6 +338,7 @@ pub(crate) struct PostToolUseCommandInput {
     pub tool_input: Value,
     pub tool_response: Value,
     pub tool_use_id: String,
+    pub skill_activations: Vec<SkillActivation>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -585,6 +589,9 @@ pub(crate) struct StopCommandInput {
     pub permission_mode: String,
     pub stop_hook_active: bool,
     pub last_assistant_message: NullableString,
+    /// Codex extension: live monitor and background-terminal state, so a Stop
+    /// hook can refuse a turn that walked away from running work.
+    pub background: BackgroundState,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -606,6 +613,10 @@ pub(crate) struct SubagentStopCommandInput {
     pub agent_id: String,
     pub agent_type: String,
     pub last_assistant_message: NullableString,
+    /// Codex extension: as on `stop.command.input`. A subagent leaving a
+    /// monitor running is the case this exists for — its parent has no other
+    /// way to find out.
+    pub background: BackgroundState,
 }
 
 pub fn write_schema_fixtures(schema_root: &Path) -> anyhow::Result<()> {
@@ -1113,6 +1124,43 @@ mod tests {
     }
 
     #[test]
+    fn tool_hook_schemas_require_typed_skill_activation_arrays() {
+        let schemas = [
+            schema_json::<PreToolUseCommandInput>().expect("serialize pre tool use input schema"),
+            schema_json::<PostToolUseCommandInput>()
+                .expect("serialize post tool use input schema"),
+        ];
+
+        for schema in schemas {
+            let schema: Value = serde_json::from_slice(&schema).expect("parse hook input schema");
+            assert_eq!(
+                schema["properties"]["skill_activations"],
+                json!({
+                    "items": { "$ref": "#/definitions/SkillActivation" },
+                    "type": "array",
+                })
+            );
+            assert!(
+                schema["required"]
+                    .as_array()
+                    .expect("schema required fields")
+                    .contains(&Value::String("skill_activations".to_string()))
+            );
+            assert_eq!(
+                schema["definitions"]["SkillActivation"]["required"],
+                json!([
+                    "content_sha256",
+                    "invocation",
+                    "name",
+                    "path",
+                    "scope",
+                    "turn_id",
+                ])
+            );
+        }
+    }
+
+    #[test]
     fn subagent_context_fields_are_optional_for_hooks_that_run_inside_subagents() {
         let schemas = [
             schema_json::<PreToolUseCommandInput>().expect("serialize pre tool use input schema"),
@@ -1156,6 +1204,7 @@ mod tests {
             tool_name: "Bash".to_string(),
             tool_input: json!({ "command": "echo hello" }),
             tool_use_id: "tool-1".to_string(),
+            skill_activations: Vec::new(),
         };
 
         assert_eq!(
@@ -1173,6 +1222,7 @@ mod tests {
                 "tool_name": "Bash",
                 "tool_input": { "command": "echo hello" },
                 "tool_use_id": "tool-1",
+                "skill_activations": [],
             })
         );
 
@@ -1189,6 +1239,7 @@ mod tests {
             tool_name: "Bash".to_string(),
             tool_input: json!({ "command": "echo hello" }),
             tool_use_id: "tool-1".to_string(),
+            skill_activations: Vec::new(),
         };
         let root_input = serde_json::to_value(root_input).expect("serialize root hook input");
         assert_eq!(root_input.get("agent_id"), None);

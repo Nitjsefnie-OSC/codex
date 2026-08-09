@@ -255,6 +255,15 @@ async fn start_if_idle(
     submission_id: String,
     is_recovery: bool,
 ) -> CodexResult<TurnInputSubmission> {
+    let _turn_start_guard = session.input_queue.lock_turn_start().await;
+    if session
+        .shutdown_started
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Ok(TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::NotIdle,
+        });
+    }
     let TurnInputRequest {
         input,
         thread_settings,

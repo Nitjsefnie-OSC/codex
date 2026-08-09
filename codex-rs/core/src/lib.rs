@@ -4,6 +4,10 @@
 // user-visible output must go through the appropriate abstraction (e.g.,
 // the TUI or the tracing stack).
 #![deny(clippy::print_stdout, clippy::print_stderr)]
+// The tool handlers compose deeply nested async futures — `monitor` reaches the
+// unified exec orchestrator through two more layers than `exec_command` does —
+// and auto-trait solving for those futures exceeds the default limit.
+#![recursion_limit = "256"]
 
 mod apply_patch;
 mod apps;
@@ -37,6 +41,13 @@ pub use codex_thread::CodexThread;
 pub use codex_thread::CodexThreadSettingsOverrides;
 pub use codex_thread::ThreadConfigSnapshot;
 pub use session::turn_context::TurnContext;
+pub use unified_exec::MonitorAcknowledgement;
+pub use unified_exec::MonitorInfo;
+pub use unified_exec::MonitorKind;
+pub use unified_exec::MonitorOutput;
+pub use unified_exec::MonitorOwner;
+pub use unified_exec::MonitorState;
+pub use unified_exec::MonitorWaitOutcome;
 mod agent;
 mod agent_communication;
 mod attestation;

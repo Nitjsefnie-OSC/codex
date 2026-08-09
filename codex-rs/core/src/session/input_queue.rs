@@ -1,5 +1,7 @@
+use crate::context::MonitorNotification;
 use crate::state::ActiveTurn;
 use crate::state::MailboxDeliveryPhase;
+use crate::state::TaskKind;
 use crate::state::TurnState;
 use codex_diagnostics::Gauge;
 use codex_diagnostics::GaugeGuard;
@@ -11,7 +13,10 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
+use tokio::sync::Notify;
 use tokio::sync::watch;
 
 static PENDING_MAILBOX_MESSAGES: Gauge = Gauge::new("core.mailbox.pending");
@@ -77,6 +82,10 @@ pub(crate) struct TurnInputQueue {
 pub(crate) struct InputQueue {
     activity_tx: watch::Sender<InputQueueActivity>,
     mailbox_pending_mails: Mutex<VecDeque<PendingMailboxCommunication>>,
+    turn_start_lock: Mutex<()>,
+    monitor_delivery_lock: Mutex<()>,
+    monitor_wake_requested: AtomicBool,
+    monitor_wake_notify: Notify,
 }
 
 struct PendingMailboxCommunication {
@@ -92,7 +101,78 @@ impl InputQueue {
         Self {
             activity_tx,
             mailbox_pending_mails: Mutex::new(VecDeque::new()),
+            turn_start_lock: Mutex::new(()),
+            monitor_delivery_lock: Mutex::new(()),
+            monitor_wake_requested: AtomicBool::new(false),
+            monitor_wake_notify: Notify::new(),
         }
+    }
+
+    pub(crate) async fn lock_turn_start(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.turn_start_lock.lock().await
+    }
+
+    pub(crate) async fn lock_monitor_delivery(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.monitor_delivery_lock.lock().await
+    }
+
+    pub(crate) fn request_monitor_wake(&self) {
+        self.monitor_wake_requested.store(true, Ordering::Release);
+    }
+
+    /// Wake the submission loop after the monitor item represented by the
+    /// durable flag has been persisted and flushed.
+    pub(crate) fn notify_monitor_wake(&self) {
+        if self.monitor_wake_requested() {
+            self.monitor_wake_notify.notify_one();
+        }
+    }
+
+    pub(crate) async fn monitor_wake_notified(&self) {
+        self.monitor_wake_notify.notified().await;
+    }
+
+    pub(crate) fn monitor_wake_requested(&self) -> bool {
+        self.monitor_wake_requested.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn claim_monitor_wake(&self) -> bool {
+        self.monitor_wake_requested
+            .swap(false, Ordering::AcqRel)
+    }
+
+    /// Add a monitor item to an active regular turn only while that turn still
+    /// accepts same-turn work. The active-turn lock and turn-state lock make
+    /// this decision atomic with task finalization.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "active turn and turn state must be checked and updated atomically"
+    )]
+    pub(crate) async fn inject_monitor_if_running(
+        &self,
+        active_turn: &Mutex<Option<ActiveTurn>>,
+        item: ResponseItem,
+    ) -> bool {
+        let mut active = active_turn.lock().await;
+        let Some(active_turn) = active.as_mut() else {
+            return false;
+        };
+        let Some(task) = active_turn.task.as_ref() else {
+            return false;
+        };
+        if task.kind != TaskKind::Regular || !task.task.accepts_monitor_input() {
+            return false;
+        }
+        let mut turn_state = active_turn.turn_state.lock().await;
+        if !turn_state.accepts_mailbox_delivery_for_current_turn() {
+            return false;
+        }
+        turn_state
+            .pending_input
+            .items
+            .push(TurnInput::ResponseItem(ResponseItemEnvelope::new(item)));
+        self.activity_tx.send_replace(InputQueueActivity::Steer);
+        true
     }
 
     pub(crate) async fn subscribe_activity(
@@ -277,6 +357,28 @@ impl InputQueue {
         turn_state.lock().await.pending_input.items.split_off(0)
     }
 
+    pub(crate) async fn take_pending_monitor_items_for_turn_state(
+        &self,
+        turn_state: &Mutex<TurnState>,
+    ) -> Vec<ResponseItem> {
+        let mut turn_state = turn_state.lock().await;
+        let pending_items = std::mem::take(&mut turn_state.pending_input.items);
+        let mut monitor_items = Vec::new();
+        let mut remaining_items = Vec::with_capacity(pending_items.len());
+        for item in pending_items {
+            match item {
+                TurnInput::ResponseItem(response_item)
+                    if MonitorNotification::is_response_item(&response_item.item) =>
+                {
+                    monitor_items.push(response_item.into_item());
+                }
+                item => remaining_items.push(item),
+            }
+        }
+        turn_state.pending_input.items = remaining_items;
+        monitor_items
+    }
+
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "active turn checks and turn state updates must remain atomic"
@@ -375,6 +477,8 @@ impl TurnInputQueue {
 mod tests {
     use super::*;
     use codex_history::CodexHarnessMetadata;
+    use crate::context::ContextualUserFragment;
+    use crate::context::MonitorNotification;
     use codex_protocol::AgentPath;
     use codex_protocol::user_input::UserInput;
     use pretty_assertions::assert_eq;
@@ -625,5 +729,91 @@ mod tests {
             )
             .await;
         assert!(input_queue.has_trigger_turn_mailbox_items().await);
+    }
+
+    #[tokio::test]
+    async fn monitor_wake_requests_are_coalesced_until_a_turn_claims_them() {
+        let input_queue = InputQueue::new();
+
+        input_queue.request_monitor_wake();
+        input_queue.request_monitor_wake();
+        assert!(input_queue.monitor_wake_requested());
+
+        assert!(input_queue.claim_monitor_wake());
+        assert!(!input_queue.monitor_wake_requested());
+        assert!(!input_queue.claim_monitor_wake());
+    }
+
+    #[tokio::test]
+    async fn monitor_wake_notification_waits_for_explicit_durable_wake() {
+        let input_queue = InputQueue::new();
+        input_queue.request_monitor_wake();
+
+        let mut notified = Box::pin(input_queue.monitor_wake_notified());
+        tokio::select! {
+            biased;
+            _ = &mut notified => panic!("a flag alone must not wake the submission loop"),
+            _ = tokio::task::yield_now() => {}
+        }
+
+        input_queue.notify_monitor_wake();
+        notified.await;
+    }
+
+    #[tokio::test]
+    async fn monitor_pending_items_can_be_recovered_before_turn_state_cleanup() {
+        let input_queue = InputQueue::new();
+        let turn_state = Mutex::new(TurnState::default());
+        let monitor_item = ContextualUserFragment::into(MonitorNotification {
+            process_id: 1,
+            seq: 1,
+            command: "watch".to_string(),
+            kind: "watcher",
+            terminal_state: None,
+            lines: vec!["output".to_string()],
+            omitted_lines: 0,
+            suppressed_notifications: 0,
+            note: None,
+        });
+        let ordinary_item = ResponseItem::Message {
+            id: None,
+            role: "developer".to_string(),
+            content: vec![codex_protocol::models::ContentItem::InputText {
+                text: "ordinary".to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        };
+        input_queue
+            .extend_pending_input_for_turn_state(
+                &turn_state,
+                vec![
+                    TurnInput::ResponseItem(monitor_item.clone().into()),
+                    TurnInput::ResponseItem(ordinary_item.into()),
+                ],
+            )
+            .await;
+
+        assert_eq!(
+            vec![monitor_item],
+            input_queue
+                .take_pending_monitor_items_for_turn_state(&turn_state)
+                .await
+        );
+        assert_eq!(
+            vec![TurnInput::ResponseItem(
+                ResponseItem::Message {
+                    id: None,
+                    role: "developer".to_string(),
+                    content: vec![codex_protocol::models::ContentItem::InputText {
+                        text: "ordinary".to_string(),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                }
+                .into(),
+            )],
+            input_queue.take_pending_input_for_turn_state(&turn_state).await
+        );
     }
 }

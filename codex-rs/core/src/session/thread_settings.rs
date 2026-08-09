@@ -90,6 +90,11 @@ pub(super) async fn apply_update(
     updates: SessionSettingsUpdate,
 ) -> ConstraintResult<()> {
     session.update_settings(updates).await?;
+    // A monitor wake may have been held back by Plan mode. The settings
+    // submission is serialized ahead of the internal wake, so retry it after
+    // any concurrent monitor delivery finishes.
+    let _monitor_delivery_guard = session.input_queue.lock_monitor_delivery().await;
+    session.input_queue.notify_monitor_wake();
     emit_applied(session, submission_id).await;
     Ok(())
 }

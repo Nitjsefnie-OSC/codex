@@ -48,6 +48,8 @@ use codex_core_plugins::PluginMetricsSidecar;
 mod async_watcher;
 mod errors;
 mod head_tail_buffer;
+mod monitor_watcher;
+mod monitors;
 mod process;
 mod process_manager;
 mod process_state;
@@ -57,6 +59,16 @@ pub(crate) fn set_deterministic_process_ids_for_tests(enabled: bool) {
 }
 
 pub(crate) use errors::UnifiedExecError;
+#[cfg(test)]
+pub(crate) use monitors::MAX_MONITOR_NOTIFICATIONS;
+pub use monitors::MonitorAcknowledgement;
+pub(crate) use monitors::MonitorAttachment;
+pub use monitors::MonitorInfo;
+pub use monitors::MonitorKind;
+pub use monitors::MonitorOutput;
+pub use monitors::MonitorOwner;
+pub use monitors::MonitorState;
+pub use monitors::MonitorWaitOutcome;
 pub(crate) use process::NoopSpawnLifecycle;
 #[cfg(unix)]
 pub(crate) use process::SpawnLifecycle;
@@ -147,6 +159,13 @@ impl ProcessStore {
 
 pub(crate) struct UnifiedExecProcessManager {
     process_store: Mutex<ProcessStore>,
+    /// Watcher metadata for the subset of `process_store` started as monitors.
+    /// Not a second process registry — see [`monitors`].
+    monitor_store: Mutex<monitors::MonitorStore>,
+    /// Serializes watcher registration with shutdown so a newly spawned
+    /// watcher cannot be missed by the shutdown join.
+    monitor_watcher_lifecycle_lock: Mutex<()>,
+    monitor_watcher_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     max_write_stdin_yield_time_ms: u64,
 }
 
@@ -154,6 +173,9 @@ impl UnifiedExecProcessManager {
     pub(crate) fn new(max_write_stdin_yield_time_ms: u64) -> Self {
         Self {
             process_store: Mutex::new(ProcessStore::default()),
+            monitor_store: Mutex::new(monitors::MonitorStore::default()),
+            monitor_watcher_lifecycle_lock: Mutex::new(()),
+            monitor_watcher_tasks: Mutex::new(Vec::new()),
             max_write_stdin_yield_time_ms: max_write_stdin_yield_time_ms
                 .max(MIN_EMPTY_YIELD_TIME_MS),
         }

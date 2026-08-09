@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "fork": {
+    "slug": "Nitjsefnie-OSC/codex",
+    "repository": "https://github.com/Nitjsefnie-OSC/codex",
+    "default_branch": "main"
+  },
+  "upstream": {
+    "slug": "openai/codex",
+    "repository": "https://github.com/openai/codex"
+  },
+  "release_channel": {
+    "provider": "github",
+    "latest_release_api_url": "https://api.github.com/repos/Nitjsefnie-OSC/codex/releases/latest",
+    "releases_page_url": "https://github.com/Nitjsefnie-OSC/codex/releases",
+    "tag_prefix": "fork-v",
+    "checksums_asset": "SHA256SUMS",
+    "package_manager_releases": false
+  },
+  "capabilities": [
+    {
+      "id": "tool.whoami",
+      "kind": "tool",
+      "name": "whoami",
+      "config_key": null,
+      "default_enabled": true,
+      "summary": "Reports the slug, display name, reasoning effort, and context window of the model executing the current turn, so self-identification does not come from training-data memory."
+    },
+    {
+      "id": "tool.monitor",
+      "kind": "tool",
+      "name": "monitor",
+      "config_key": "monitor_tool",
+      "default_enabled": true,
+      "summary": "Runs a long-lived command under the unified exec process manager and streams its output back to the model as batched, sequenced, acknowledgeable notifications, with start/list/read/stop/wait actions."
+    },
+    {
+      "id": "hook.stop_background_state",
+      "kind": "hook_field",
+      "name": "background",
+      "config_key": null,
+      "default_enabled": true,
+      "summary": "Stop and SubagentStop hook payloads carry a `background` object with live monitor and background-terminal state — what is still running, and how much delivered output was never read — so a hook can refuse to let a turn end on top of work it walked away from."
+    },
+    {
+      "id": "hook.skill_activations",
+      "kind": "hook_field",
+      "name": "skill_activations",
+      "config_key": null,
+      "default_enabled": true,
+      "summary": "PreToolUse and PostToolUse hook payloads carry `skill_activations` for the current turn, including each explicit or implicit activation's name, source path, scope, invocation kind, turn id, and content SHA-256."
+    }
+  ]
+}
