@@ -6,6 +6,7 @@ use crate::realtime_conversation::handle_text as handle_realtime_conversation_te
 use async_channel::Receiver;
 use codex_otel::set_parent_from_w3c_trace_context;
 use codex_protocol::protocol::Submission;
+use futures::future::BoxFuture;
 use tracing::Instrument;
 use tracing::debug_span;
 use tracing::info_span;
@@ -57,6 +58,7 @@ use codex_rmcp_client::ElicitationAction;
 use codex_rmcp_client::ElicitationResponse;
 use serde_json::Value;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tracing::debug;
 use tracing::info;
 use tracing::warn;
@@ -81,23 +83,26 @@ pub async fn realtime_conversation_list_voices(sess: &Session, sub_id: String) {
     .await;
 }
 
-pub async fn user_input_or_turn(
+pub fn user_input_or_turn(
     sess: &Arc<Session>,
     sub_id: String,
     op: Op,
     client_user_message_id: Option<String>,
     parent_turn_id: Option<String>,
-) {
-    let admission = user_input_or_turn_inner(
-        sess,
-        sub_id.clone(),
-        op,
-        client_user_message_id,
-        parent_turn_id,
-    )
-    .await;
-    sess.pending_user_message_admissions
-        .complete(&sub_id, admission);
+) -> BoxFuture<'static, ()> {
+    let sess = Arc::clone(sess);
+    Box::pin(async move {
+        let admission = user_input_or_turn_inner(
+            &sess,
+            sub_id.clone(),
+            op,
+            client_user_message_id,
+            parent_turn_id,
+        )
+        .await;
+        sess.pending_user_message_admissions
+            .complete(&sub_id, admission);
+    })
 }
 
 pub async fn update_thread_settings(
@@ -108,6 +113,11 @@ pub async fn update_thread_settings(
     let updates = thread_settings_update(sess, thread_settings).await;
     match sess.update_settings(updates).await {
         Ok(()) => {
+            // A monitor wake may have been held back by Plan mode. The
+            // settings submission is already serialized ahead of the internal
+            // wake, so retry it after any concurrent delivery has finished.
+            let _monitor_delivery_guard = sess.input_queue.lock_monitor_delivery().await;
+            sess.input_queue.notify_monitor_wake();
             sess.send_event_raw_without_materializing_rollout(Event {
                 id: sub_id,
                 msg: thread_settings_applied_event(sess).await,
@@ -585,6 +595,11 @@ pub async fn set_thread_memory_mode(sess: &Arc<Session>, sub_id: String, mode: T
 }
 
 async fn shutdown_session_runtime(sess: &Arc<Session>) {
+    {
+        let _turn_start_guard = sess.input_queue.lock_turn_start().await;
+        sess.shutdown_started
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
     if let Some(startup_prewarm) = sess.take_session_startup_prewarm().await {
         startup_prewarm.abort().await;
     }
@@ -710,11 +725,56 @@ pub(super) async fn submission_loop(
 ) {
     // To break out of this loop, send Op::Shutdown.
     let mut shutdown_received = false;
-    while let Ok(sub) = rx_sub.recv().await {
+    loop {
+        let sub = tokio::select! {
+            biased;
+            sub = rx_sub.recv() => match sub {
+                Ok(sub) => sub,
+                Err(_) => break,
+            },
+            _ = sess.input_queue.monitor_wake_notified(),
+                if !sess.shutdown_started.load(Ordering::Acquire) =>
+            {
+                sess.maybe_start_monitor_turn_if_idle().await;
+                continue;
+            }
+        };
         debug!(?sub, "Submission");
         let dispatch_span = submission_dispatch_span(&sub);
-        let should_exit = async {
-            match sub.op.clone() {
+        let should_exit = dispatch_submission(
+            Arc::clone(&sess),
+            Arc::clone(&config),
+            sub,
+            dispatch_span,
+        )
+        .await;
+        if should_exit {
+            shutdown_received = true;
+            break;
+        }
+    }
+    // If the submission loop exits because the channel closed without an
+    // explicit shutdown op, still run session teardown.
+    if !shutdown_received {
+        shutdown_session_runtime(&sess).await;
+        emit_thread_stop_lifecycle(sess.as_ref()).await;
+        if let Some(live_thread) = sess.live_thread()
+            && let Err(err) = live_thread.shutdown().await
+        {
+            warn!("failed to shutdown thread persistence after submission channel closed: {err}");
+        }
+    }
+    debug!("Agent loop exited");
+}
+
+fn dispatch_submission(
+    sess: Arc<Session>,
+    config: Arc<Config>,
+    sub: Submission,
+    dispatch_span: tracing::Span,
+) -> BoxFuture<'static, bool> {
+    let dispatch: BoxFuture<'static, bool> = Box::pin(async move {
+        match sub.op.clone() {
                 Op::Interrupt => {
                     interrupt(&sess).await;
                     false
@@ -852,27 +912,9 @@ pub(super) async fn submission_loop(
                     false
                 }
                 _ => false, // Ignore unknown ops; enum is non_exhaustive to allow extensions.
-            }
         }
-        .instrument(dispatch_span)
-        .await;
-        if should_exit {
-            shutdown_received = true;
-            break;
-        }
-    }
-    // If the submission loop exits because the channel closed without an
-    // explicit shutdown op, still run session teardown.
-    if !shutdown_received {
-        shutdown_session_runtime(&sess).await;
-        emit_thread_stop_lifecycle(sess.as_ref()).await;
-        if let Some(live_thread) = sess.live_thread()
-            && let Err(err) = live_thread.shutdown().await
-        {
-            warn!("failed to shutdown thread persistence after submission channel closed: {err}");
-        }
-    }
-    debug!("Agent loop exited");
+    });
+    Box::pin(dispatch.instrument(dispatch_span))
 }
 
 async fn approve_guardian_denied_action(sess: &Arc<Session>, event: GuardianAssessmentEvent) {

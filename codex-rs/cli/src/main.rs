@@ -217,6 +217,21 @@ enum Subcommand {
 
     /// Inspect feature flags.
     Features(FeaturesCli),
+
+    /// Print this fork's identity, capabilities, and build commit.
+    #[clap(name = "fork-manifest")]
+    ForkManifest(ForkManifestCommand),
+}
+
+#[derive(Debug, Parser)]
+struct ForkManifestCommand {
+    /// Print only the commit this binary was built from.
+    #[clap(long, conflicts_with = "capabilities")]
+    commit: bool,
+
+    /// Print only the declared capability ids, one per line.
+    #[clap(long, conflicts_with = "commit")]
+    capabilities: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -834,8 +849,17 @@ fn run_update_command() -> anyhow::Result<()> {
     #[cfg(not(debug_assertions))]
     {
         let Some(action) = codex_tui::get_update_action() else {
+            // Either the installation method is unknown, or it is one whose
+            // upgrade would install an upstream build over this fork one. Both
+            // land the user in the same place: the fork's own releases.
             anyhow::bail!(
-                "Could not detect the Codex installation method. Please update manually: https://developers.openai.com/codex/cli/"
+                "No in-place update path for this installation. Download a build from {}, and verify it against the {} published alongside it.",
+                codex_fork_manifest::manifest()
+                    .release_channel
+                    .releases_page_url,
+                codex_fork_manifest::manifest()
+                    .release_channel
+                    .checksums_asset,
             );
         };
         run_update_action(action)
@@ -1644,6 +1668,14 @@ async fn cli_main(
             run_exec_server_command(cmd, &arg0_paths, &root_config_overrides, strict_config)
                 .await?;
         }
+        Some(Subcommand::ForkManifest(fork_manifest_cli)) => {
+            reject_remote_mode_for_subcommand(
+                root_remote.as_deref(),
+                root_remote_auth_token_env.as_deref(),
+                "fork-manifest",
+            )?;
+            print_fork_manifest(fork_manifest_cli);
+        }
         Some(Subcommand::Features(FeaturesCli { sub })) => match sub {
             FeaturesSubcommand::List => {
                 reject_remote_mode_for_subcommand(
@@ -2272,6 +2304,22 @@ fn unsupported_subcommand_name_for_strict_config(
         Some(Subcommand::ResponsesApiProxy(_)) => Some("responses-api-proxy"),
         Some(Subcommand::StdioToUds(_)) => Some("stdio-to-uds"),
         Some(Subcommand::Features(_)) => Some("features"),
+        Some(Subcommand::ForkManifest(_)) => Some("fork-manifest"),
+    }
+}
+
+/// Prints the fork manifest. `--commit` and `--capabilities` exist so a shell
+/// caller does not need a JSON parser for the two things it usually wants.
+fn print_fork_manifest(command: ForkManifestCommand) {
+    let manifest = codex_fork_manifest::manifest();
+    if command.commit {
+        println!("{}", manifest.build.commit);
+    } else if command.capabilities {
+        for capability in &manifest.capabilities {
+            println!("{}", capability.id);
+        }
+    } else {
+        println!("{}", codex_fork_manifest::manifest_json());
     }
 }
 

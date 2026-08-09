@@ -7,11 +7,18 @@ use codex_analytics::TrackEventsContext;
 use codex_analytics::build_track_events_context;
 use codex_extension_api::SkillInvocationInput;
 use codex_extension_api::SkillInvocationKind;
+use codex_hooks::SkillActivation;
+use codex_hooks::SkillActivationKind;
+use codex_hooks::SkillActivationScope;
 use codex_otel::sanitize_metric_tag_value;
 use codex_protocol::protocol::SkillScope;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_plugins::PluginSkillRoot;
+use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::Mutex as StdMutex;
+use std::sync::PoisonError;
 use tokio::sync::Mutex;
 
 pub use codex_skills::SkillError;
@@ -22,11 +29,92 @@ pub use codex_skills::collect_explicit_skill_mentions;
 pub use codex_skills::detect_implicit_skill_invocation_for_command;
 pub use codex_skills_extension::HostSkillsLoadInput;
 pub use codex_skills_extension::HostSkillsService;
+use codex_skills_extension::InjectedHostSkill;
 pub use codex_skills_extension::SkillLoadOutcome;
 pub use codex_skills_extension::bundled_skills_enabled_from_stack;
 
 #[derive(Debug, Default)]
 struct ImplicitSkillInvocations(Mutex<HashSet<String>>);
+
+#[derive(Debug, Default)]
+struct SkillActivations(StdMutex<SkillActivationState>);
+
+#[derive(Debug, Default)]
+struct SkillActivationState {
+    active: BTreeSet<SkillActivation>,
+    pending_by_process_id: HashMap<i32, SkillActivation>,
+}
+
+pub(crate) fn record_skill_activation(turn_context: &TurnContext, activation: SkillActivation) {
+    skill_activation_state(turn_context)
+        .lock()
+        .active
+        .insert(activation);
+}
+
+pub(crate) fn skill_activation_snapshot(turn_context: &TurnContext) -> Vec<SkillActivation> {
+    skill_activation_state(turn_context)
+        .lock()
+        .active
+        .iter()
+        .cloned()
+        .collect()
+}
+
+pub(crate) fn retain_pending_skill_activation(
+    turn_context: &TurnContext,
+    process_id: i32,
+    activation: SkillActivation,
+) {
+    skill_activation_state(turn_context)
+        .lock()
+        .pending_by_process_id
+        .insert(process_id, activation);
+}
+
+pub(crate) fn promote_pending_skill_activation(
+    turn_context: &TurnContext,
+    process_id: i32,
+) -> bool {
+    let state = skill_activation_state(turn_context);
+    let mut state = state.lock();
+    let Some(activation) = state.pending_by_process_id.remove(&process_id) else {
+        return false;
+    };
+    state.active.insert(activation);
+    true
+}
+
+pub(crate) fn discard_pending_skill_activation(
+    turn_context: &TurnContext,
+    process_id: i32,
+) -> bool {
+    skill_activation_state(turn_context)
+        .lock()
+        .pending_by_process_id
+        .remove(&process_id)
+        .is_some()
+}
+
+#[cfg(test)]
+pub(crate) fn has_pending_skill_activation(turn_context: &TurnContext, process_id: i32) -> bool {
+    skill_activation_state(turn_context)
+        .lock()
+        .pending_by_process_id
+        .contains_key(&process_id)
+}
+
+fn skill_activation_state(turn_context: &TurnContext) -> std::sync::Arc<SkillActivations> {
+    turn_context
+        .extension_data
+        .get_or_init(SkillActivations::default)
+}
+
+impl SkillActivations {
+    fn lock(&self) -> std::sync::MutexGuard<'_, SkillActivationState> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 pub(crate) fn skills_load_input_from_config(
     config: &Config,
@@ -44,12 +132,12 @@ pub(crate) fn emit_explicit_skill_invocations(
     sess: &Session,
     turn_context: &TurnContext,
     mentioned_skills: &[SkillMetadata],
-    injected_skills: &[SkillMetadata],
+    injected_skills: &[InjectedHostSkill],
     tracking: TrackEventsContext,
 ) {
     let injected_skill_paths = injected_skills
         .iter()
-        .map(|skill| &skill.path_to_skills_md)
+        .map(|injected| &injected.skill.path_to_skills_md)
         .collect::<HashSet<_>>();
     for skill in mentioned_skills {
         let skill_name_tag = sanitize_metric_tag_value(skill.name.as_str());
@@ -71,12 +159,12 @@ pub(crate) fn emit_explicit_skill_invocations(
 
     let invocations = injected_skills
         .iter()
-        .map(|skill| SkillInvocation {
-            skill_name: skill.name.clone(),
-            skill_scope: skill.scope,
-            skill_path: skill.path_to_skills_md.to_path_buf(),
-            plugin_id: skill.plugin_id.clone(),
-            remote_plugin_id: skill.remote_plugin_id.clone(),
+        .map(|injected| SkillInvocation {
+            skill_name: injected.skill.name.clone(),
+            skill_scope: injected.skill.scope,
+            skill_path: injected.skill.path_to_skills_md.to_path_buf(),
+            plugin_id: injected.skill.plugin_id.clone(),
+            remote_plugin_id: injected.skill.remote_plugin_id.clone(),
             invocation_type: InvocationType::Explicit,
         })
         .collect();
@@ -85,19 +173,69 @@ pub(crate) fn emit_explicit_skill_invocations(
         .track_skill_invocations(tracking, invocations);
 }
 
-pub(crate) async fn maybe_emit_implicit_skill_invocation(
+pub(crate) async fn prepare_implicit_skill_activation(
     sess: &Session,
     turn_context: &TurnContext,
     command: &str,
     workdir: &AbsolutePathBuf,
-) {
+) -> Option<SkillActivation> {
     let Some(candidate) = detect_implicit_skill_invocation_for_command(
         turn_context.skills_snapshot().outcome(),
         command,
         workdir,
     ) else {
-        return;
+        return None;
     };
+
+    // Candidate creation is intentionally independent of analytics deduplication. A later read of
+    // an edited SKILL.md must produce its new digest even when this skill's invocation telemetry
+    // was already emitted for the turn.
+    let activation = build_implicit_skill_activation(turn_context, &candidate).await;
+    emit_implicit_skill_invocation(sess, turn_context, candidate).await;
+    activation
+}
+
+pub(crate) async fn maybe_emit_implicit_skill_invocation(
+    sess: &Session,
+    turn_context: &TurnContext,
+    command: &str,
+    workdir: &AbsolutePathBuf,
+) -> Option<SkillActivation> {
+    prepare_implicit_skill_activation(sess, turn_context, command, workdir).await
+}
+
+async fn build_implicit_skill_activation(
+    turn_context: &TurnContext,
+    candidate: &SkillMetadata,
+) -> Option<SkillActivation> {
+    let contents = turn_context
+        .skills_snapshot()
+        .outcome()
+        .read_skill_text(candidate)
+        .await
+        .ok()?;
+    let scope = match candidate.scope {
+        SkillScope::User => SkillActivationScope::User,
+        SkillScope::Repo => SkillActivationScope::Repo,
+        SkillScope::System => SkillActivationScope::System,
+        SkillScope::Admin => SkillActivationScope::Admin,
+    };
+    SkillActivation::new(
+        candidate.name.clone(),
+        candidate.path_to_skills_md.to_string_lossy().into_owned(),
+        scope,
+        SkillActivationKind::Implicit,
+        turn_context.sub_id.clone(),
+        codex_skills_extension::sha256_hex(&contents),
+    )
+    .ok()
+}
+
+async fn emit_implicit_skill_invocation(
+    sess: &Session,
+    turn_context: &TurnContext,
+    candidate: SkillMetadata,
+) {
     let invocation = SkillInvocation {
         skill_name: candidate.name,
         skill_scope: candidate.scope,
@@ -161,3 +299,7 @@ pub(crate) async fn maybe_emit_implicit_skill_invocation(
             vec![invocation],
         );
 }
+
+#[cfg(test)]
+#[path = "skills_tests.rs"]
+pub(crate) mod tests;

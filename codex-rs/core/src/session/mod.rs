@@ -3199,6 +3199,9 @@ impl Session {
         .await??;
         Ok(Arc::new(StepContext {
             turn: turn_context,
+            response_identity: Arc::new(
+                crate::session::step_context::ResponseIdentityState::default(),
+            ),
             environments,
             selected_capability_roots,
             executor_capability_discovery,
@@ -4044,10 +4047,10 @@ impl Session {
         let Some(active_task) = active_turn.task.as_ref() else {
             return Err(SteerInputError::NoActiveTurn(input));
         };
-        let active_turn_id = &active_task.turn_context.sub_id;
+        let active_turn_id = active_task.turn_context.sub_id.clone();
 
         if let Some(expected_turn_id) = expected_turn_id
-            && expected_turn_id != active_turn_id
+            && expected_turn_id != active_turn_id.as_str()
         {
             return Err(SteerInputError::ExpectedTurnMismatch {
                 expected: expected_turn_id.to_string(),
@@ -4102,9 +4105,9 @@ impl Session {
             .await;
         if let Some(client_id) = client_user_message_id.as_deref() {
             self.pending_user_message_admissions
-                .associate_steered_by_client_id(client_id, active_turn_id);
+                .associate_steered_by_client_id(client_id, &active_turn_id);
         }
-        Ok(active_turn_id.clone())
+        Ok(active_turn_id)
     }
 
     pub(crate) async fn record_memory_citation_for_turn(&self, sub_id: &str) {
