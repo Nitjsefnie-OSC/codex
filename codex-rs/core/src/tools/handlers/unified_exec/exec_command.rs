@@ -3,6 +3,9 @@ use std::sync::Arc;
 
 use crate::function_tool::FunctionCallError;
 use crate::maybe_emit_implicit_skill_invocation;
+use crate::session::turn_context::TurnContext;
+use crate::skills::record_skill_activation;
+use crate::skills::retain_pending_skill_activation;
 use crate::tools::context::ExecCommandToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
@@ -28,6 +31,7 @@ use crate::unified_exec::UnifiedExecError;
 use crate::unified_exec::UnifiedExecProcessManager;
 use crate::unified_exec::generate_chunk_id;
 use codex_features::Feature;
+use codex_hooks::SkillActivation;
 use codex_otel::SessionTelemetry;
 use codex_otel::TOOL_CALL_UNIFIED_EXEC_METRIC;
 use codex_sandboxing::SandboxManager;
@@ -191,7 +195,7 @@ impl ExecCommandHandler {
         let sandbox_permissions =
             resolve_sandbox_permissions(args.sandbox_permissions, args.justification.as_deref())?;
         let hook_command = args.cmd.clone();
-        maybe_emit_implicit_skill_invocation(
+        let implicit_skill_activation = maybe_emit_implicit_skill_invocation(
             session.as_ref(),
             context.step_context.turn.as_ref(),
             &hook_command,
@@ -346,7 +350,7 @@ impl ExecCommandHandler {
         }
 
         emit_unified_exec_tty_metric(&turn.session_telemetry, tty);
-        match manager
+        let result = manager
             .exec_command(
                 ExecCommandRequest {
                     command,
@@ -370,8 +374,13 @@ impl ExecCommandHandler {
                 },
                 &context,
             )
-            .await
-        {
+            .await;
+        settle_unified_exec_implicit_skill_activation(
+            context.turn.as_ref(),
+            implicit_skill_activation,
+            result.as_ref(),
+        );
+        match result {
             Ok(response) => Ok(boxed_tool_output(response)),
             Err(UnifiedExecError::SandboxDenied {
                 output,
@@ -402,6 +411,21 @@ impl ExecCommandHandler {
                 "exec_command failed for `{command_for_display}`: {err:?}"
             ))),
         }
+    }
+}
+
+fn settle_unified_exec_implicit_skill_activation(
+    turn: &TurnContext,
+    candidate: Option<SkillActivation>,
+    result: Result<&ExecCommandToolOutput, &UnifiedExecError>,
+) {
+    let (Some(candidate), Ok(response)) = (candidate, result) else {
+        return;
+    };
+    if let Some(process_id) = response.process_id {
+        retain_pending_skill_activation(turn, process_id, candidate);
+    } else if response.exit_code == Some(0) {
+        record_skill_activation(turn, candidate);
     }
 }
 
@@ -459,4 +483,247 @@ fn emit_unified_exec_tty_metric(session_telemetry: &SessionTelemetry, tty: bool)
         /*inc*/ 1,
         &[("tty", if tty { "true" } else { "false" })],
     );
+}
+
+#[cfg(test)]
+mod implicit_activation_tests {
+    use std::sync::Arc;
+
+    use codex_hooks::SkillActivation;
+    use codex_hooks::SkillActivationKind;
+    use codex_hooks::SkillActivationScope;
+    use codex_protocol::exec_output::ExecToolCallOutput;
+    use codex_protocol::models::PermissionProfile;
+    use codex_utils_output_truncation::TruncationPolicy;
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+    use tokio::sync::Mutex;
+
+    use super::*;
+    use crate::session::step_context::StepContext;
+    use crate::session::tests::make_session_and_context;
+    use crate::skills::promote_pending_skill_activation;
+    use crate::skills::skill_activation_snapshot;
+    use crate::skills::tests::assert_implicit_skill_candidate;
+    use crate::skills::tests::configure_implicit_skill_fixture_for_exec;
+    use crate::skills::tests::implicit_skill_fixture;
+    use crate::skills::tests::quote_skill_test_path;
+    use crate::tools::context::ToolCallSource;
+    use crate::turn_diff_tracker::TurnDiffTracker;
+
+    fn activation(name: &str, digest: char) -> SkillActivation {
+        SkillActivation::new(
+            name.to_string(),
+            format!("/repo/{name}/SKILL.md"),
+            SkillActivationScope::Repo,
+            SkillActivationKind::Implicit,
+            "turn-1".to_string(),
+            digest.to_string().repeat(64),
+        )
+        .expect("valid activation")
+    }
+
+    fn response(process_id: Option<i32>, exit_code: Option<i32>) -> ExecCommandToolOutput {
+        ExecCommandToolOutput {
+            event_call_id: "call-1".to_string(),
+            chunk_id: "chunk-1".to_string(),
+            wall_time: std::time::Duration::ZERO,
+            raw_output: Vec::new(),
+            truncation_policy: TruncationPolicy::Tokens(10_000),
+            max_output_tokens: None,
+            process_id,
+            exit_code,
+            original_token_count: None,
+            output_omitted_bytes: None,
+            hook_command: Some("cat SKILL.md".to_string()),
+        }
+    }
+
+    fn invocation(
+        session: Arc<crate::session::session::Session>,
+        turn: Arc<TurnContext>,
+        arguments: serde_json::Value,
+        call_id: &str,
+    ) -> ToolInvocation {
+        ToolInvocation {
+            session,
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn,
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: call_id.to_string(),
+            tool_name: ToolName::plain("exec_command"),
+            source: ToolCallSource::Direct,
+            payload: ToolPayload::Function {
+                arguments: arguments.to_string(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn unified_exec_implicit_skill_activation_actual_nonzero_does_not_record() {
+        let mut fixture = implicit_skill_fixture(codex_protocol::protocol::SkillScope::Repo).await;
+        configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::Disabled);
+        let command = format!(
+            "cat {} ; exit 7",
+            quote_skill_test_path(&fixture.skill_path)
+        );
+        assert_implicit_skill_candidate(&fixture, &command).await;
+        let turn = Arc::new(fixture.turn);
+
+        ExecCommandHandler::default()
+            .handle(invocation(
+                Arc::new(fixture.session),
+                Arc::clone(&turn),
+                json!({ "cmd": command }),
+                "failed-skill-read",
+            ))
+            .await
+            .expect("nonzero command should return structured output");
+
+        assert_eq!(skill_activation_snapshot(&turn), Vec::new());
+    }
+
+    #[tokio::test]
+    async fn unified_exec_implicit_skill_activation_actual_rewritten_terminal_zero_records() {
+        let mut fixture = implicit_skill_fixture(codex_protocol::protocol::SkillScope::Admin).await;
+        configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::Disabled);
+        let rewritten_command = format!("cat {}", quote_skill_test_path(&fixture.skill_path));
+        let turn = Arc::new(fixture.turn);
+        let handler = ExecCommandHandler::default();
+        let original = invocation(
+            Arc::new(fixture.session),
+            Arc::clone(&turn),
+            json!({ "cmd": "exit 99" }),
+            "rewritten-skill-read",
+        );
+        let rewritten = handler
+            .with_updated_hook_input(original, json!({ "command": rewritten_command }))
+            .expect("rewrite exec_command input");
+
+        handler
+            .handle(rewritten)
+            .await
+            .expect("rewritten command should execute successfully");
+
+        let activations = skill_activation_snapshot(&turn);
+        assert_eq!(activations.len(), 1);
+        assert_eq!(activations[0].name(), "audit-skill");
+        assert_eq!(activations[0].scope(), SkillActivationScope::Admin);
+    }
+
+    #[tokio::test]
+    async fn unified_exec_implicit_skill_activation_actual_escalation_rejection_does_not_record() {
+        let mut fixture =
+            implicit_skill_fixture(codex_protocol::protocol::SkillScope::System).await;
+        configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::Disabled);
+        let command = format!("cat {}", quote_skill_test_path(&fixture.skill_path));
+        assert_implicit_skill_candidate(&fixture, &command).await;
+        let turn = Arc::new(fixture.turn);
+
+        let Err(error) = ExecCommandHandler::default()
+            .handle(invocation(
+                Arc::new(fixture.session),
+                Arc::clone(&turn),
+                json!({
+                    "cmd": command,
+                    "sandbox_permissions": "require_escalated",
+                    "justification": "exercise approval rejection"
+                }),
+                "denied-skill-read",
+            ))
+            .await
+        else {
+            panic!("Never policy must reject explicit escalation");
+        };
+
+        assert!(error.to_string().contains("approval policy is Never"));
+        assert_eq!(skill_activation_snapshot(&turn), Vec::new());
+    }
+
+    #[tokio::test]
+    async fn unified_exec_implicit_skill_activation_actual_sandbox_denial_does_not_record() {
+        let mut fixture = implicit_skill_fixture(codex_protocol::protocol::SkillScope::Repo).await;
+        configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::read_only());
+        let denied_path = fixture.workdir.join("sandbox-denied.txt");
+        let command = format!(
+            "cat {} ; echo denied > {}",
+            quote_skill_test_path(&fixture.skill_path),
+            quote_skill_test_path(&denied_path)
+        );
+        assert_implicit_skill_candidate(&fixture, &command).await;
+        let turn = Arc::new(fixture.turn);
+
+        let result = ExecCommandHandler::default()
+            .handle(invocation(
+                Arc::new(fixture.session),
+                Arc::clone(&turn),
+                json!({ "cmd": command }),
+                "sandbox-denied-skill-read",
+            ))
+            .await;
+        let denial = match result {
+            Ok(output) => output.log_preview(),
+            Err(error) => error.to_string(),
+        }
+        .to_ascii_lowercase();
+
+        assert!(
+            denial.contains("permission denied")
+                || denial.contains("operation not permitted")
+                || denial.contains("read-only file system")
+                || denial.contains("sandbox")
+                || denial.contains("landlocksandboxexecutablenotprovided"),
+            "unexpected sandbox-denial output: {denial}"
+        );
+        assert!(!denied_path.exists());
+        assert_eq!(skill_activation_snapshot(&turn), Vec::new());
+    }
+
+    #[tokio::test]
+    async fn unified_exec_implicit_skill_activation_records_terminal_zero_and_hides_yielded() {
+        let (_session, turn) = make_session_and_context().await;
+        let terminal = activation("terminal", 'a');
+        settle_unified_exec_implicit_skill_activation(
+            &turn,
+            Some(terminal.clone()),
+            Ok(&response(None, Some(0))),
+        );
+        assert_eq!(skill_activation_snapshot(&turn), vec![terminal.clone()]);
+
+        let yielded = activation("yielded", 'b');
+        settle_unified_exec_implicit_skill_activation(
+            &turn,
+            Some(yielded.clone()),
+            Ok(&response(Some(31), Some(0))),
+        );
+        assert_eq!(skill_activation_snapshot(&turn).len(), 1);
+        assert!(promote_pending_skill_activation(&turn, 31));
+        assert_eq!(skill_activation_snapshot(&turn), vec![terminal, yielded]);
+    }
+
+    #[tokio::test]
+    async fn unified_exec_implicit_skill_activation_drops_nonzero_missing_exit_and_sandbox_denial()
+    {
+        let (_session, turn) = make_session_and_context().await;
+        settle_unified_exec_implicit_skill_activation(
+            &turn,
+            Some(activation("nonzero", 'a')),
+            Ok(&response(None, Some(7))),
+        );
+        settle_unified_exec_implicit_skill_activation(
+            &turn,
+            Some(activation("unknown", 'b')),
+            Ok(&response(None, None)),
+        );
+        let denied =
+            UnifiedExecError::sandbox_denied("denied".to_string(), ExecToolCallOutput::default());
+        settle_unified_exec_implicit_skill_activation(
+            &turn,
+            Some(activation("denied", 'c')),
+            Err(&denied),
+        );
+
+        assert_eq!(skill_activation_snapshot(&turn), Vec::new());
+    }
 }

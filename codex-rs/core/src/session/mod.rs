@@ -3182,6 +3182,9 @@ impl Session {
         .await??;
         Ok(Arc::new(StepContext {
             turn: turn_context,
+            response_identity: Arc::new(
+                crate::session::step_context::ResponseIdentityState::default(),
+            ),
             environments,
             selected_capability_roots,
             executor_capability_discovery,
@@ -4034,10 +4037,10 @@ impl Session {
         let Some(active_task) = active_turn.task.as_ref() else {
             return Err(SteerInputError::NoActiveTurn(input));
         };
-        let active_turn_id = &active_task.turn_context.sub_id;
+        let active_turn_id = active_task.turn_context.sub_id.clone();
 
         if let Some(expected_turn_id) = expected_turn_id
-            && expected_turn_id != active_turn_id
+            && expected_turn_id != active_turn_id.as_str()
         {
             return Err(SteerInputError::ExpectedTurnMismatch {
                 expected: expected_turn_id.to_string(),

@@ -70,7 +70,9 @@ pub fn spawn_response_stream(
     let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent, ApiError>>(1600);
     tokio::spawn(async move {
         if let Some(model) = server_model {
-            let _ = tx_event.send(Ok(ResponseEvent::ServerModel(model))).await;
+            let _ = tx_event
+                .send(Ok(ResponseEvent::ServerModel(model)))
+                .await;
         }
         for snapshot in rate_limit_snapshots {
             let _ = tx_event.send(Ok(ResponseEvent::RateLimits(snapshot))).await;
@@ -190,25 +192,37 @@ impl ResponsesStreamEvent {
         &self.kind
     }
 
-    /// Returns the effective model reported by the server, if present.
+    /// Returns the response-scoped model reported by the server, if present.
     ///
-    /// Precedence:
-    /// 1. `response.headers` for standard Responses stream events.
-    /// 2. top-level `headers` for websocket metadata events.
+    /// A model in transport headers is deliberately excluded: headers may
+    /// describe a connection or transport rather than this response, so they
+    /// must never be used as model identity attestation.
     pub fn response_model(&self) -> Option<String> {
-        let response_headers_model = self
+        let response_model = self
             .response
             .as_ref()
-            .and_then(|response| response.get("headers"))
-            .and_then(header_openai_model_value_from_json);
+            .and_then(|response| response.get("model"))
+            .and_then(json_value_as_string);
 
-        match response_headers_model {
-            Some(model) => Some(model),
-            None => self
-                .headers
-                .as_ref()
-                .and_then(header_openai_model_value_from_json),
-        }
+        response_model
+    }
+
+    /// Returns model metadata carried by response or event headers.
+    ///
+    /// This is intentionally separate from [`Self::response_model`]. SSE
+    /// callers treat these per-response headers as authoritative, while the
+    /// WebSocket caller classifies them as unverified because its top-level
+    /// headers can describe the connection handshake.
+    pub(crate) fn header_model(&self) -> Option<String> {
+        self.response
+            .as_ref()
+            .and_then(|response| response.get("headers"))
+            .and_then(header_openai_model_value_from_json)
+            .or_else(|| {
+                self.headers
+                    .as_ref()
+                    .and_then(header_openai_model_value_from_json)
+            })
     }
 
     pub(crate) fn turn_state(&self) -> Option<String> {
@@ -587,7 +601,7 @@ async fn process_sse_with_treatment(
         let turn_moderation_metadata = event.turn_moderation_metadata();
         let safety_buffering = event.safety_buffering(&safety_buffering_treatment);
 
-        if let Some(model) = event.response_model()
+        if let Some(model) = event.response_model().or_else(|| event.header_model())
             && last_server_model.as_deref() != Some(model.as_str())
         {
             if tx_event
@@ -1360,7 +1374,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_sse_ignores_response_model_field_in_payload() {
+    async fn process_sse_emits_response_model_as_verified_identity() {
         let events = run_sse(vec![
             json!({
                 "type": "response.created",
@@ -1379,10 +1393,14 @@ mod tests {
         ])
         .await;
 
-        assert_eq!(events.len(), 2);
-        assert_matches!(&events[0], ResponseEvent::Created);
+        assert_eq!(events.len(), 3);
         assert_matches!(
-            &events[1],
+            &events[0],
+            ResponseEvent::ServerModel(model) if model == CYBER_RESTRICTED_MODEL_FOR_TESTS
+        );
+        assert_matches!(&events[1], ResponseEvent::Created);
+        assert_matches!(
+            &events[2],
             ResponseEvent::Completed {
                 response_id,
                 token_usage: None,
@@ -1721,7 +1739,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_stream_event_response_model_reads_top_level_headers() {
+    fn responses_stream_event_response_model_ignores_transport_headers() {
         let ev: ResponsesStreamEvent = serde_json::from_value(json!({
             "type": "response.metadata",
             "headers": {
@@ -1730,14 +1748,12 @@ mod tests {
         }))
         .expect("expected event to deserialize");
 
-        assert_eq!(
-            ev.response_model().as_deref(),
-            Some(CYBER_RESTRICTED_MODEL_FOR_TESTS)
-        );
+        assert_eq!(ev.response_model(), None);
+        assert_eq!(ev.header_model().as_deref(), Some(CYBER_RESTRICTED_MODEL_FOR_TESTS));
     }
 
     #[test]
-    fn responses_stream_event_response_model_prefers_response_headers() {
+    fn responses_stream_event_response_model_reads_response_model_only() {
         let ev: ResponsesStreamEvent = serde_json::from_value(json!({
             "type": "response.created",
             "headers": {
@@ -1745,6 +1761,7 @@ mod tests {
             },
             "response": {
                 "id": "resp-1",
+                "model": "response-model",
                 "headers": {
                     "openai-model": CYBER_RESTRICTED_MODEL_FOR_TESTS
                 }
@@ -1754,8 +1771,9 @@ mod tests {
 
         assert_eq!(
             ev.response_model().as_deref(),
-            Some(CYBER_RESTRICTED_MODEL_FOR_TESTS)
+            Some("response-model")
         );
+        assert_eq!(ev.header_model().as_deref(), Some(CYBER_RESTRICTED_MODEL_FOR_TESTS));
     }
 
     #[test]

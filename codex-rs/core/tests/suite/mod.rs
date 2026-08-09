@@ -86,6 +86,8 @@ mod mcp_startup_refresh_http_proxy;
 mod mcp_tool_cache;
 mod mcp_tool_exposure;
 mod mcp_turn_metadata;
+#[cfg(unix)]
+mod monitor;
 mod model_overrides;
 mod model_runtime_selectors;
 mod model_switching;
@@ -161,6 +163,7 @@ mod view_image;
 mod web_search;
 mod websocket_fallback;
 mod window_headers;
+mod whoami;
 #[cfg(target_os = "windows")]
 mod windows_sandbox;
 mod workspace_roots;
