@@ -96,6 +96,13 @@ impl ChatWidget {
         {
             return;
         }
+        // Fold the fork setting into the server's own visibility bit rather than
+        // returning early: the established `false` branch is what dismisses a
+        // stale popup, clears the active record, and restores the reasoning
+        // status header. Suppression is local presentation only — the same
+        // request keeps waiting on the same model, and nothing here retries,
+        // cancels, or changes the server-side safeguard.
+        let show_buffering_ui = show_buffering_ui && self.config.tui_show_safety_buffering_ui;
         if !show_buffering_ui {
             if self
                 .safety_buffering

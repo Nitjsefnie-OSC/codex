@@ -391,7 +391,7 @@ impl ExecCommandHandler {
             )
             .await;
         settle_unified_exec_implicit_skill_activation(
-            context.turn.as_ref(),
+            context.step_context.turn.as_ref(),
             implicit_skill_activation,
             result.as_ref(),
         );
