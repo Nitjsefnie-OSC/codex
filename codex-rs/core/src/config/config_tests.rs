@@ -11047,6 +11047,36 @@ enabled = true
     Ok(())
 }
 
+#[tokio::test]
+async fn explicitly_disabled_multi_agent_v2_overrides_model_catalog_v2() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    std::fs::write(
+        codex_home.path().join(CONFIG_TOML_FILE),
+        r#"[features.multi_agent_v2]
+enabled = true
+"#,
+    )?;
+
+    let config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .cli_overrides(vec![(
+            "features.multi_agent_v2".to_string(),
+            toml::Value::Boolean(false),
+        )])
+        .build()
+        .await?;
+
+    assert!(!config.features.enabled(Feature::MultiAgentV2));
+    assert!(!config.multi_agent_v2.allow_model_catalog_v2);
+    assert_eq!(
+        config.multi_agent_version_for_model(Some(MultiAgentVersion::V2)),
+        MultiAgentVersion::V1,
+    );
+
+    Ok(())
+}
+
 #[test]
 fn multi_agent_v2_default_usage_hints_use_configured_thread_cap() {
     let config_toml = toml::from_str(
