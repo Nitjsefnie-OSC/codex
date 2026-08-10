@@ -17,6 +17,10 @@ use super::telemetry::CodeModeToolCallGuard;
 
 type CodeModeNestedTool = (Arc<ToolSpec>, Option<Arc<dyn CoreToolRuntime>>);
 
+fn fatal_code_mode_runtime_error(error: String) -> FunctionCallError {
+    FunctionCallError::Fatal(format!("code mode runtime unavailable: {error}"))
+}
+
 pub struct CodeModeExecuteHandler {
     spec: ToolSpec,
     nested_tool_specs: Vec<CodeModeNestedTool>,
@@ -74,7 +78,7 @@ impl CodeModeExecuteHandler {
                 max_output_tokens: args.max_output_tokens,
             })
             .await
-            .map_err(FunctionCallError::RespondToModel)?;
+            .map_err(fatal_code_mode_runtime_error)?;
         let cell_id = started_cell.cell_id.clone();
         telemetry.cell_id = Some(cell_id.to_string());
         exec.session
@@ -107,7 +111,7 @@ impl CodeModeExecuteHandler {
         let response = started_cell
             .initial_response()
             .await
-            .map_err(FunctionCallError::RespondToModel)?;
+            .map_err(fatal_code_mode_runtime_error)?;
         // Record the raw runtime boundary. The model-visible custom-tool output
         // is produced by `handle_runtime_response` and later linked through
         // `CodeCell.output_item_ids` in the reduced trace.
@@ -192,5 +196,24 @@ impl CodeModeExecuteHandler {
 impl CoreToolRuntime for CodeModeExecuteHandler {
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Custom { .. })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fatal_code_mode_runtime_error;
+    use crate::function_tool::FunctionCallError;
+
+    #[test]
+    fn code_mode_runtime_start_failure_is_fatal_to_the_turn() {
+        let error = fatal_code_mode_runtime_error(
+            "failed to spawn code-mode host: executable was not found".to_string(),
+        );
+        assert!(matches!(
+            error,
+            FunctionCallError::Fatal(message)
+                if message.contains("failed to spawn code-mode host")
+                    && message.contains("runtime unavailable")
+        ));
     }
 }

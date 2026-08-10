@@ -363,15 +363,27 @@ async fn missing_process_host_keeps_code_mode_only_and_fails_closed() -> Result<
                 .enable(Feature::CodeModeOnly)
                 .expect("code mode should be enabled");
         });
-    let (_test, follow_up_mock) = run_code_mode_turn_with_builder(
+    let (_test, _follow_up_mock) = run_code_mode_turn_with_builder(
         &server,
         "Run required code mode",
         "text('unreachable')",
         builder,
     )
     .await?;
-    let request = follow_up_mock.single_request();
-    let tools = tool_names(&request.body_json());
+    let requests = server
+        .received_requests()
+        .await
+        .expect("received requests should be available");
+    let response_requests = requests
+        .iter()
+        .filter(|request| request.url.path() == "/v1/responses")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        response_requests.len(),
+        1,
+        "a host spawn failure must abort before a model follow-up"
+    );
+    let tools = tool_names(&response_requests[0].body_json::<Value>()?);
     assert!(
         tools.iter().any(|name| name == "exec") && tools.iter().any(|name| name == "wait"),
         "code-mode-only must retain code-mode tools: {tools:?}"
@@ -382,12 +394,6 @@ async fn missing_process_host_keeps_code_mode_only_and_fails_closed() -> Result<
             .all(|name| { !matches!(name.as_str(), "shell" | "shell_command" | "exec_command") }),
         "code-mode-only must never expose direct shell tools: {tools:?}"
     );
-    let (output, _) = custom_tool_output_body_and_success(&request, "call-1");
-    assert!(
-        output.contains("codex-code-mode-host-does-not-exist"),
-        "code-mode-only must report the host failure: {output}"
-    );
-
     Ok(())
 }
 
@@ -406,25 +412,31 @@ async fn missing_process_host_fails_closed_when_direct_fallback_is_disabled() ->
                 .expect("code mode should be enabled");
             config.code_mode.disable_in_process_fallback = true;
         });
-    let (_test, follow_up_mock) = run_code_mode_turn_with_builder(
+    let (_test, _follow_up_mock) = run_code_mode_turn_with_builder(
         &server,
         "Run required code mode",
         "text('unreachable')",
         builder,
     )
     .await?;
-    let request = follow_up_mock.single_request();
-    let tools = tool_names(&request.body_json());
+    let requests = server
+        .received_requests()
+        .await
+        .expect("received requests should be available");
+    let response_requests = requests
+        .iter()
+        .filter(|request| request.url.path() == "/v1/responses")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        response_requests.len(),
+        1,
+        "a host spawn failure must abort before a model follow-up"
+    );
+    let tools = tool_names(&response_requests[0].body_json::<Value>()?);
     assert!(
         tools.iter().any(|name| name == "exec") && tools.iter().any(|name| name == "wait"),
         "disabled fallback must retain code-mode tools: {tools:?}"
     );
-    let (output, _) = custom_tool_output_body_and_success(&request, "call-1");
-    assert!(
-        output.contains("codex-code-mode-host-does-not-exist"),
-        "disabled fallback must report the host failure: {output}"
-    );
-
     Ok(())
 }
 
@@ -446,18 +458,23 @@ async fn disabled_process_host_with_fallback_disabled_attempts_the_host() -> Res
                 .expect("code-mode host should be disabled");
             config.code_mode.disable_in_process_fallback = true;
         });
-    let (_test, follow_up_mock) = run_code_mode_turn_with_builder(
+    let (_test, _follow_up_mock) = run_code_mode_turn_with_builder(
         &server,
         "Run required code mode",
         "text('unreachable')",
         builder,
     )
     .await?;
-    let request = follow_up_mock.single_request();
-    let (output, _) = custom_tool_output_body_and_success(&request, "call-1");
-    assert!(
-        output.contains("failed to spawn code-mode host"),
-        "disabled fallback must still attempt the standalone host: {output}"
+    let response_count = server
+        .received_requests()
+        .await
+        .expect("received requests should be available")
+        .into_iter()
+        .filter(|request| request.url.path() == "/v1/responses")
+        .count();
+    assert_eq!(
+        response_count, 1,
+        "disabled fallback must attempt the host and abort before follow-up"
     );
 
     Ok(())

@@ -304,6 +304,43 @@ jobs:
           cargo test -p codex-core --test all monitor -- --nocapture
           df -h /
 
+      - name: code-mode infrastructure failures abort the turn
+        # Missing/failed host infrastructure must never become ordinary tool
+        # output followed by a model-authored success claim. Each exact filter
+        # is non-vacuous and the integration cases assert that only the first
+        # Responses request occurs.
+        timeout-minutes: 20
+        working-directory: codex-rs
+        run: |
+          set +e
+          failures=0
+          for spec in \
+            "lib|tools::code_mode::execute_handler::tests::code_mode_runtime_start_failure_is_fatal_to_the_turn" \
+            "all|suite::code_mode::missing_process_host_keeps_code_mode_only_and_fails_closed" \
+            "all|suite::code_mode::missing_process_host_fails_closed_when_direct_fallback_is_disabled" \
+            "all|suite::code_mode::disabled_process_host_with_fallback_disabled_attempts_the_host"
+          do
+            kind="${spec%%|*}"
+            test_name="${spec#*|}"
+            if [ "$kind" = lib ]; then
+              target=(--lib)
+            else
+              target=(--test all)
+            fi
+            output=$(timeout 5m cargo test -p codex-core "${target[@]}" "$test_name" -- \
+              --exact --nocapture --test-threads=1 2>&1)
+            status=$?
+            printf '%s\n' "$output"
+            if ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+              echo "::error::code-mode fatal filter $test_name did not run at least one passing test"
+              status=1
+            fi
+            if [ "$status" -ne 0 ]; then
+              failures=$((failures + 1))
+            fi
+          done
+          exit "$failures"
+
       - name: golden tool-name list
         working-directory: codex-rs
         run: cargo test -p codex-core --test all prompt_caching -- --nocapture || true
