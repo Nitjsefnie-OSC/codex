@@ -69,6 +69,19 @@ jobs:
         working-directory: codex-rs
         run: cargo test -p codex-fork-manifest
 
+      - name: multi-agent feature precedence tests
+        # A command-line/config disable must win over a model-catalog V2
+        # default. Require the exact regression to execute so the filter cannot
+        # silently go green after a rename.
+        working-directory: codex-rs
+        run: |
+          set +e
+          output=$(cargo test -p codex-core --lib config::tests::explicitly_disabled_multi_agent_v2_overrides_model_catalog_v2 -- --exact --nocapture 2>&1)
+          status=$?
+          printf '%s\n' "$output"
+          printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed' || status=1
+          exit "$status"
+
       - name: TUI presentation default tests
         # Fork settings `tui.show_safety_buffering_ui` and
         # `tui.show_prompt_suggestions`. What has to hold: both default to
