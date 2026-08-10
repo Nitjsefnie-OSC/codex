@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Implementation plan — Codex exec agent role selection</title>
+  <style>
+    :root { --bg:#1b1a17; --panel:#252420; --panel2:#2e2c27; --line:#3a3833; --text:#cfccc2; --bright:#f5f3ec; --muted:#8f8d82; --clay:#d97757; --olive:#8fa56e; --mono:ui-monospace,SFMono-Regular,Menlo,monospace; --sans:system-ui,-apple-system,"Segoe UI",sans-serif; --serif:ui-serif,Georgia,serif; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font-family:var(--sans); line-height:1.55; }
+    .page { max-width:1120px; margin:auto; padding:48px 28px 100px; }
+    header { max-width:850px; margin-bottom:32px; }
+    .eyebrow,.label { color:var(--muted); font:12px var(--mono); letter-spacing:.07em; text-transform:uppercase; }
+    h1,h2,h3 { color:var(--bright); font-family:var(--serif); font-weight:500; }
+    h1 { font-size:40px; line-height:1.12; margin:10px 0 18px; }
+    h2 { font-size:27px; margin:0; }
+    h3 { font-size:20px; margin:0 0 8px; }
+    code,pre { font-family:var(--mono); }
+    code { color:#c9b98a; }
+    .prompt,.card,.risk,.summary>div,.toc { background:var(--panel); border:1px solid var(--line); border-radius:12px; }
+    .prompt { padding:16px 20px; }
+    .summary { display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin:28px 0 44px; }
+    .summary>div { padding:17px; }
+    .value { color:var(--bright); font-size:16px; font-weight:650; margin-top:5px; }
+    .accent { color:var(--clay); }
+    .toc { padding:18px 22px; margin-bottom:50px; }
+    .toc a { color:var(--text); text-decoration:none; margin-right:18px; display:inline-block; padding:5px 0; }
+    .toc a:hover { color:var(--clay); }
+    section { margin:0 0 58px; }
+    .section-head { display:flex; gap:12px; align-items:baseline; margin-bottom:20px; }
+    .num { background:#3a352b; border-radius:7px; padding:3px 9px; color:var(--bright); font:12px var(--mono); }
+    .task-list { display:grid; gap:18px; }
+    .card { padding:22px; position:relative; }
+    .files { color:var(--muted); font:12px var(--mono); margin:8px 0 14px; }
+    ol { padding-left:22px; margin-bottom:0; }
+    li+li { margin-top:9px; }
+    .accept { border-left:4px solid var(--olive); padding:10px 14px; background:#232a1e; margin-top:16px; border-radius:6px; }
+    .review { display:flex; gap:8px; flex-wrap:wrap; margin-top:18px; padding-top:14px; border-top:1px dashed var(--line); }
+    button { font:12px var(--mono); border-radius:7px; padding:7px 11px; color:var(--text); background:var(--panel2); border:1px solid var(--line); cursor:pointer; }
+    button:hover { border-color:var(--clay); color:var(--bright); }
+    .approve { border-color:#536443; }
+    .reject { border-color:#704331; }
+    .diagram { overflow-x:auto; padding:24px; background:var(--panel); border:1px solid var(--line); border-radius:12px; }
+    .flow { display:flex; min-width:820px; align-items:center; gap:12px; }
+    .node { flex:1; min-height:92px; padding:14px; border:1px solid var(--line); border-radius:9px; background:var(--panel2); }
+    .arrow { color:var(--clay); font-size:23px; }
+    .risk { overflow:hidden; }
+    .risk-row { display:grid; grid-template-columns:1.25fr 90px 1.5fr; }
+    .risk-row+ .risk-row { border-top:1px solid var(--line); }
+    .risk-row>div { padding:13px 16px; }
+    .risk-row>div+div { border-left:1px solid var(--line); }
+    .head { background:var(--panel2); color:var(--bright); font:12px var(--mono); text-transform:uppercase; }
+    .sev { font:11px var(--mono); border-radius:5px; padding:3px 7px; background:#4a2a1c; color:#f0b79c; }
+    pre { white-space:pre-wrap; background:#121110; color:var(--bright); padding:16px; border-radius:9px; overflow:auto; }
+    .footer { color:var(--muted); border-top:1px solid var(--line); padding-top:20px; font-size:13px; }
+    @media(max-width:760px){ .page{padding:28px 16px 70px}.summary{grid-template-columns:1fr 1fr}h1{font-size:32px}.risk-row{grid-template-columns:1fr}.risk-row>div+div{border-left:0;border-top:1px dashed var(--line)} }
+  </style>
+</head>
+<body>
+<main class="page">
+  <header>
+    <div class="eyebrow">Implementation plan · Nitjsefnie-OSC/codex</div>
+    <h1>First-class headless agent role selection</h1>
+    <div class="prompt"><span class="label">Objective</span><br>Add <code>codex exec --agent &lt;ROLE&gt;</code> so installed role profiles work in new headless sessions with native-spawn precedence, fail locally when invalid, and preserve invocation safety state.</div>
+  </header>
+
+  <div class="summary">
+    <div><div class="label">Slices</div><div class="value accent">6</div></div>
+    <div><div class="label">Primary crates</div><div class="value">exec + core</div></div>
+    <div><div class="label">Rust verification</div><div class="value">GitHub Actions</div></div>
+    <div><div class="label">Release target</div><div class="value">next fork tag</div></div>
+  </div>
+
+  <nav class="toc" aria-label="Plan sections">
+    <span class="label">Jump to</span><br>
+    <a href="#flow">Architecture</a><a href="#tasks">Tasks</a><a href="#risks">Risks</a><a href="#acceptance">Acceptance</a>
+  </nav>
+
+  <section id="flow">
+    <div class="section-head"><span class="num">01</span><h2>Architecture</h2></div>
+    <div class="diagram">
+      <div class="flow">
+        <div class="node"><strong>Clap</strong><br><code>exec --agent adversary</code><br><small>New sessions only</small></div>
+        <div class="arrow">→</div>
+        <div class="node"><strong>Resolved exec Config</strong><br>User/project/cloud config plus runtime safety overrides</div>
+        <div class="arrow">→</div>
+        <div class="node"><strong>Core role adapter</strong><br>Existing registry + role layer; restore runtime-owned fields</div>
+        <div class="arrow">→</div>
+        <div class="node"><strong>Session startup</strong><br>Role identity in request; invocation safety retained</div>
+      </div>
+    </div>
+  </section>
+
+  <section id="tasks">
+    <div class="section-head"><span class="num">02</span><h2>Execution tasks</h2></div>
+    <div class="task-list">
+      <article class="card" id="task-1">
+        <h3>1. Pin the CLI contract with RED tests</h3>
+        <div class="files">exec/src/cli.rs · exec/src/lib_tests.rs · .github/workflows/fork-verify.yml</div>
+        <ol><li>Parse a real <code>--agent adversary</code> new-session command and reject blank values.</li><li>Reject resume, fork, and review combinations before startup.</li><li>Add an exact, pass-count-gated workflow family.</li><li>Push the test-only diagnostic and prove failure through <code>gh api</code>; later amend it away.</li></ol>
+        <div class="accept"><strong>Acceptance:</strong> The Actions step fails specifically because the CLI/validator is absent, with no vacuous zero-test success.</div>
+        <div class="review"><button class="approve" onclick="mark(this,'approved')">Approve</button><button class="reject" onclick="mark(this,'rejected')">Reject</button><button onclick="copyTask('task-1')">Copy task</button><button onclick="annotate('task-1')">Annotate</button></div>
+      </article>
+
+      <article class="card" id="task-2">
+        <h3>2. Add the headless CLI surface</h3>
+        <div class="files">exec/src/cli.rs · exec/src/lib.rs</div>
+        <ol><li>Add global <code>--agent ROLE</code> for the root exec command.</li><li>Validate a nonblank role and incompatible subcommands before auth/cloud/network startup.</li><li>Keep role parsing out of the exec crate.</li></ol>
+        <div class="accept"><strong>Acceptance:</strong> Parser and compatibility tests pass without touching role-layer internals.</div>
+        <div class="review"><button class="approve" onclick="mark(this,'approved')">Approve</button><button class="reject" onclick="mark(this,'rejected')">Reject</button><button onclick="copyTask('task-2')">Copy task</button><button onclick="annotate('task-2')">Annotate</button></div>
+      </article>
+
+      <article class="card" id="task-3">
+        <h3>3. Expose a narrow core adapter</h3>
+        <div class="files">core/src/agent/mod.rs · core/src/agent/role.rs</div>
+        <ol><li>Build a real temporary role fixture and prove model, effort, and developer instructions apply.</li><li>Call the existing resolver and role-layer code through one public adapter.</li><li>Snapshot and restore only invocation-owned safety/process fields.</li><li>Use independent mutation-sensitive assertions for role application and runtime restoration.</li></ol>
+        <div class="accept"><strong>Acceptance:</strong> Role identity wins; approval, sandbox/permission, CWD, writable roots, executable paths, hook bypass, ephemeral mode, and PSP survive.</div>
+        <div class="review"><button class="approve" onclick="mark(this,'approved')">Approve</button><button class="reject" onclick="mark(this,'rejected')">Reject</button><button onclick="copyTask('task-3')">Copy task</button><button onclick="annotate('task-3')">Annotate</button></div>
+      </article>
+
+      <article class="card" id="task-4">
+        <h3>4. Integrate before session startup</h3>
+        <div class="files">exec/src/lib.rs · exec integration tests</div>
+        <ol><li>Apply the role after final exec config resolution and before login/session startup.</li><li>Assert unknown roles and incompatible modes cause zero mocked Responses requests.</li><li>Assert outbound model and developer instructions come from the role.</li><li>Assert conflicting CLI model/effort cannot defeat a role that sets them.</li></ol>
+        <div class="accept"><strong>Acceptance:</strong> A mocked end-to-end turn observes role identity and preserved invocation safety; invalid selection remains local.</div>
+        <div class="review"><button class="approve" onclick="mark(this,'approved')">Approve</button><button class="reject" onclick="mark(this,'rejected')">Reject</button><button onclick="copyTask('task-4')">Copy task</button><button onclick="annotate('task-4')">Annotate</button></div>
+      </article>
+
+      <article class="card" id="task-5">
+        <h3>5. Verify and declare the capability</h3>
+        <div class="files">fork-verify.yml · fork-manifest.json · manifest tests</div>
+        <ol><li>Declare the named headless role-selection capability in the fork manifest.</li><li>Amend the RED commit with production code and push using <code>--force-with-lease</code>.</li><li>Require terminal green for every focused and existing workflow family.</li><li>Confirm clean diff, exact coauthor, no local target artifacts, and untouched user file.</li></ol>
+        <div class="accept"><strong>Acceptance:</strong> The final workflow is terminal green and <code>fork-manifest --capabilities</code> reports the new surface.</div>
+        <div class="review"><button class="approve" onclick="mark(this,'approved')">Approve</button><button class="reject" onclick="mark(this,'rejected')">Reject</button><button onclick="copyTask('task-5')">Copy task</button><button onclick="annotate('task-5')">Annotate</button></div>
+      </article>
+
+      <article class="card" id="task-6">
+        <h3>6. Release, install, and live-test</h3>
+        <div class="files">GitHub release · bundle fork lock/update metadata</div>
+        <ol><li>Publish the next fork tag from the green commit and verify GitHub-served checksums.</li><li>Install the Linux artifact through the hardened dry-run-first bundle path; never compile locally.</li><li>Run a closed-stdin <code>codex exec --agent adversary</code> whoami probe and verify server-reported identity plus developer-instruction behavior.</li><li>Close the tracking issue only after deployed evidence is available.</li></ol>
+        <div class="accept"><strong>Acceptance:</strong> The installed binary selects a real role end to end, and an unknown role fails before network activity.</div>
+        <div class="review"><button class="approve" onclick="mark(this,'approved')">Approve</button><button class="reject" onclick="mark(this,'rejected')">Reject</button><button onclick="copyTask('task-6')">Copy task</button><button onclick="annotate('task-6')">Annotate</button></div>
+      </article>
+    </div>
+  </section>
+
+  <section id="risks">
+    <div class="section-head"><span class="num">03</span><h2>Risks and mitigations</h2></div>
+    <div class="risk">
+      <div class="risk-row"><div class="head">Risk</div><div class="head">Severity</div><div class="head">Mitigation</div></div>
+      <div class="risk-row"><div>Role rebuild drops headless safety or process state.</div><div><span class="sev">HIGH</span></div><div>Typed runtime snapshot plus a field-by-field preservation test.</div></div>
+      <div class="risk-row"><div>Exec implements a second role parser with precedence drift.</div><div><span class="sev">HIGH</span></div><div>Public core adapter calls the existing registry and layer machinery only.</div></div>
+      <div class="risk-row"><div>Unknown role reaches auth or consumes an API request.</div><div><span class="sev">HIGH</span></div><div>Apply before login/session startup and assert zero mock requests.</div></div>
+      <div class="risk-row"><div>Diagnostic CI commits add history spam.</div><div><span class="sev">MED</span></div><div>Amend RED into GREEN and use force-with-lease, then squash docs if useful.</div></div>
+    </div>
+  </section>
+
+  <section id="acceptance">
+    <div class="section-head"><span class="num">04</span><h2>Final acceptance command</h2></div>
+    <pre>codex exec --agent adversary -- "Call whoami and report only its JSON." &lt; /dev/null</pre>
+    <p>The server-verified model and effort must match the installed role. The role's developer instructions must be active, and invocation-owned yolo/sandbox/CWD state must remain unchanged.</p>
+  </section>
+
+  <p class="footer">Plan source: <code>docs/superpowers/plans/2026-08-10-codex-exec-agent-role.md</code>. Every Rust proof runs in GitHub Actions; no local Rust compilation is authorized for this work.</p>
+</main>
+<script>
+  function mark(button, state) { const card=button.closest('.card'); card.dataset.review=state; button.textContent=state==='approved'?'Approved':'Rejected'; }
+  function copyTask(id) { navigator.clipboard.writeText(document.getElementById(id).innerText); }
+  function annotate(id) { const note=prompt('Review note for '+id); if(note) localStorage.setItem('codex-plan-note-'+id,note); }
+</script>
+</body>
+</html>
