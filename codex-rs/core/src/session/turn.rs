@@ -2344,7 +2344,7 @@ async fn drain_in_flight(
                 .await;
             }
             Err(err) => {
-                error_or_panic(format!("in-flight tool future failed during drain: {err}"));
+                return Err(err);
             }
         }
     }
