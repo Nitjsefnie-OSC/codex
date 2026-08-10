@@ -82,6 +82,69 @@ jobs:
           printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed' || status=1
           exit "$status"
 
+      - name: headless agent role contract tests
+        # Named role selection is a fork CLI capability. Keep parser and
+        # incompatible-operation coverage exact and non-vacuous so a renamed
+        # or deleted test cannot silently remove the contract.
+        working-directory: codex-rs
+        run: |
+          set +e
+          status=0
+          for test_name in \
+            cli::tests::headless_agent_role_parses_for_new_session \
+            cli::tests::headless_agent_role_rejects_blank_value \
+            cli::tests::headless_agent_role_rejects_existing_session_commands \
+            tests::thread_start_params_preserve_resolved_role_instructions_and_effort
+          do
+            output=$(cargo test -p codex-exec --lib "$test_name" -- --exact --nocapture 2>&1)
+            result=$?
+            printf '%s\n' "$output"
+            if [ "$result" -ne 0 ] || ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+              status=1
+            fi
+          done
+          exit "$status"
+
+      - name: headless agent role core tests
+        # The role owns identity while the headless invocation owns runtime
+        # safety/process state. Exercise those halves independently of the CLI.
+        working-directory: codex-rs
+        run: |
+          set +e
+          status=0
+          for test_name in \
+            agent::role::tests::apply_exec_agent_role_uses_role_identity_and_preserves_runtime_state \
+            agent::role::tests::apply_exec_agent_role_rejects_unknown_role
+          do
+            output=$(cargo test -p codex-core --lib "$test_name" -- --exact --nocapture 2>&1)
+            result=$?
+            printf '%s\n' "$output"
+            if [ "$result" -ne 0 ] || ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+              status=1
+            fi
+          done
+          exit "$status"
+
+      - name: headless agent role integration tests
+        # A real codex-exec binary must send role identity while retaining its
+        # headless safety mode, and an unknown role must remain local.
+        working-directory: codex-rs
+        run: |
+          set +e
+          status=0
+          for test_name in \
+            suite::headless_agent_role::exec_agent_role_reaches_request_and_preserves_headless_safety \
+            suite::headless_agent_role::exec_unknown_agent_role_fails_before_responses_request
+          do
+            output=$(cargo test -p codex-exec --test all "$test_name" -- --exact --nocapture --test-threads=1 2>&1)
+            result=$?
+            printf '%s\n' "$output"
+            if [ "$result" -ne 0 ] || ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+              status=1
+            fi
+          done
+          exit "$status"
+
       - name: TUI presentation default tests
         # Fork settings `tui.show_safety_buffering_ui` and
         # `tui.show_prompt_suggestions`. What has to hold: both default to

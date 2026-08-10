@@ -51,6 +51,14 @@
       "summary": "PreToolUse and PostToolUse hook payloads carry `skill_activations` for the current turn, including each explicit or implicit activation's name, source path, scope, invocation kind, turn id, and content SHA-256."
     },
     {
+      "id": "cli.exec_agent_role",
+      "kind": "cli",
+      "name": "exec --agent",
+      "config_key": null,
+      "default_enabled": true,
+      "summary": "`codex exec --agent <role>` applies an installed or built-in agent role to a new headless session through the native role registry while retaining invocation-owned runtime safety state."
+    },
+    {
       "id": "tui.safety_buffering_ui",
       "kind": "tui_setting",
       "name": "show_safety_buffering_ui",
