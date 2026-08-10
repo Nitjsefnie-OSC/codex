@@ -99,6 +99,65 @@ fn parses_config_isolation_flags() {
 }
 
 #[test]
+fn headless_agent_role_parses_for_new_session() {
+    let cli = Cli::parse_from([
+        "codex-exec",
+        "--agent",
+        "adversary",
+        "Review this claim",
+    ]);
+
+    assert_eq!(cli.agent.as_deref(), Some("adversary"));
+    assert!(cli.command.is_none());
+    assert_eq!(cli.prompt.as_deref(), Some("Review this claim"));
+}
+
+#[test]
+fn headless_agent_role_rejects_blank_value() {
+    let error = Cli::try_parse_from(["codex-exec", "--agent", "", "Review this claim"])
+        .expect_err("blank agent role should be rejected");
+
+    assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+}
+
+#[test]
+fn headless_agent_role_rejects_existing_session_commands() {
+    for (args, command_name) in [
+        (
+            vec!["codex-exec", "--agent", "adversary", "resume", "--last"],
+            "resume",
+        ),
+        (
+            vec![
+                "codex-exec",
+                "--agent",
+                "adversary",
+                "fork",
+                "session-123",
+            ],
+            "fork",
+        ),
+        (
+            vec![
+                "codex-exec",
+                "--agent",
+                "adversary",
+                "review",
+                "--uncommitted",
+            ],
+            "review",
+        ),
+    ] {
+        let cli = Cli::parse_from(args);
+        let error = validate_agent_role_command(cli.agent.as_deref(), cli.command.as_ref())
+            .expect_err("existing-session command should reject --agent");
+
+        assert!(error.contains("--agent"), "unexpected error: {error}");
+        assert!(error.contains(command_name), "unexpected error: {error}");
+    }
+}
+
+#[test]
 fn approve_for_me_flag_applies_to_resume_when_passed_at_exec_root() {
     for flag in ["--approve-for-me", "--not-so-yolo"] {
         let cli = Cli::parse_from(["codex-exec", flag, "resume", "--last"]);

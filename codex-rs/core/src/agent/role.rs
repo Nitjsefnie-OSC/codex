@@ -64,6 +64,43 @@ pub(crate) async fn apply_role_to_config_for_multi_agent_v2(
     .await
 }
 
+/// Applies a named role to a new headless exec session without dropping the
+/// invocation's runtime safety and process state.
+pub async fn apply_exec_agent_role(config: &mut Config, role_name: &str) -> Result<(), String> {
+    let runtime_permissions = config.permissions.clone();
+    let runtime_explicit_permission_profile_mode = config.explicit_permission_profile_mode;
+    let runtime_include_permissions_instructions = config.include_permissions_instructions;
+    let runtime_approvals_reviewer = config.approvals_reviewer;
+    let runtime_cwd = config.cwd.clone();
+    let runtime_workspace_roots = config.workspace_roots.clone();
+    let runtime_workspace_roots_explicit = config.workspace_roots_explicit;
+    let runtime_ephemeral = config.ephemeral;
+    let runtime_bypass_hook_trust = config.bypass_hook_trust;
+    let runtime_codex_self_exe = config.codex_self_exe.clone();
+    let runtime_codex_linux_sandbox_exe = config.codex_linux_sandbox_exe.clone();
+    let runtime_main_execve_wrapper_exe = config.main_execve_wrapper_exe.clone();
+    let runtime_zsh_path = config.zsh_path.clone();
+    let runtime_psp = config.psp;
+
+    apply_role_to_config(config, Some(role_name)).await?;
+
+    config.permissions = runtime_permissions;
+    config.explicit_permission_profile_mode = runtime_explicit_permission_profile_mode;
+    config.include_permissions_instructions = runtime_include_permissions_instructions;
+    config.approvals_reviewer = runtime_approvals_reviewer;
+    config.cwd = runtime_cwd;
+    config.workspace_roots = runtime_workspace_roots;
+    config.workspace_roots_explicit = runtime_workspace_roots_explicit;
+    config.ephemeral = runtime_ephemeral;
+    config.bypass_hook_trust = runtime_bypass_hook_trust;
+    config.codex_self_exe = runtime_codex_self_exe;
+    config.codex_linux_sandbox_exe = runtime_codex_linux_sandbox_exe;
+    config.main_execve_wrapper_exe = runtime_main_execve_wrapper_exe;
+    config.zsh_path = runtime_zsh_path;
+    config.psp = runtime_psp;
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 enum RoleDeveloperInstructions {
     UseConfigLayers,

@@ -8,6 +8,7 @@ mod auth_env;
 mod completion_backfill;
 mod ephemeral;
 mod hooks;
+mod headless_agent_role;
 mod mcp_required_exit;
 mod originator;
 mod output_schema;

@@ -20,6 +20,15 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
 
+    /// Agent role profile to apply to a new headless session.
+    #[arg(
+        long = "agent",
+        value_name = "ROLE",
+        global = true,
+        value_parser = clap::builder::NonEmptyStringValueParser::new()
+    )]
+    pub agent: Option<String>,
+
     /// Error out when config.toml contains fields that are not recognized by this version of Codex.
     #[arg(long = "strict-config", global = true, default_value_t = false)]
     pub strict_config: bool,
@@ -154,6 +163,30 @@ pub enum Command {
 
     /// Run a code review against the current repository.
     Review(ReviewArgs),
+}
+
+pub(crate) fn validate_agent_role_command(
+    agent: Option<&str>,
+    command: Option<&Command>,
+) -> Result<(), String> {
+    let Some(agent) = agent else {
+        return Ok(());
+    };
+    if agent.trim().is_empty() {
+        return Err("--agent requires a non-empty role name".to_string());
+    }
+    let command_name = match command {
+        Some(Command::Resume(_)) => Some("resume"),
+        Some(Command::Fork(_)) => Some("fork"),
+        Some(Command::Review(_)) => Some("review"),
+        None => None,
+    };
+    if let Some(command_name) = command_name {
+        return Err(format!(
+            "--agent cannot be used with `{command_name}`; existing sessions and review mode keep their own identity"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Args, Debug)]

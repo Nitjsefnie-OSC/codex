@@ -3,6 +3,7 @@ use codex_otel::set_parent_from_w3c_trace_context;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_utils_absolute_path::test_support::PathBufExt;
 use codex_utils_absolute_path::test_support::test_path_buf;
 use opentelemetry::trace::TraceContextExt;
@@ -632,6 +633,39 @@ async fn thread_start_params_include_user_thread_source() {
 }
 
 #[tokio::test]
+async fn thread_start_params_preserve_resolved_role_instructions_and_effort() {
+    let codex_home = tempdir().expect("create temp codex home");
+    let cwd = tempdir().expect("create temp cwd");
+    let mut config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(cwd.path().to_path_buf()))
+        .build()
+        .await
+        .expect("build config");
+    config.base_instructions = Some("ROLE-BASE-MARKER".to_string());
+    config.developer_instructions = Some("ROLE-DEVELOPER-MARKER".to_string());
+    config.model_reasoning_effort = Some(ReasoningEffort::Low);
+
+    let params = thread_start_params_from_config(&config);
+
+    assert_eq!(
+        params.base_instructions.as_deref(),
+        Some("ROLE-BASE-MARKER")
+    );
+    assert_eq!(
+        params.developer_instructions.as_deref(),
+        Some("ROLE-DEVELOPER-MARKER")
+    );
+    assert_eq!(
+        params
+            .config
+            .as_ref()
+            .and_then(|overrides| overrides.get("model_reasoning_effort")),
+        Some(&serde_json::Value::String("low".to_string()))
+    );
+}
+
+#[tokio::test]
 async fn thread_lifecycle_params_preserve_hook_trust_bypass() {
     let codex_home = tempdir().expect("create temp codex home");
     let cwd = tempdir().expect("create temp cwd");
@@ -645,10 +679,17 @@ async fn thread_lifecycle_params_preserve_hook_trust_bypass() {
         .build()
         .await
         .expect("build config with hook trust bypass");
-    let expected_config = Some(HashMap::from([(
+    let expected_resume_config = Some(HashMap::from([(
         "bypass_hook_trust".to_string(),
         serde_json::Value::Bool(true),
     )]));
+    let mut expected_start_config = expected_resume_config.clone().unwrap_or_default();
+    if let Some(reasoning_effort) = config.model_reasoning_effort.as_ref() {
+        expected_start_config.insert(
+            "model_reasoning_effort".to_string(),
+            serde_json::Value::String(reasoning_effort.to_string()),
+        );
+    }
 
     let start_params = thread_start_params_from_config(&config);
     let resume_params = thread_resume_params_from_config(
@@ -657,8 +698,8 @@ async fn thread_lifecycle_params_preserve_hook_trust_bypass() {
         /*approvals_reviewer_override*/ None,
     );
 
-    assert_eq!(start_params.config, expected_config);
-    assert_eq!(resume_params.config, expected_config);
+    assert_eq!(start_params.config, Some(expected_start_config));
+    assert_eq!(resume_params.config, expected_resume_config);
 }
 
 #[test]

@@ -4,8 +4,10 @@ use crate::config::ConfigBuilder;
 use crate::plugins::plugins_manager_for_config;
 use crate::skills_load_input_from_config;
 use codex_protocol::config_types::ServiceTier;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::BaseInstructionsProvenance;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::protocol::AskForApproval;
 use codex_utils_absolute_path::test_support::PathExt;
 use pretty_assertions::assert_eq;
 use std::fs;
@@ -34,6 +36,94 @@ async fn write_role_config(home: &TempDir, name: &str, contents: &str) -> PathBu
         .await
         .expect("write role config");
     role_path
+}
+
+#[tokio::test]
+async fn apply_exec_agent_role_uses_role_identity_and_preserves_runtime_state() {
+    let home = TempDir::new().expect("create temp dir");
+    let runtime_root = home.path().join("runtime-root");
+    fs::create_dir_all(&runtime_root).expect("create runtime root");
+    let role_path = write_role_config(
+        &home,
+        "adversary.toml",
+        r#"model = "role-model"
+model_reasoning_effort = "high"
+developer_instructions = "ROLE-DEVELOPER-MARKER"
+approval_policy = "on-request"
+sandbox_mode = "read-only"
+include_permissions_instructions = false
+"#,
+    )
+    .await;
+    let mut config = ConfigBuilder::default()
+        .codex_home(home.path().to_path_buf())
+        .fallback_cwd(Some(home.path().to_path_buf()))
+        .harness_overrides(ConfigOverrides {
+            model: Some("cli-model".to_string()),
+            approval_policy: Some(AskForApproval::Never),
+            permission_profile: Some(PermissionProfile::Disabled),
+            workspace_roots: Some(vec![runtime_root.abs()]),
+            codex_self_exe: Some(PathBuf::from("/runtime/codex")),
+            codex_linux_sandbox_exe: Some(PathBuf::from("/runtime/bwrap")),
+            main_execve_wrapper_exe: Some(PathBuf::from("/runtime/execve-wrapper")),
+            ephemeral: Some(true),
+            bypass_hook_trust: Some(true),
+            psp: Some(true),
+            ..Default::default()
+        })
+        .build()
+        .await
+        .expect("load exec config");
+    config.agent_roles.insert(
+        "adversary".to_string(),
+        AgentRoleConfig {
+            description: Some("Adversarial reviewer".to_string()),
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    );
+    let runtime_permissions = config.permissions.clone();
+    let runtime_cwd = config.cwd.clone();
+    let runtime_workspace_roots = config.workspace_roots.clone();
+
+    apply_exec_agent_role(&mut config, "adversary")
+        .await
+        .expect("exec role should apply");
+
+    assert_eq!(config.model.as_deref(), Some("role-model"));
+    assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::High));
+    assert_eq!(
+        config.developer_instructions.as_deref(),
+        Some("ROLE-DEVELOPER-MARKER")
+    );
+    assert_eq!(config.permissions, runtime_permissions);
+    assert!(config.include_permissions_instructions);
+    assert_eq!(config.cwd, runtime_cwd);
+    assert_eq!(config.workspace_roots, runtime_workspace_roots);
+    assert!(config.workspace_roots_explicit);
+    assert!(config.ephemeral);
+    assert!(config.bypass_hook_trust);
+    assert!(config.psp);
+    assert_eq!(config.codex_self_exe, Some(PathBuf::from("/runtime/codex")));
+    assert_eq!(
+        config.codex_linux_sandbox_exe,
+        Some(PathBuf::from("/runtime/bwrap"))
+    );
+    assert_eq!(
+        config.main_execve_wrapper_exe,
+        Some(PathBuf::from("/runtime/execve-wrapper"))
+    );
+}
+
+#[tokio::test]
+async fn apply_exec_agent_role_rejects_unknown_role() {
+    let (_home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+
+    let error = apply_exec_agent_role(&mut config, "missing-role")
+        .await
+        .expect_err("unknown exec role should fail");
+
+    assert_eq!(error, "unknown agent_type 'missing-role'");
 }
 
 fn session_flags_layer_count(config: &Config) -> usize {
