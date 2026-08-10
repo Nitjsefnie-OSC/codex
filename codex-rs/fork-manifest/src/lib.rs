@@ -252,6 +252,14 @@ mod tests {
         assert!(manifest.has_capability("tool.monitor"));
         assert!(manifest.has_capability("hook.stop_background_state"));
 
+        let exec_agent_role = manifest
+            .capability("cli.exec_agent_role")
+            .unwrap_or_else(|| panic!("headless exec role capability should be declared"));
+        assert_eq!(exec_agent_role.kind, CapabilityKind::Cli);
+        assert_eq!(exec_agent_role.name, "exec --agent");
+        assert_eq!(exec_agent_role.config_key, None);
+        assert!(exec_agent_role.default_enabled);
+
         let skill_activations = manifest
             .capability("hook.skill_activations")
             .unwrap_or_else(|| panic!("skill_activations hook capability should be declared"));
