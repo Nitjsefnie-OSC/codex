@@ -142,7 +142,6 @@ async fn notifications(harness: &Harness, process_id: i64) -> Vec<serde_json::Va
         .clone_history()
         .await
         .raw_items()
-        .iter()
         .filter_map(|item| {
             let ResponseItem::Message { content, .. } = item else {
                 return None;

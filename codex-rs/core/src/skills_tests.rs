@@ -1,7 +1,10 @@
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use codex_config::ConfigLayerEntry;
+use codex_config::ConfigLayerSource;
+use codex_config::ConfigLayerStack;
+use codex_config::ConfigRequirementsToml;
 use codex_exec_server::LOCAL_FS;
 use codex_extension_api::ExtensionData;
 use codex_hooks::SkillActivation;
@@ -10,9 +13,9 @@ use codex_hooks::SkillActivationScope;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::SkillScope;
-use codex_skills_extension::HostSkillsSnapshot;
-use codex_skills_extension::SkillLoadOutcome;
-use codex_skills::SkillMetadata;
+use codex_skills::system_cache_root_dir;
+use codex_skills_extension::HostSkillsLoadInput;
+use codex_skills_extension::HostSkillsService;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::test_support::PathBufExt;
 use pretty_assertions::assert_eq;
@@ -45,46 +48,76 @@ pub(crate) struct ImplicitSkillFixture {
 
 pub(crate) async fn implicit_skill_fixture(scope: SkillScope) -> ImplicitSkillFixture {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
-    let skills_root = temp_dir.path().join("skills");
-    let skill_dir = skills_root.join("audit-skill");
-    std::fs::create_dir_all(&skill_dir).expect("create skill dir");
-    let skill_path = skill_dir.join("SKILL.md");
-    std::fs::write(&skill_path, ORIGINAL_SKILL_SOURCE).expect("write skill source");
-    let skill_path = skill_path.abs();
-    let skill = SkillMetadata {
-        name: "audit-skill".to_string(),
-        description: "Audit reads.".to_string(),
-        short_description: None,
-        interface: None,
-        dependencies: None,
-        policy: None,
-        path_to_skills_md: skill_path.clone(),
-        scope,
-        plugin_id: None,
-        remote_plugin_id: None,
+    let codex_home = temp_dir.path().to_path_buf().abs();
+    let (skills_root, layer_source, bundled_skills_enabled) = match scope {
+        SkillScope::User => (
+            codex_home.join("skills"),
+            ConfigLayerSource::User {
+                file: codex_home.join("config.toml"),
+                profile: None,
+            },
+            false,
+        ),
+        SkillScope::Repo => {
+            let dot_codex_folder = codex_home.join(".codex");
+            (
+                dot_codex_folder.join("skills"),
+                ConfigLayerSource::Project { dot_codex_folder },
+                false,
+            )
+        }
+        SkillScope::System => (
+            system_cache_root_dir(&codex_home),
+            ConfigLayerSource::User {
+                file: codex_home.join("config.toml"),
+                profile: None,
+            },
+            true,
+        ),
+        SkillScope::Admin => (
+            codex_home.join("skills"),
+            ConfigLayerSource::System {
+                file: codex_home.join("config.toml"),
+            },
+            false,
+        ),
     };
-    let outcome = SkillLoadOutcome::from_parts(
-        vec![skill],
-        Vec::new(),
-        vec![skills_root.abs()],
-        HashMap::from([(skill_path.clone(), skills_root.abs())]),
-        HashMap::from([(skill_path.clone(), skill_path.clone())]),
+    let skills_service = HostSkillsService::new(codex_home.clone(), bundled_skills_enabled);
+    let skill_dir = skills_root.join("audit-skill");
+    std::fs::create_dir_all(skill_dir.as_path()).expect("create skill dir");
+    let skill_path = skill_dir.join("SKILL.md");
+    std::fs::write(skill_path.as_path(), ORIGINAL_SKILL_SOURCE).expect("write skill source");
+    let config_layer_stack = ConfigLayerStack::new(
+        vec![ConfigLayerEntry::new(
+            layer_source,
+            toml::Value::Table(Default::default()),
+        )],
         Default::default(),
-        HashMap::from([(skill_path.clone(), Arc::clone(&LOCAL_FS))]),
+        ConfigRequirementsToml::default(),
     )
-    .with_disabled_paths(Default::default());
-    assert_eq!(outcome.errors, Vec::new());
-    assert_eq!(outcome.skills.len(), 1);
-
+    .expect("fixture config stack should be valid");
+    let skills_input = HostSkillsLoadInput::new(codex_home.clone(), Vec::new(), config_layer_stack);
     let (session, turn) = make_session_and_context().await;
-    turn.extension_data
-        .insert(HostSkillsSnapshot::new(Arc::new(outcome)));
+    let snapshot = skills_service
+        .snapshot_for_config(&skills_input, Some(Arc::clone(&LOCAL_FS)))
+        .await;
+    assert_eq!(snapshot.outcome().errors, Vec::new());
+    assert_eq!(
+        snapshot
+            .outcome()
+            .skills
+            .iter()
+            .find(|skill| skill.path_to_skills_md == skill_path)
+            .map(|skill| (skill.name.as_str(), skill.scope)),
+        Some(("audit-skill", scope))
+    );
+    turn.extension_data.insert(snapshot);
     ImplicitSkillFixture {
         session,
         turn,
         _temp_dir: temp_dir,
         skill_path,
-        workdir: skill_dir.abs(),
+        workdir: skill_dir,
     }
 }
 
