@@ -130,6 +130,10 @@ async fn yielded_exec_completion_wakes_idle_session_once_and_remains_pollable() 
         notification.contains(r#""exit_code":0"#),
         "completion notification should report the exit code: {notification}"
     );
+    assert!(
+        notification.contains(r#""output_may_be_available":true"#),
+        "completion notification should preserve write_stdin retrieval: {notification}"
+    );
 
     let poll_output = completion_requests[1]
         .function_call_output_text("yielded-exec-poll")

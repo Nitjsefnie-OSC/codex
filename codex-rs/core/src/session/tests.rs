@@ -10609,9 +10609,9 @@ async fn concurrent_idle_monitor_notifications_are_persisted_once_and_coalesce_w
             .count(),
         "racing idle notifications must not be dropped or duplicated"
     );
-    assert!(session.input_queue.monitor_wake_requested());
-    assert!(session.input_queue.claim_monitor_wake());
-    assert!(!session.input_queue.claim_monitor_wake());
+    assert!(session.input_queue.background_wake_requested());
+    assert!(session.input_queue.claim_background_wake());
+    assert!(!session.input_queue.claim_background_wake());
 }
 
 #[tokio::test]

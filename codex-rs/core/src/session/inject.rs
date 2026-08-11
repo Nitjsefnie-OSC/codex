@@ -4,6 +4,7 @@ use super::turn_context::TurnContext;
 use crate::codex_thread::TryStartTurnIfIdleError;
 use crate::codex_thread::TryStartTurnIfIdleRejectionReason;
 use crate::context::ContextualUserFragment;
+use crate::context::ExecCommandCompletionNotification;
 use crate::context::MonitorNotification;
 use crate::tasks::MailboxParentProvenance;
 use crate::tasks::RegularTask;
@@ -140,21 +141,43 @@ impl Session {
         Ok(())
     }
 
-    /// Persist one monitor notification and request one coalesced idle wake.
-    ///
-    /// Active regular turns receive the item directly. At every other turn
-    /// boundary the item is recorded first, so interruption, shutdown, and a
-    /// competing user submission cannot erase it before the next model request.
     pub(crate) async fn deliver_monitor_notification(
         self: &Arc<Self>,
         notification: MonitorNotification,
         fallback_turn_context: &TurnContext,
     ) {
-        let _delivery_guard = self.input_queue.lock_monitor_delivery().await;
         let item = ContextualUserFragment::into(notification);
+        self.deliver_background_notification(item, fallback_turn_context)
+            .await;
+    }
+
+    pub(crate) async fn deliver_exec_command_completion_notification(
+        self: &Arc<Self>,
+        notification: ExecCommandCompletionNotification,
+        fallback_turn_context: &TurnContext,
+    ) {
+        let item = ContextualUserFragment::into(notification);
+        self.deliver_background_notification(item, fallback_turn_context)
+            .await;
+    }
+
+    /// Persist one background notification and request one coalesced idle wake.
+    ///
+    /// Active regular turns receive the item directly. At every other turn
+    /// boundary the item is recorded first, so interruption, shutdown, and a
+    /// competing user submission cannot erase it before the next model request.
+    async fn deliver_background_notification(
+        self: &Arc<Self>,
+        item: ResponseItem,
+        fallback_turn_context: &TurnContext,
+    ) {
+        let _delivery_guard = self
+            .input_queue
+            .lock_background_notification_delivery()
+            .await;
         if self
             .input_queue
-            .inject_monitor_if_running(&self.active_turn, item.clone())
+            .inject_background_notification_if_running(&self.active_turn, item.clone())
             .await
         {
             return;
@@ -162,24 +185,26 @@ impl Session {
 
         self.record_conversation_items(fallback_turn_context, std::slice::from_ref(&item))
             .await;
-        self.input_queue.request_monitor_wake();
+        self.input_queue.request_background_wake();
         if let Err(err) = self.flush_rollout().await {
-            tracing::warn!("failed to flush monitor notification before wake: {err}");
+            tracing::warn!("failed to flush background notification before wake: {err}");
         }
-        self.input_queue.notify_monitor_wake();
+        self.input_queue.notify_background_wake();
     }
 
-    /// Start at most one regular turn for monitor history waiting for a model
-    /// request. The same lock is used by user/task starts, so no taskless
-    /// `ActiveTurn` can steal a submission race.
-    pub(crate) fn maybe_start_monitor_turn_if_idle(self: &Arc<Self>) -> BoxFuture<'static, ()> {
+    /// Start at most one regular turn for background notifications waiting for
+    /// a model request. The same lock is used by user/task starts, so no
+    /// taskless `ActiveTurn` can steal a submission race.
+    pub(crate) fn maybe_start_background_notification_turn_if_idle(
+        self: &Arc<Self>,
+    ) -> BoxFuture<'static, ()> {
         let session = Arc::clone(self);
         Box::pin(async move {
             let _turn_start_guard = session.input_queue.lock_turn_start().await;
             if session
                 .shutdown_started
                 .load(std::sync::atomic::Ordering::Acquire)
-                || !session.input_queue.monitor_wake_requested()
+                || !session.input_queue.background_wake_requested()
                 || session
                     .input_queue
                     .has_trigger_turn_mailbox_items()

@@ -51,6 +51,18 @@ jobs:
           cargo test -p codex-core --test all \
             suite::unified_exec_idle_wake::yielded_exec_completion_wakes_idle_session_once_and_remains_pollable \
             -- --exact --nocapture --test-threads=1
+          cargo test -p codex-core --lib \
+            unified_exec::tests::yielded_exec_terminal_notification_waits_for_result_and_is_claimed_once \
+            -- --exact --nocapture
+          cargo test -p codex-core --lib \
+            unified_exec::tests::terminal_notification_is_not_claimed_when_exec_command_did_not_yield \
+            -- --exact --nocapture
+          cargo test -p codex-core --lib \
+            unified_exec::tests::removing_terminal_result_does_not_suppress_notification \
+            -- --exact --nocapture
+          cargo test -p codex-core --lib \
+            context::exec_command_completion_notification::tests::notification_fields_are_bounded_for_model_context \
+            -- --exact --nocapture
 
   check:
     if: github.event_name == 'push' || inputs.mode == '' || inputs.mode == 'full'

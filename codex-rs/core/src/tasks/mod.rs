@@ -27,7 +27,7 @@ use tracing::warn;
 use crate::codex_thread::BackgroundTerminalInfo;
 use crate::config::Config;
 use crate::context::ContextualUserFragment;
-use crate::context::MonitorNotification;
+use crate::context::is_background_notification;
 use crate::session::TurnInput;
 use crate::session::session::Session;
 use crate::session::turn::run_hooks_and_record_inputs;
@@ -198,10 +198,10 @@ pub(crate) trait SessionTask: Send + Sync + 'static {
     /// Returns the tracing name for a spawned task span.
     fn span_name(&self) -> &'static str;
 
-    /// Whether monitor notifications can be consumed as model-turn input by
+    /// Whether background notifications can be consumed as model-turn input by
     /// this task. Standalone command tasks share the regular task kind but do
-    /// not sample a model, so they must leave durable monitor wakes intact.
-    fn accepts_monitor_input(&self) -> bool {
+    /// not sample a model, so they must leave durable wakes intact.
+    fn accepts_background_notifications(&self) -> bool {
         true
     }
 
@@ -244,7 +244,7 @@ pub(crate) trait AnySessionTask: Send + Sync + 'static {
 
     fn span_name(&self) -> &'static str;
 
-    fn accepts_monitor_input(&self) -> bool;
+    fn accepts_background_notifications(&self) -> bool;
 
     fn run(
         self: Arc<Self>,
@@ -269,8 +269,8 @@ where
         SessionTask::span_name(self)
     }
 
-    fn accepts_monitor_input(&self) -> bool {
-        SessionTask::accepts_monitor_input(self)
+    fn accepts_background_notifications(&self) -> bool {
+        SessionTask::accepts_background_notifications(self)
     }
 
     fn run(
@@ -553,8 +553,11 @@ impl Session {
             aborted_turn = task.is_some();
             turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
             if let Some(task) = task {
-                self.persist_pending_monitor_items(&active_turn, task.turn_context.as_ref())
-                    .await;
+                self.persist_pending_background_notifications(
+                    &active_turn,
+                    task.turn_context.as_ref(),
+                )
+                .await;
                 self.handle_task_abort(task, reason.clone()).await;
             }
             if aborted_turn {
@@ -573,7 +576,7 @@ impl Session {
         }
         if reason == TurnAbortReason::Interrupted && aborted_turn {
             self.maybe_start_turn_for_pending_work().await;
-            self.input_queue.notify_monitor_wake();
+            self.input_queue.notify_background_wake();
         }
     }
 
@@ -601,7 +604,7 @@ impl Session {
         let task = active_turn.task.take();
         let turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
         if let Some(task) = task {
-            self.persist_pending_monitor_items(&active_turn, task.turn_context.as_ref())
+            self.persist_pending_background_notifications(&active_turn, task.turn_context.as_ref())
                 .await;
             self.handle_task_abort(task, reason.clone()).await;
         }
@@ -615,7 +618,7 @@ impl Session {
 
         if reason == TurnAbortReason::Interrupted {
             self.maybe_start_turn_for_pending_work().await;
-            self.input_queue.notify_monitor_wake();
+            self.input_queue.notify_background_wake();
         }
 
         true
@@ -662,19 +665,22 @@ impl Session {
         let Some(turn_state) = turn_state else {
             return;
         };
-        // Keep pending monitor extraction, terminal history, and the wake
-        // generation ordered with watcher delivery. Otherwise a late watcher
-        // can overtake this turn's older notification or leave it without a
-        // follow-up request.
-        let monitor_delivery_guard = self.input_queue.lock_monitor_delivery().await;
+        // Keep pending notification extraction, terminal history, and wake
+        // generation ordered with background delivery. Otherwise a late
+        // notification can overtake this turn's older notification or leave it
+        // without a follow-up request.
+        let background_delivery_guard = self
+            .input_queue
+            .lock_background_notification_delivery()
+            .await;
         let pending_input = self
             .input_queue
             .take_pending_input_for_turn_state(turn_state.as_ref())
             .await;
-        let has_pending_monitor_items = pending_input.iter().any(|input| {
+        let has_pending_background_notifications = pending_input.iter().any(|input| {
             matches!(
                 input,
-                TurnInput::ResponseItem(item) if MonitorNotification::is_response_item(item)
+                TurnInput::ResponseItem(item) if is_background_notification(item)
             )
         });
         let (turn_had_memory_citation, turn_tool_calls, token_usage_at_turn_start) = {
@@ -692,8 +698,8 @@ impl Session {
             PersistContext::Standard,
         )
         .await;
-        if has_pending_monitor_items {
-            self.input_queue.request_monitor_wake();
+        if has_pending_background_notifications {
+            self.input_queue.request_background_wake();
         }
         // Emit token usage metrics.
         {
@@ -904,25 +910,28 @@ impl Session {
         if let Err(err) = self.flush_rollout().await {
             warn!("failed to flush rollout after emitting terminal turn event: {err}");
         }
-        drop(monitor_delivery_guard);
-        if has_pending_monitor_items {
-            self.input_queue.notify_monitor_wake();
+        drop(background_delivery_guard);
+        if has_pending_background_notifications {
+            self.input_queue.notify_background_wake();
         }
         if cleared_active_turn {
             self.maybe_start_turn_for_pending_work().await;
-            self.input_queue.notify_monitor_wake();
+            self.input_queue.notify_background_wake();
         }
     }
 
-    async fn persist_pending_monitor_items(
+    async fn persist_pending_background_notifications(
         &self,
         active_turn: &ActiveTurn,
         turn_context: &TurnContext,
     ) {
-        let _delivery_guard = self.input_queue.lock_monitor_delivery().await;
+        let _delivery_guard = self
+            .input_queue
+            .lock_background_notification_delivery()
+            .await;
         let items = self
             .input_queue
-            .take_pending_monitor_items_for_turn_state(active_turn.turn_state.as_ref())
+            .take_pending_background_notifications_for_turn_state(active_turn.turn_state.as_ref())
             .await;
         if items.is_empty() {
             return;
@@ -931,11 +940,11 @@ impl Session {
             self.record_conversation_items(turn_context, std::slice::from_ref(item))
                 .await;
         }
-        self.input_queue.request_monitor_wake();
+        self.input_queue.request_background_wake();
         if let Err(err) = self.flush_rollout().await {
-            warn!("failed to flush monitor items during task cleanup: {err}");
+            warn!("failed to flush background notifications during task cleanup: {err}");
         }
-        self.input_queue.notify_monitor_wake();
+        self.input_queue.notify_background_wake();
     }
 
     async fn take_active_turn(&self) -> Option<ActiveTurn> {

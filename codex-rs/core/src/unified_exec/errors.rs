@@ -40,6 +40,21 @@ impl UnifiedExecError {
         Self::ProcessFailed { message }
     }
 
+    /// Preserve output drained by `write_stdin` when a stored process reports
+    /// a deferred failure. The error remains model-visible, so include the
+    /// bounded output that would otherwise be discarded with the process.
+    pub(crate) fn with_collected_process_output(self, output: &[u8]) -> Self {
+        match self {
+            Self::ProcessFailed { message } if !output.is_empty() => Self::ProcessFailed {
+                message: format!(
+                    "{message}\n\nFinal output:\n{}",
+                    String::from_utf8_lossy(output)
+                ),
+            },
+            other => other,
+        }
+    }
+
     pub(crate) fn sandbox_denied(message: String, output: ExecToolCallOutput) -> Self {
         Self::SandboxDenied {
             message,

@@ -43,7 +43,7 @@ impl Session {
     pub(crate) async fn emit_thread_idle_lifecycle_if_idle(&self, cause: ThreadIdleCause) {
         if self.active_turn.lock().await.is_some()
             || self.input_queue.has_trigger_turn_mailbox_items().await
-            || self.input_queue.monitor_wake_requested()
+            || self.input_queue.background_wake_requested()
         {
             return;
         }

@@ -114,11 +114,14 @@ pub async fn update_thread_settings(
     let updates = thread_settings_update(sess, thread_settings).await;
     match sess.update_settings(updates).await {
         Ok(()) => {
-            // A monitor wake may have been held back by Plan mode. The
+            // A background wake may have been held back by Plan mode. The
             // settings submission is already serialized ahead of the internal
             // wake, so retry it after any concurrent delivery has finished.
-            let _monitor_delivery_guard = sess.input_queue.lock_monitor_delivery().await;
-            sess.input_queue.notify_monitor_wake();
+            let _background_delivery_guard = sess
+                .input_queue
+                .lock_background_notification_delivery()
+                .await;
+            sess.input_queue.notify_background_wake();
             sess.send_event_raw_without_materializing_rollout(Event {
                 id: sub_id,
                 msg: thread_settings_applied_event(sess).await,
@@ -732,10 +735,10 @@ pub(super) async fn submission_loop(
                 Ok(sub) => sub,
                 Err(_) => break,
             },
-            _ = sess.input_queue.monitor_wake_notified(),
+            _ = sess.input_queue.background_wake_notified(),
                 if !sess.shutdown_started.load(Ordering::Acquire) =>
             {
-                sess.maybe_start_monitor_turn_if_idle().await;
+                sess.maybe_start_background_notification_turn_if_idle().await;
                 continue;
             }
         };

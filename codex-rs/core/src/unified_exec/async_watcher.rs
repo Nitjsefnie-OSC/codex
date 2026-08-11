@@ -8,9 +8,12 @@ use tokio::time::Duration;
 use tokio::time::Instant;
 use tokio::time::Sleep;
 
+use super::InitialExecCommandState;
 use super::UnifiedExecContext;
 use super::process::OutputHandles;
 use super::process::UnifiedExecProcess;
+use crate::context::ExecCommandCompletion;
+use crate::context::ExecCommandCompletionNotification;
 use crate::exec::MAX_EXEC_OUTPUT_DELTAS_PER_CALL;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
@@ -29,6 +32,23 @@ use codex_protocol::protocol::ExecOutputStream;
 use codex_utils_path_uri::PathUri;
 
 pub(crate) const TRAILING_OUTPUT_GRACE: Duration = Duration::from_millis(100);
+
+pub(crate) struct YieldedExecCompletionContext {
+    initial_exec_command_state: Arc<InitialExecCommandState>,
+    command: String,
+}
+
+impl YieldedExecCompletionContext {
+    pub(crate) fn new(
+        initial_exec_command_state: Arc<InitialExecCommandState>,
+        command: String,
+    ) -> Self {
+        Self {
+            initial_exec_command_state,
+            command,
+        }
+    }
+}
 
 /// Upper bound for a single ExecCommandOutputDelta chunk emitted by unified exec.
 ///
@@ -168,6 +188,7 @@ pub(crate) fn spawn_exit_watcher(
     transcript: Arc<Mutex<HeadTailBuffer>>,
     started_at: Instant,
     network_denial_monitor: Option<tokio::task::JoinHandle<()>>,
+    completion_notification: Option<YieldedExecCompletionContext>,
 ) {
     let exit_token = process.cancellation_token();
     let output_drained = process.output_drained_notify();
@@ -185,10 +206,10 @@ pub(crate) fn spawn_exit_watcher(
         let _interaction_guard = interaction_lock.lock_owned().await;
 
         let duration = Instant::now().saturating_duration_since(started_at);
-        if let Some(message) = process.failure_message() {
+        let completion = if let Some(message) = process.failure_message() {
             emit_failed_exec_end_for_unified_exec(
-                session_ref,
-                turn_ref,
+                Arc::clone(&session_ref),
+                Arc::clone(&turn_ref),
                 call_id,
                 command,
                 cwd,
@@ -196,15 +217,16 @@ pub(crate) fn spawn_exit_watcher(
                 plugin_attribution,
                 transcript,
                 String::new(),
-                message,
+                message.clone(),
                 duration,
             )
             .await;
+            ExecCommandCompletion::Failed { message }
         } else {
             let exit_code = process.exit_code().unwrap_or(-1);
             emit_exec_end_for_unified_exec(
-                session_ref,
-                turn_ref,
+                Arc::clone(&session_ref),
+                Arc::clone(&turn_ref),
                 call_id,
                 command,
                 cwd,
@@ -216,6 +238,28 @@ pub(crate) fn spawn_exit_watcher(
                 duration,
             )
             .await;
+            ExecCommandCompletion::Exited { exit_code }
+        };
+
+        if let Some(completion_notification) = completion_notification
+            && completion_notification
+                .initial_exec_command_state
+                .claim_terminal_notification()
+                .await
+        {
+            session_ref
+                .deliver_exec_command_completion_notification(
+                    ExecCommandCompletionNotification {
+                        session_id: process_id,
+                        command: completion_notification.command,
+                        completion,
+                        output_may_be_available: completion_notification
+                            .initial_exec_command_state
+                            .terminal_result_available(),
+                    },
+                    turn_ref.as_ref(),
+                )
+                .await;
         }
     });
 }
