@@ -53,7 +53,7 @@ impl Session {
             }
         };
         if self.input_queue.has_trigger_turn_mailbox_items().await
-            || self.input_queue.monitor_wake_requested()
+            || self.input_queue.background_wake_requested()
         {
             return;
         }

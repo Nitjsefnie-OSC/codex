@@ -329,10 +329,14 @@ async fn run_turn_sampling_loop_inner(
 
             // Construct the input that we will send to the model.
             // Serialize the history snapshot and wake consumption with
-            // monitor delivery. A notification arriving before this lock is
-            // included in the request and can be claimed; one arriving after
-            // it is released retains its durable wake for a later request.
-            let monitor_delivery_guard = sess.input_queue.lock_monitor_delivery().await;
+            // background notification delivery. A notification arriving before
+            // this lock is included in the request and can be claimed; one
+            // arriving after it is released retains its durable wake for a
+            // later request.
+            let background_delivery_guard = sess
+                .input_queue
+                .lock_background_notification_delivery()
+                .await;
             let sampling_request_input: Vec<ResponseItem> = async {
                 sess.clone_history()
                     .await
@@ -340,8 +344,8 @@ async fn run_turn_sampling_loop_inner(
             }
             .instrument(trace_span!("run_turn.prepare_sampling_request_input"))
             .await;
-            sess.input_queue.claim_monitor_wake();
-            drop(monitor_delivery_guard);
+            sess.input_queue.claim_background_wake();
+            drop(background_delivery_guard);
 
             let responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(
                 sess.installation_id.clone(),

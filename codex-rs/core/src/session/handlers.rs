@@ -533,10 +533,10 @@ pub(super) async fn submission_loop(
                 Ok(sub) => sub,
                 Err(_) => break,
             },
-            _ = sess.input_queue.monitor_wake_notified(),
+            _ = sess.input_queue.background_wake_notified(),
                 if !sess.shutdown_started.load(Ordering::Acquire) =>
             {
-                sess.maybe_start_monitor_turn_if_idle().await;
+                sess.maybe_start_background_notification_turn_if_idle().await;
                 continue;
             }
         };

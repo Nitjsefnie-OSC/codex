@@ -7,6 +7,7 @@ mod contextual_user_message;
 mod current_time_reminder;
 mod environment_context;
 mod environments_instructions;
+mod exec_command_completion_notification;
 mod guardian_followup_review_reminder;
 mod hook_additional_context;
 mod image_resize_notice;
@@ -49,6 +50,8 @@ pub(crate) use contextual_user_message::is_contextual_user_fragment;
 pub(crate) use contextual_user_message::parse_visible_hook_prompt_message;
 pub(crate) use current_time_reminder::CurrentTimeReminder;
 pub(crate) use environments_instructions::EnvironmentsInstructions;
+pub(crate) use exec_command_completion_notification::ExecCommandCompletion;
+pub(crate) use exec_command_completion_notification::ExecCommandCompletionNotification;
 pub(crate) use guardian_followup_review_reminder::GuardianFollowupReviewReminder;
 pub(crate) use hook_additional_context::HookAdditionalContext;
 pub(crate) use image_resize_notice::ImageResizeNotice;
@@ -90,3 +93,8 @@ pub(crate) use token_budget_context::TokenBudgetReminder;
 pub(crate) use turn_aborted::TurnAborted;
 pub(crate) use user_instructions::UserInstructions;
 pub(crate) use user_shell_command::UserShellCommand;
+
+pub(crate) fn is_background_notification(item: &codex_protocol::models::ResponseItem) -> bool {
+    MonitorNotification::is_response_item(item)
+        || ExecCommandCompletionNotification::is_response_item(item)
+}

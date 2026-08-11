@@ -39,6 +39,7 @@ use crate::tools::sandboxing::SandboxAttempt;
 use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
 use crate::unified_exec::ExecCommandRequest;
+use crate::unified_exec::InitialExecCommandState;
 use crate::unified_exec::MAX_UNIFIED_EXEC_PROCESSES;
 use crate::unified_exec::MAX_YIELD_TIME_MS;
 use crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS;
@@ -55,6 +56,7 @@ use crate::unified_exec::UnifiedExecError;
 use crate::unified_exec::UnifiedExecProcessManager;
 use crate::unified_exec::WriteStdinInteractionEvent;
 use crate::unified_exec::WriteStdinRequest;
+use crate::unified_exec::async_watcher::YieldedExecCompletionContext;
 use crate::unified_exec::async_watcher::emit_exec_end_for_unified_exec;
 use crate::unified_exec::async_watcher::emit_failed_exec_end_for_unified_exec;
 use crate::unified_exec::async_watcher::spawn_exit_watcher;
@@ -253,7 +255,7 @@ struct PreparedProcessHandles {
 }
 
 struct InitialExecCommandGuard {
-    active: Option<Arc<AtomicBool>>,
+    state: Option<Arc<InitialExecCommandState>>,
     metrics_sidecar: Option<PluginMetricsSidecar>,
 }
 
@@ -268,12 +270,18 @@ impl InitialExecCommandGuard {
         )
         .await;
     }
+
+    fn mark_yielded(&self) {
+        if let Some(state) = self.state.as_ref() {
+            state.mark_yielded();
+        }
+    }
 }
 
 impl Drop for InitialExecCommandGuard {
     fn drop(&mut self) {
-        if let Some(active) = self.active.as_ref() {
-            active.store(false, Ordering::Release);
+        if let Some(state) = self.state.as_ref() {
+            state.mark_not_yielded();
         }
     }
 }
@@ -559,6 +567,7 @@ impl UnifiedExecProcessManager {
         // Bytes the process produced before the monitor could subscribe. They
         // belong to the monitor now, so the tool result has to put them back in
         // front of what the initial yield collects.
+        let notify_yielded_completion = monitor.is_none();
         let monitor_seed = match monitor {
             Some(attachment) => {
                 self.attach_monitor(&request, context, &process, &transcript, attachment)
@@ -572,7 +581,7 @@ impl UnifiedExecProcessManager {
         // turn cannot drop the last Arc and terminate the background process.
         let process_started_alive = !process.has_exited() && process.exit_code().is_none();
         let mut initial_exec_command_guard = if process_started_alive {
-            let initial_exec_command_active = Arc::new(AtomicBool::new(true));
+            let initial_exec_command_state = Arc::new(InitialExecCommandState::new());
             self.store_process(
                 Arc::clone(&process),
                 context,
@@ -587,16 +596,17 @@ impl UnifiedExecProcessManager {
                 network_denial_monitor,
                 metrics_sidecar,
                 Arc::clone(&transcript),
-                Arc::clone(&initial_exec_command_active),
+                Arc::clone(&initial_exec_command_state),
+                notify_yielded_completion,
             )
             .await;
             InitialExecCommandGuard {
-                active: Some(initial_exec_command_active),
+                state: Some(initial_exec_command_state),
                 metrics_sidecar: None,
             }
         } else {
             InitialExecCommandGuard {
-                active: None,
+                state: None,
                 metrics_sidecar,
             }
         };
@@ -770,6 +780,10 @@ impl UnifiedExecProcessManager {
             (None, exit_code)
         };
 
+        if response_process_id.is_some() {
+            initial_exec_command_guard.mark_yielded();
+        }
+
         let response = ExecCommandToolOutput {
             event_call_id: context.call_id.clone(),
             chunk_id,
@@ -887,8 +901,10 @@ impl UnifiedExecProcessManager {
             let message =
                 network_denial_message_for_session(session.as_ref(), network_approval.clone())
                     .await;
+            let error = fail_process_with_message(process.as_ref(), message)
+                .with_collected_process_output(&collected);
             self.release_process_id(process_id).await;
-            return Err(fail_process_with_message(process.as_ref(), message));
+            return Err(error);
         }
         if let Some(message) = process.failure_message() {
             let finish_result = finish_deferred_network_approval_for_session(
@@ -898,9 +914,12 @@ impl UnifiedExecProcessManager {
             .await;
             self.release_process_id(process_id).await;
             if let Err(message) = finish_result {
-                return Err(fail_process_with_message(process.as_ref(), message));
+                return Err(fail_process_with_message(process.as_ref(), message)
+                    .with_collected_process_output(&collected));
             }
-            return Err(UnifiedExecError::process_failed(message));
+            return Err(
+                UnifiedExecError::process_failed(message).with_collected_process_output(&collected)
+            );
         }
 
         // After polling, refresh_process_state tells us whether the PTY is
@@ -923,7 +942,8 @@ impl UnifiedExecProcessManager {
                 if let Err(message) =
                     finish_network_approval_after_process_exit_for_entry(&entry).await
                 {
-                    return Err(fail_process_with_message(entry.process.as_ref(), message));
+                    return Err(fail_process_with_message(entry.process.as_ref(), message)
+                        .with_collected_process_output(&collected));
                 }
                 (None, exit_code, call_id)
             }
@@ -1048,17 +1068,24 @@ impl UnifiedExecProcessManager {
         network_denial_monitor: Option<tokio::task::JoinHandle<()>>,
         metrics_sidecar: Option<PluginMetricsSidecar>,
         transcript: Arc<tokio::sync::Mutex<HeadTailBuffer>>,
-        initial_exec_command_active: Arc<AtomicBool>,
+        initial_exec_command_state: Arc<InitialExecCommandState>,
+        notify_yielded_completion: bool,
     ) {
         let plugin_metrics_sidecar =
             metrics_sidecar.map(|sidecar| Arc::new(std::sync::Mutex::new(Some(sidecar))));
+        let completion_notification = notify_yielded_completion.then(|| {
+            YieldedExecCompletionContext::new(
+                Arc::clone(&initial_exec_command_state),
+                hook_command.clone(),
+            )
+        });
         let entry = ProcessEntry {
             process: Arc::clone(&process),
             plugin_metrics_sidecar: plugin_metrics_sidecar.clone(),
             call_id: context.call_id.clone(),
             process_id,
             cwd: cwd.clone(),
-            initial_exec_command_active,
+            initial_exec_command_state,
             hook_command,
             tty,
             network_approval,
@@ -1071,13 +1098,6 @@ impl UnifiedExecProcessManager {
             store.processes.insert(process_id, entry);
             pruned_entry
         };
-        // prune_processes_if_needed runs while holding process_store; do async
-        // network-approval cleanup only after dropping that lock.
-        if let Some(pruned_entry) = pruned_entry {
-            unregister_network_approval_for_entry(&pruned_entry).await;
-            pruned_entry.process.terminate();
-        }
-
         spawn_exit_watcher(
             Arc::clone(&process),
             Arc::clone(&context.session),
@@ -1091,7 +1111,17 @@ impl UnifiedExecProcessManager {
             started_at,
             network_denial_monitor,
             plugin_metrics_sidecar,
+            completion_notification,
         );
+
+        // prune_processes_if_needed runs while holding process_store; do async
+        // network-approval cleanup only after dropping that lock. The new
+        // process's watcher is already installed, so cancellation during this
+        // cleanup cannot orphan it.
+        if let Some(pruned_entry) = pruned_entry {
+            unregister_network_approval_for_entry(&pruned_entry).await;
+            pruned_entry.process.terminate();
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1606,19 +1636,37 @@ impl UnifiedExecProcessManager {
     }
 
     pub(crate) async fn terminate_process(&self, process_id: i32) -> bool {
-        let (process, already_exited) = {
+        let (process, already_exited, network_approval, session) = {
             let store = self.process_store.lock().await;
             let Some(entry) = store.processes.get(&process_id) else {
                 return false;
             };
-            (Arc::clone(&entry.process), entry.process.has_exited())
+            (
+                Arc::clone(&entry.process),
+                entry.process.has_exited(),
+                entry.network_approval.clone(),
+                entry.session.clone(),
+            )
         };
 
         if !already_exited && process.terminate_confirmed().await.is_err() {
             return false;
         }
 
-        let entry = {
+        // Keep the process result available until cancellation-prone cleanup
+        // completes. If this future is dropped while unregistering, the exit
+        // watcher can still claim and durably announce the terminal result.
+        if let Some(network_approval) = network_approval
+            && let Some(session) = session.upgrade()
+        {
+            session
+                .services
+                .network_approval
+                .unregister_call(network_approval.registration_id())
+                .await;
+        }
+
+        {
             let mut store = self.process_store.lock().await;
             let Some(entry) = store.processes.get(&process_id) else {
                 return true;
@@ -1626,16 +1674,24 @@ impl UnifiedExecProcessManager {
             if !Arc::ptr_eq(&entry.process, &process) {
                 return true;
             }
-            if entry.initial_exec_command_active.load(Ordering::Acquire) {
+            if entry.initial_exec_command_state.is_pending() {
                 return true;
             }
-            let Some(entry) = store.remove(process_id) else {
+            // Once the watcher has announced a terminal result, retain the
+            // entry so the notification-directed write_stdin poll can collect
+            // it. Capacity pruning and session shutdown remain the bounded
+            // cleanup paths.
+            if entry
+                .initial_exec_command_state
+                .terminal_notification_claimed()
+            {
+                return true;
+            }
+            if store.remove(process_id).is_none() {
                 return false;
-            };
-            entry
-        };
+            }
+        }
 
-        unregister_network_approval_for_entry(&entry).await;
         true
     }
 

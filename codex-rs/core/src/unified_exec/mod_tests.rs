@@ -36,6 +36,47 @@ use tokio::sync::watch;
 use tokio::time::Duration;
 use tokio::time::Instant;
 
+#[tokio::test]
+async fn yielded_exec_terminal_notification_waits_for_result_and_is_claimed_once() {
+    let state = Arc::new(InitialExecCommandState::new());
+    let first_claim = tokio::spawn({
+        let state = Arc::clone(&state);
+        async move { state.claim_terminal_notification().await }
+    });
+
+    tokio::task::yield_now().await;
+    assert!(
+        !first_claim.is_finished(),
+        "terminal delivery must wait until exec_command decides whether it yielded"
+    );
+
+    state.mark_yielded();
+    assert!(
+        first_claim
+            .await
+            .expect("terminal claim task should not panic")
+    );
+    assert!(!state.claim_terminal_notification().await);
+}
+
+#[tokio::test]
+async fn terminal_notification_is_not_claimed_when_exec_command_did_not_yield() {
+    let state = InitialExecCommandState::new();
+    state.mark_not_yielded();
+
+    assert!(!state.claim_terminal_notification().await);
+}
+
+#[tokio::test]
+async fn removing_terminal_result_does_not_suppress_notification() {
+    let state = InitialExecCommandState::new();
+    state.mark_yielded();
+
+    state.mark_terminal_result_unavailable();
+    assert!(state.claim_terminal_notification().await);
+    assert!(!state.terminal_result_available());
+}
+
 async fn test_session_and_turn() -> (Arc<Session>, Arc<TurnContext>) {
     let (session, turn) = make_session_and_context().await;
     (Arc::new(session), Arc::new(turn))
@@ -138,7 +179,7 @@ async fn exec_command_with_tty(
             call_id: context.call_id.clone(),
             process_id,
             cwd: cwd.clone().into(),
-            initial_exec_command_active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            initial_exec_command_state: Arc::new(InitialExecCommandState::new()),
             hook_command: cmd.to_string(),
             tty,
             network_approval: None,
@@ -183,9 +224,7 @@ async fn exec_command_with_tty(
             .processes
             .get_mut(&process_id)
     {
-        entry
-            .initial_exec_command_active
-            .store(false, std::sync::atomic::Ordering::Release);
+        entry.initial_exec_command_state.mark_yielded();
     }
 
     Ok(ExecCommandToolOutput {
@@ -612,7 +651,7 @@ async fn terminating_initial_exec_command_rechecks_initial_response_state() -> a
             call_id: "call".to_string(),
             process_id,
             cwd: cwd.into(),
-            initial_exec_command_active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            initial_exec_command_state: Arc::new(InitialExecCommandState::new()),
             hook_command: "sleep 60".to_string(),
             tty: true,
             network_approval: None,
@@ -639,9 +678,7 @@ async fn terminating_initial_exec_command_rechecks_initial_response_state() -> a
             .processes
             .get_mut(&process_id)
             .expect("process should remain stored until initial response returns");
-        entry
-            .initial_exec_command_active
-            .store(false, std::sync::atomic::Ordering::Release);
+        entry.initial_exec_command_state.mark_yielded();
     }
 
     allow_terminate.notify_waiters();
@@ -686,7 +723,9 @@ async fn terminating_during_stdin_poll_returns_exited_response() -> anyhow::Resu
             call_id: "call".to_string(),
             process_id,
             cwd: cwd.into(),
-            initial_exec_command_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            initial_exec_command_state: Arc::new(InitialExecCommandState::resolved(
+                InitialExecCommandOutcome::Yielded,
+            )),
             hook_command: "sleep 60".to_string(),
             tty: true,
             network_approval: None,

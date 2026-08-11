@@ -78,7 +78,7 @@ impl SessionTask for UserShellCommandTask {
         "session_task.user_shell"
     }
 
-    fn accepts_monitor_input(&self) -> bool {
+    fn accepts_background_notifications(&self) -> bool {
         false
     }
 

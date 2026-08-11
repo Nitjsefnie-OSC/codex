@@ -26,6 +26,8 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Weak;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use codex_network_proxy::NetworkProxy;
 use codex_protocol::models::AdditionalPermissionProfile;
@@ -35,6 +37,7 @@ use codex_utils_path_uri::PathUri;
 use rand::Rng;
 use rand::rng;
 use tokio::sync::Mutex;
+use tokio::sync::watch;
 
 use crate::sandboxing::SandboxPermissions;
 use crate::session::session::Session;
@@ -153,7 +156,11 @@ pub(crate) struct ProcessStore {
 impl ProcessStore {
     fn remove(&mut self, process_id: i32) -> Option<ProcessEntry> {
         self.reserved_process_ids.remove(&process_id);
-        self.processes.remove(&process_id)
+        let entry = self.processes.remove(&process_id)?;
+        entry
+            .initial_exec_command_state
+            .mark_terminal_result_unavailable();
+        Some(entry)
     }
 }
 
@@ -194,7 +201,7 @@ struct ProcessEntry {
     call_id: String,
     process_id: i32,
     cwd: PathUri,
-    initial_exec_command_active: Arc<std::sync::atomic::AtomicBool>,
+    initial_exec_command_state: Arc<InitialExecCommandState>,
     hook_command: String,
     tty: bool,
     network_approval: Option<DeferredNetworkApproval>,
@@ -211,6 +218,98 @@ fn take_plugin_metrics_sidecar(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InitialExecCommandOutcome {
+    Pending,
+    Yielded,
+    NotYielded,
+}
+
+/// Coordinates process exit with the initial `exec_command` result.
+///
+/// A process may exit after the manager decides to return a session id but
+/// before that result reaches the model. The exit watcher waits for this state
+/// instead of inspecting process liveness again, then atomically claims the
+/// single model-visible terminal notification.
+struct InitialExecCommandState {
+    outcome_tx: watch::Sender<InitialExecCommandOutcome>,
+    terminal_notification_claimed: AtomicBool,
+    terminal_result_available: AtomicBool,
+}
+
+impl InitialExecCommandState {
+    fn new() -> Self {
+        let (outcome_tx, _) = watch::channel(InitialExecCommandOutcome::Pending);
+        Self {
+            outcome_tx,
+            terminal_notification_claimed: AtomicBool::new(false),
+            terminal_result_available: AtomicBool::new(true),
+        }
+    }
+
+    #[cfg(test)]
+    fn resolved(outcome: InitialExecCommandOutcome) -> Self {
+        let state = Self::new();
+        state.resolve(outcome);
+        state
+    }
+
+    fn is_pending(&self) -> bool {
+        *self.outcome_tx.borrow() == InitialExecCommandOutcome::Pending
+    }
+
+    fn mark_yielded(&self) {
+        self.resolve(InitialExecCommandOutcome::Yielded);
+    }
+
+    fn mark_not_yielded(&self) {
+        self.resolve(InitialExecCommandOutcome::NotYielded);
+    }
+
+    async fn claim_terminal_notification(&self) -> bool {
+        let mut outcome_rx = self.outcome_tx.subscribe();
+        let outcome = *outcome_rx.borrow_and_update();
+        let outcome = if outcome == InitialExecCommandOutcome::Pending {
+            match outcome_rx
+                .wait_for(|outcome| *outcome != InitialExecCommandOutcome::Pending)
+                .await
+            {
+                Ok(outcome) => *outcome,
+                Err(_) => InitialExecCommandOutcome::NotYielded,
+            }
+        } else {
+            outcome
+        };
+        outcome == InitialExecCommandOutcome::Yielded
+            && !self
+                .terminal_notification_claimed
+                .swap(true, Ordering::AcqRel)
+    }
+
+    fn terminal_result_available(&self) -> bool {
+        self.terminal_result_available.load(Ordering::Acquire)
+    }
+
+    fn terminal_notification_claimed(&self) -> bool {
+        self.terminal_notification_claimed.load(Ordering::Acquire)
+    }
+
+    fn mark_terminal_result_unavailable(&self) {
+        self.terminal_result_available
+            .store(false, Ordering::Release);
+    }
+
+    fn resolve(&self, outcome: InitialExecCommandOutcome) {
+        let _ = self.outcome_tx.send_if_modified(|current| {
+            if *current != InitialExecCommandOutcome::Pending {
+                return false;
+            }
+            *current = outcome;
+            true
+        });
+    }
 }
 
 pub(crate) fn clamp_yield_time(yield_time_ms: u64) -> u64 {
