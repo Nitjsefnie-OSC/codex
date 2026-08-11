@@ -152,6 +152,8 @@ mod tools;
 mod truncation;
 mod turn_state;
 mod unified_exec;
+#[cfg(unix)]
+mod unified_exec_idle_wake;
 mod unified_exec_process_events;
 #[cfg(unix)]
 mod unified_exec_zsh_fork_approvals;
