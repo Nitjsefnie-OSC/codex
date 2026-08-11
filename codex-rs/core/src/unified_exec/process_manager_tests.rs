@@ -1,4 +1,5 @@
 use super::*;
+use crate::unified_exec::InitialExecCommandOutcome;
 use crate::unified_exec::clamp_yield_time;
 use codex_network_proxy::ManagedNetworkSandboxContext;
 use pretty_assertions::assert_eq;

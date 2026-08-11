@@ -10594,7 +10594,6 @@ async fn concurrent_idle_monitor_notifications_are_persisted_once_and_coalesce_w
         2,
         history
             .raw_items()
-            .iter()
             .filter(|item| MonitorNotification::is_response_item(item))
             .count(),
         "racing idle notifications must not be dropped or duplicated"
