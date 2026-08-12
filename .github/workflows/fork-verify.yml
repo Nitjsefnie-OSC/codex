@@ -53,6 +53,10 @@ jobs:
       - name: Yielded exec completion wake regression
         working-directory: codex-rs
         run: |
+          # Swatinem/rust-cache can restore v8's Cargo fingerprint after its
+          # externally supplied static archive was evicted. Rebuild only that
+          # package so the verified archive above is unpacked for this runner.
+          cargo clean -p v8
           run_exact() {
             set +e
             output=$("$@" 2>&1)

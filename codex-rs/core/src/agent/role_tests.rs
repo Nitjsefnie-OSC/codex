@@ -68,7 +68,6 @@ include_permissions_instructions = false
             main_execve_wrapper_exe: Some(PathBuf::from("/runtime/execve-wrapper")),
             ephemeral: Some(true),
             bypass_hook_trust: Some(true),
-            psp: Some(true),
             ..Default::default()
         })
         .build()
@@ -103,7 +102,6 @@ include_permissions_instructions = false
     assert!(config.workspace_roots_explicit);
     assert!(config.ephemeral);
     assert!(config.bypass_hook_trust);
-    assert!(config.psp);
     assert_eq!(config.codex_self_exe, Some(PathBuf::from("/runtime/codex")));
     assert_eq!(
         config.codex_linux_sandbox_exe,

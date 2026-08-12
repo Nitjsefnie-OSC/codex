@@ -262,10 +262,7 @@ impl SessionInner {
             CallbackAdmission::Cancelled | CallbackAdmission::Closed => {
                 let inner = Arc::clone(self);
                 tokio::spawn(async move {
-                    if let Err(error) = inner
-                        .acknowledge_notification(notification_id)
-                        .await
-                    {
+                    if let Err(error) = inner.acknowledge_notification(notification_id).await {
                         inner.fail(error);
                     }
                 });
@@ -275,10 +272,7 @@ impl SessionInner {
                 warn!("code-mode notification was dropped: {error}");
                 let inner = Arc::clone(self);
                 tokio::spawn(async move {
-                    if let Err(error) = inner
-                        .acknowledge_notification(notification_id)
-                        .await
-                    {
+                    if let Err(error) = inner.acknowledge_notification(notification_id).await {
                         inner.fail(error);
                     }
                 });
@@ -312,10 +306,7 @@ impl SessionInner {
                 Ok(Err(error)) => warn!("code-mode notification delegate failed: {error}"),
                 Err(_) => warn!("code-mode notification delegate panicked"),
             }
-            if let Err(error) = inner
-                .acknowledge_notification(notification_id)
-                .await
-            {
+            if let Err(error) = inner.acknowledge_notification(notification_id).await {
                 inner.fail(error);
                 return;
             }

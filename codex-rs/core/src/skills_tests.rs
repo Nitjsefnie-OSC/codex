@@ -5,6 +5,7 @@ use codex_config::ConfigLayerEntry;
 use codex_config::ConfigLayerSource;
 use codex_config::ConfigLayerStack;
 use codex_config::ConfigRequirementsToml;
+use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_exec_server::LOCAL_FS;
 use codex_extension_api::ExtensionData;
 use codex_hooks::SkillActivation;
@@ -18,6 +19,7 @@ use codex_skills_extension::HostSkillsLoadInput;
 use codex_skills_extension::HostSkillsService;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::test_support::PathBufExt;
+use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
@@ -151,6 +153,23 @@ pub(crate) fn quote_skill_test_path(path: &Path) -> String {
         .into_owned()
 }
 
+async fn prepare_test_implicit_skill_activation(
+    session: &Session,
+    turn: &TurnContext,
+    command: &str,
+    workdir: &AbsolutePathBuf,
+) -> Option<SkillActivation> {
+    prepare_implicit_skill_activation(
+        session,
+        turn,
+        command,
+        &PathUri::from_abs_path(workdir),
+        Some(workdir),
+        LOCAL_ENVIRONMENT_ID,
+    )
+    .await
+}
+
 pub(crate) async fn assert_implicit_skill_candidate(fixture: &ImplicitSkillFixture, command: &str) {
     let cwd = fixture
         .turn
@@ -161,7 +180,7 @@ pub(crate) async fn assert_implicit_skill_candidate(fixture: &ImplicitSkillFixtu
         .to_abs_path()
         .expect("test session should use a native cwd");
     assert!(
-        prepare_implicit_skill_activation(&fixture.session, &fixture.turn, command, &cwd)
+        prepare_test_implicit_skill_activation(&fixture.session, &fixture.turn, command, &cwd)
             .await
             .is_some(),
         "exact handler command should prepare an implicit skill candidate: {command}"
@@ -236,7 +255,7 @@ async fn implicit_skill_activation_candidate_reads_current_source_and_keeps_dist
     let fixture = implicit_skill_fixture(SkillScope::Repo).await;
     let command = format!("cat {}", quote_skill_test_path(&fixture.skill_path));
 
-    let original = prepare_implicit_skill_activation(
+    let original = prepare_test_implicit_skill_activation(
         &fixture.session,
         &fixture.turn,
         &command,
@@ -256,7 +275,7 @@ async fn implicit_skill_activation_candidate_reads_current_source_and_keeps_dist
     record_skill_activation(&fixture.turn, original.clone());
 
     std::fs::write(fixture.skill_path.as_path(), EDITED_SKILL_SOURCE).expect("edit skill source");
-    let edited = prepare_implicit_skill_activation(
+    let edited = prepare_test_implicit_skill_activation(
         &fixture.session,
         &fixture.turn,
         &command,
@@ -281,7 +300,7 @@ async fn implicit_skill_activation_candidate_repeated_unchanged_read_collapses_e
     let fixture = implicit_skill_fixture(SkillScope::User).await;
     let command = format!("cat {}", quote_skill_test_path(&fixture.skill_path));
 
-    let first = prepare_implicit_skill_activation(
+    let first = prepare_test_implicit_skill_activation(
         &fixture.session,
         &fixture.turn,
         &command,
@@ -289,7 +308,7 @@ async fn implicit_skill_activation_candidate_repeated_unchanged_read_collapses_e
     )
     .await
     .expect("first recognized read");
-    let second = prepare_implicit_skill_activation(
+    let second = prepare_test_implicit_skill_activation(
         &fixture.session,
         &fixture.turn,
         &command,
@@ -308,7 +327,7 @@ async fn implicit_skill_activation_candidate_repeated_unchanged_read_collapses_e
 async fn implicit_skill_activation_candidate_skips_unrelated_or_unreadable_source() {
     let fixture = implicit_skill_fixture(SkillScope::System).await;
     assert_eq!(
-        prepare_implicit_skill_activation(
+        prepare_test_implicit_skill_activation(
             &fixture.session,
             &fixture.turn,
             "cat unrelated.txt",
@@ -321,7 +340,7 @@ async fn implicit_skill_activation_candidate_skips_unrelated_or_unreadable_sourc
     std::fs::remove_file(fixture.skill_path.as_path()).expect("remove skill source");
     let recognized_command = format!("cat {}", quote_skill_test_path(&fixture.skill_path));
     assert_eq!(
-        prepare_implicit_skill_activation(
+        prepare_test_implicit_skill_activation(
             &fixture.session,
             &fixture.turn,
             &recognized_command,
