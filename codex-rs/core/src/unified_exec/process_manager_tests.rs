@@ -376,6 +376,31 @@ async fn output_collection_preserves_omissions_from_drained_buffer() {
 }
 
 #[tokio::test]
+async fn process_exit_ends_output_collection_while_elicitation_is_paused() {
+    let cancellation_token = CancellationToken::new();
+    let output = OutputHandles {
+        output_buffer: Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default())),
+        output_notify: Arc::new(Notify::new()),
+        output_closed: Arc::new(AtomicBool::new(true)),
+        output_closed_notify: Arc::new(Notify::new()),
+        cancellation_token: cancellation_token.clone(),
+    };
+    let (_pause_tx, pause_state) = tokio::sync::watch::channel(true);
+    let collect = UnifiedExecProcessManager::collect_output_until_deadline(
+        &output,
+        Some(pause_state),
+        Instant::now() + Duration::from_secs(5),
+    );
+
+    cancellation_token.cancel();
+    let collected = tokio::time::timeout(Duration::from_secs(1), collect)
+        .await
+        .expect("process exit should end paused output collection");
+
+    assert_eq!(collected, HeadTailBuffer::default());
+}
+
+#[tokio::test]
 async fn network_denial_fallback_message_names_sandbox_network_proxy() {
     let message = network_denial_message_for_session(/*session*/ None, /*deferred*/ None).await;
 
@@ -404,6 +429,7 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
         Arc::clone(&session),
         crate::session::step_context::StepContext::for_test(Arc::clone(&turn)),
         "call-unified-denied".to_string(),
+        crate::unified_exec::InitialExecCommandOutputDestination::Rollout,
     );
     let request = ExecCommandRequest {
         command: vec![
@@ -607,5 +633,91 @@ async fn pruning_does_not_evict_live_process_while_exited_process_is_finalizing(
     assert_eq!(
         (pruned.map(|entry| entry.process_id), store.processes.len()),
         (None, MAX_UNIFIED_EXEC_PROCESSES)
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn draining_process_store_coordinates_with_terminal_notification_claim() {
+    let process = Arc::new(
+        crate::unified_exec::process_tests::remote_process(
+            codex_exec_server::WriteStatus::Accepted,
+            /*terminate_error*/ None,
+            codex_sandboxing::SandboxType::None,
+        )
+        .await,
+    );
+    let cleanup_wins = Arc::new(InitialExecCommandState::resolved(
+        InitialExecCommandOutcome::Yielded,
+    ));
+    let notification_wins = Arc::new(InitialExecCommandState::resolved(
+        InitialExecCommandOutcome::Yielded,
+    ));
+    let unrecorded = Arc::new(InitialExecCommandState::new());
+    unrecorded.mark_returned();
+    assert_eq!(
+        notification_wins.claim_terminal_notification().await,
+        Some(true)
+    );
+    let mut store = ProcessStore::default();
+    for (process_id, state) in [
+        (1, &cleanup_wins),
+        (2, &notification_wins),
+        (3, &unrecorded),
+    ] {
+        store.reserved_process_ids.insert(process_id);
+        store
+            .reservation_owners
+            .insert(process_id, Arc::downgrade(&process));
+        store.processes.insert(
+            process_id,
+            ProcessEntry {
+                process: Arc::clone(&process),
+                call_id: format!("call-{process_id}"),
+                process_id,
+                cwd: PathUri::parse("file:///tmp").expect("test cwd should be valid"),
+                initial_exec_command_state: Arc::clone(state),
+                hook_command: format!("command-{process_id}"),
+                tty: false,
+                network_approval: None,
+                session: std::sync::Weak::new(),
+                last_used: Instant::now(),
+            },
+        );
+    }
+    store.reserved_process_ids.insert(4);
+
+    let drained = store.drain_unclaimed();
+    let mut retained_process_ids = store.processes.keys().copied().collect::<Vec<_>>();
+    retained_process_ids.sort_unstable();
+    let mut reserved_process_ids = store
+        .reserved_process_ids
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    reserved_process_ids.sort_unstable();
+
+    assert_eq!(
+        (
+            drained
+                .into_iter()
+                .map(|entry| entry.process_id)
+                .collect::<Vec<_>>(),
+            retained_process_ids,
+            reserved_process_ids,
+            cleanup_wins.terminal_result_available(),
+            cleanup_wins.claim_terminal_notification().await,
+            notification_wins.terminal_result_available(),
+            unrecorded.terminal_result_available(),
+        ),
+        (
+            vec![1],
+            vec![2, 3],
+            vec![2, 3, 4],
+            false,
+            Some(false),
+            true,
+            true
+        )
     );
 }

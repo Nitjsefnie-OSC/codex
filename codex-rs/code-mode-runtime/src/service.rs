@@ -284,6 +284,17 @@ impl runtime::SessionRuntimeDelegate for ProtocolDelegate {
             .await
     }
 
+    async fn tool_result_delivered(
+        &self,
+        cell_id: runtime::CellId,
+        runtime_tool_call_id: String,
+        delivered: bool,
+    ) -> Result<(), String> {
+        self.delegate
+            .tool_result_delivered(protocol_cell_id(&cell_id), runtime_tool_call_id, delivered)
+            .await
+    }
+
     fn cell_closed(&self, cell_id: &runtime::CellId) {
         self.delegate.cell_closed(&protocol_cell_id(cell_id));
     }

@@ -270,6 +270,17 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
             .await
     }
 
+    async fn tool_result_delivered(
+        &self,
+        runtime_tool_call_id: String,
+        delivered: bool,
+    ) -> Result<(), String> {
+        self.inner
+            .delegate
+            .tool_result_delivered(self.cell_id.clone(), runtime_tool_call_id, delivered)
+            .await
+    }
+
     async fn commit_completion(
         &self,
         stored_value_writes: HashMap<String, JsonValue>,

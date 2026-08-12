@@ -27,6 +27,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 
 use codex_network_proxy::NetworkProxy;
@@ -93,16 +94,30 @@ pub(crate) struct UnifiedExecContext {
     pub session: Arc<Session>,
     pub step_context: Arc<StepContext>,
     pub call_id: String,
+    pub initial_output_destination: InitialExecCommandOutputDestination,
 }
 
 impl UnifiedExecContext {
-    pub fn new(session: Arc<Session>, step_context: Arc<StepContext>, call_id: String) -> Self {
+    pub fn new(
+        session: Arc<Session>,
+        step_context: Arc<StepContext>,
+        call_id: String,
+        initial_output_destination: InitialExecCommandOutputDestination,
+    ) -> Self {
         Self {
             session,
             step_context,
             call_id,
+            initial_output_destination,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InitialExecCommandOutputDestination {
+    Rollout,
+    CodeMode,
+    Untracked,
 }
 
 #[derive(Debug)]
@@ -151,11 +166,46 @@ impl std::fmt::Debug for WriteStdinInteractionEvent<'_> {
 pub(crate) struct ProcessStore {
     processes: HashMap<i32, ProcessEntry>,
     reserved_process_ids: HashSet<i32>,
+    reservation_owners: HashMap<i32, Weak<UnifiedExecProcess>>,
 }
 
 impl ProcessStore {
+    /// Remove entries that have not already promised a retrievable terminal
+    /// result. Claimed notifications and initial results awaiting recording
+    /// keep their entries until `write_stdin` or later cleanup.
+    fn drain_unclaimed(&mut self) -> Vec<ProcessEntry> {
+        let process_ids = self.processes.keys().copied().collect::<Vec<_>>();
+        let mut removed = Vec::with_capacity(process_ids.len());
+        for process_id in process_ids {
+            let result_is_unrecorded = self
+                .processes
+                .get(&process_id)
+                .is_some_and(|entry| entry.initial_exec_command_state.is_unrecorded());
+            if result_is_unrecorded {
+                continue;
+            }
+            if let Some(entry) = self.remove_unclaimed(process_id) {
+                removed.push(entry);
+            }
+        }
+        removed
+    }
+
+    fn remove_unclaimed(&mut self, process_id: i32) -> Option<ProcessEntry> {
+        let removal_reserved = self.processes.get(&process_id).is_some_and(|entry| {
+            entry
+                .initial_exec_command_state
+                .reserve_unclaimed_terminal_result_removal()
+        });
+        if !removal_reserved {
+            return None;
+        }
+        self.remove(process_id)
+    }
+
     fn remove(&mut self, process_id: i32) -> Option<ProcessEntry> {
         self.reserved_process_ids.remove(&process_id);
+        self.reservation_owners.remove(&process_id);
         let entry = self.processes.remove(&process_id)?;
         entry
             .initial_exec_command_state
@@ -165,13 +215,17 @@ impl ProcessStore {
 }
 
 pub(crate) struct UnifiedExecProcessManager {
-    process_store: Mutex<ProcessStore>,
+    process_store: Arc<Mutex<ProcessStore>>,
+    initial_exec_outputs_pending_recording:
+        Mutex<HashMap<String, Vec<PendingInitialExecCommandOutput>>>,
     /// Watcher metadata for the subset of `process_store` started as monitors.
     /// Not a second process registry — see [`monitors`].
     monitor_store: Mutex<monitors::MonitorStore>,
     /// Serializes watcher registration with shutdown so a newly spawned
     /// watcher cannot be missed by the shutdown join.
-    monitor_watcher_lifecycle_lock: Mutex<()>,
+    watcher_lifecycle_lock: Mutex<()>,
+    shutdown_started: AtomicBool,
+    exec_watcher_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     monitor_watcher_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     max_write_stdin_yield_time_ms: u64,
 }
@@ -179,9 +233,12 @@ pub(crate) struct UnifiedExecProcessManager {
 impl UnifiedExecProcessManager {
     pub(crate) fn new(max_write_stdin_yield_time_ms: u64) -> Self {
         Self {
-            process_store: Mutex::new(ProcessStore::default()),
+            process_store: Arc::new(Mutex::new(ProcessStore::default())),
+            initial_exec_outputs_pending_recording: Mutex::new(HashMap::new()),
             monitor_store: Mutex::new(monitors::MonitorStore::default()),
-            monitor_watcher_lifecycle_lock: Mutex::new(()),
+            watcher_lifecycle_lock: Mutex::new(()),
+            shutdown_started: AtomicBool::new(false),
+            exec_watcher_tasks: Mutex::new(Vec::new()),
             monitor_watcher_tasks: Mutex::new(Vec::new()),
             max_write_stdin_yield_time_ms: max_write_stdin_yield_time_ms
                 .max(MIN_EMPTY_YIELD_TIME_MS),
@@ -220,9 +277,25 @@ fn take_plugin_metrics_sidecar(
         .take()
 }
 
+struct PendingInitialExecCommandOutput {
+    process_id: i32,
+    state: Arc<InitialExecCommandState>,
+    process: Arc<UnifiedExecProcess>,
+    destination: InitialExecCommandOutputDestination,
+}
+
+/// Owns the rollout exec results whose persistence outcome has not yet been
+/// decided. Dropping an uncommitted decision suppresses their completion
+/// notifications and terminates their processes.
+pub(crate) struct InitialExecOutputPersistenceDecision {
+    pending_outputs: Vec<PendingInitialExecCommandOutput>,
+    process_store: Arc<Mutex<ProcessStore>>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InitialExecCommandOutcome {
     Pending,
+    Returned,
     Yielded,
     NotYielded,
 }
@@ -230,22 +303,23 @@ enum InitialExecCommandOutcome {
 /// Coordinates process exit with the initial `exec_command` result.
 ///
 /// A process may exit after the manager decides to return a session id but
-/// before that result reaches the model. The exit watcher waits for this state
-/// instead of inspecting process liveness again, then atomically claims the
+/// before that result is recorded. The exit watcher waits for this state until
+/// rollout recording acknowledges the result, then atomically claims the
 /// single model-visible terminal notification.
 struct InitialExecCommandState {
     outcome_tx: watch::Sender<InitialExecCommandOutcome>,
-    terminal_notification_claimed: AtomicBool,
-    terminal_result_available: AtomicBool,
+    terminal_state: AtomicU8,
 }
+
+const TERMINAL_NOTIFICATION_CLAIMED: u8 = 1 << 0;
+const TERMINAL_RESULT_AVAILABLE: u8 = 1 << 1;
 
 impl InitialExecCommandState {
     fn new() -> Self {
         let (outcome_tx, _) = watch::channel(InitialExecCommandOutcome::Pending);
         Self {
             outcome_tx,
-            terminal_notification_claimed: AtomicBool::new(false),
-            terminal_result_available: AtomicBool::new(true),
+            terminal_state: AtomicU8::new(TERMINAL_RESULT_AVAILABLE),
         }
     }
 
@@ -256,24 +330,49 @@ impl InitialExecCommandState {
         state
     }
 
-    fn is_pending(&self) -> bool {
-        *self.outcome_tx.borrow() == InitialExecCommandOutcome::Pending
+    fn is_unrecorded(&self) -> bool {
+        matches!(
+            *self.outcome_tx.borrow(),
+            InitialExecCommandOutcome::Pending | InitialExecCommandOutcome::Returned
+        )
     }
 
     fn mark_yielded(&self) {
-        self.resolve(InitialExecCommandOutcome::Yielded);
+        self.resolve_returned(InitialExecCommandOutcome::Yielded);
+    }
+
+    fn mark_returned(&self) {
+        self.resolve_pending(InitialExecCommandOutcome::Returned);
     }
 
     fn mark_not_yielded(&self) {
-        self.resolve(InitialExecCommandOutcome::NotYielded);
+        let _ = self.outcome_tx.send_if_modified(|current| {
+            if matches!(
+                current,
+                InitialExecCommandOutcome::Pending | InitialExecCommandOutcome::Returned
+            ) {
+                *current = InitialExecCommandOutcome::NotYielded;
+                true
+            } else {
+                false
+            }
+        });
     }
 
-    async fn claim_terminal_notification(&self) -> bool {
+    async fn claim_terminal_notification(&self) -> Option<bool> {
         let mut outcome_rx = self.outcome_tx.subscribe();
         let outcome = *outcome_rx.borrow_and_update();
-        let outcome = if outcome == InitialExecCommandOutcome::Pending {
+        let outcome = if matches!(
+            outcome,
+            InitialExecCommandOutcome::Pending | InitialExecCommandOutcome::Returned
+        ) {
             match outcome_rx
-                .wait_for(|outcome| *outcome != InitialExecCommandOutcome::Pending)
+                .wait_for(|outcome| {
+                    matches!(
+                        outcome,
+                        InitialExecCommandOutcome::Yielded | InitialExecCommandOutcome::NotYielded
+                    )
+                })
                 .await
             {
                 Ok(outcome) => *outcome,
@@ -282,28 +381,64 @@ impl InitialExecCommandState {
         } else {
             outcome
         };
-        outcome == InitialExecCommandOutcome::Yielded
-            && !self
-                .terminal_notification_claimed
-                .swap(true, Ordering::AcqRel)
+        if outcome != InitialExecCommandOutcome::Yielded {
+            return None;
+        }
+        let previous = self
+            .terminal_state
+            .fetch_or(TERMINAL_NOTIFICATION_CLAIMED, Ordering::AcqRel);
+        (previous & TERMINAL_NOTIFICATION_CLAIMED == 0)
+            .then_some(previous & TERMINAL_RESULT_AVAILABLE != 0)
     }
 
     fn terminal_result_available(&self) -> bool {
-        self.terminal_result_available.load(Ordering::Acquire)
+        self.terminal_state.load(Ordering::Acquire) & TERMINAL_RESULT_AVAILABLE != 0
     }
 
     fn terminal_notification_claimed(&self) -> bool {
-        self.terminal_notification_claimed.load(Ordering::Acquire)
+        self.terminal_state.load(Ordering::Acquire) & TERMINAL_NOTIFICATION_CLAIMED != 0
     }
 
     fn mark_terminal_result_unavailable(&self) {
-        self.terminal_result_available
-            .store(false, Ordering::Release);
+        self.terminal_state
+            .fetch_and(!TERMINAL_RESULT_AVAILABLE, Ordering::AcqRel);
+    }
+
+    fn reserve_unclaimed_terminal_result_removal(&self) -> bool {
+        let mut current = self.terminal_state.load(Ordering::Acquire);
+        loop {
+            if current & TERMINAL_NOTIFICATION_CLAIMED != 0 {
+                return false;
+            }
+            match self.terminal_state.compare_exchange_weak(
+                current,
+                current & !TERMINAL_RESULT_AVAILABLE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     fn resolve(&self, outcome: InitialExecCommandOutcome) {
+        self.resolve_pending(outcome);
+    }
+
+    fn resolve_pending(&self, outcome: InitialExecCommandOutcome) {
         let _ = self.outcome_tx.send_if_modified(|current| {
             if *current != InitialExecCommandOutcome::Pending {
+                return false;
+            }
+            *current = outcome;
+            true
+        });
+    }
+
+    fn resolve_returned(&self, outcome: InitialExecCommandOutcome) {
+        let _ = self.outcome_tx.send_if_modified(|current| {
+            if *current != InitialExecCommandOutcome::Returned {
                 return false;
             }
             *current = outcome;

@@ -402,6 +402,7 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) {
         sess.shutdown_started
             .store(true, std::sync::atomic::Ordering::Release);
     }
+    sess.services.unified_exec_manager.begin_shutdown().await;
     if let Some(startup_prewarm) = sess.take_session_startup_prewarm().await {
         startup_prewarm.abort().await;
     }

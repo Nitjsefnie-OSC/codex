@@ -566,6 +566,10 @@ impl Session {
                 )
                 .await;
                 self.handle_task_abort(task, reason.clone()).await;
+                self.services
+                    .unified_exec_manager
+                    .discard_unrecorded_initial_exec_command_outputs()
+                    .await;
             }
             if aborted_turn {
                 active_turn_to_clear = Some(active_turn);
@@ -620,6 +624,10 @@ impl Session {
             self.persist_pending_background_notifications(&active_turn, task.turn_context.as_ref())
                 .await;
             self.handle_task_abort(task, reason.clone()).await;
+            self.services
+                .unified_exec_manager
+                .discard_unrecorded_initial_exec_command_outputs()
+                .await;
         }
         if let Some(turn_context) = turn_context.as_deref() {
             self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
@@ -678,6 +686,10 @@ impl Session {
         let Some(turn_state) = turn_state else {
             return;
         };
+        self.services
+            .unified_exec_manager
+            .discard_unrecorded_initial_exec_command_outputs()
+            .await;
         // Keep pending notification extraction, terminal history, and wake
         // generation ordered with background delivery. Otherwise a late
         // notification can overtake this turn's older notification or leave it

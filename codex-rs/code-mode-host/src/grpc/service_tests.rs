@@ -2,6 +2,7 @@ use super::GrpcCodeModeHost;
 use super::GrpcStream;
 use codex_code_mode_protocol::grpc as proto;
 use codex_code_mode_protocol::grpc::code_mode_host_server::CodeModeHost;
+use codex_code_mode_protocol::host::MAX_PENDING_DELEGATE_CALLS;
 use futures::FutureExt;
 use futures::StreamExt;
 use pretty_assertions::assert_eq;
@@ -304,6 +305,21 @@ async fn notifications_do_not_delay_cell_completion() {
     assert_eq!(notification.cell_id, cell_id);
     assert_eq!(notification.call_id, "outer-call");
     assert_eq!(notification.text, "pending");
+    assert_eq!(
+        host.state
+            .session(&session_id)
+            .unwrap()
+            .state
+            .lock()
+            .unwrap()
+            .pending_notifications
+            .len(),
+        1
+    );
+    assert_eq!(
+        host.state.delegate_permits.available_permits(),
+        MAX_PENDING_DELEGATE_CALLS - 1
+    );
     assert!(matches!(
         execution.next().await.unwrap().unwrap().event,
         Some(proto::execute_event::Event::Outcome(
@@ -324,9 +340,53 @@ async fn notifications_do_not_delay_cell_completion() {
         }
     );
     host.acknowledge_notification(Request::new(proto::AcknowledgeNotificationRequest {
-        session_id,
+        session_id: session_id.clone(),
         notification_id: notification.notification_id,
     }))
     .await
     .expect("legacy notification acknowledgments remain accepted");
+    assert!(
+        host.state
+            .session(&session_id)
+            .unwrap()
+            .state
+            .lock()
+            .unwrap()
+            .pending_notifications
+            .is_empty()
+    );
+    assert_eq!(
+        host.state.delegate_permits.available_permits(),
+        MAX_PENDING_DELEGATE_CALLS
+    );
+}
+
+#[tokio::test]
+async fn closing_session_releases_unacknowledged_notification_permit() {
+    let host = GrpcCodeModeHost::new();
+    let (session_id, mut session_events) = open_session(&host).await;
+    let mut request = execute_request(
+        &session_id,
+        "execution-notify-cleanup",
+        r#"notify("pending"); text("done");"#,
+    );
+    request.yield_time_ms = Some(60_000);
+    let (_cell_id, _execution) = execute_events(&host, request).await;
+    let event = session_events.next().await.unwrap().unwrap();
+    assert!(matches!(
+        event.event,
+        Some(proto::session_event::Event::Notification(_))
+    ));
+    assert_eq!(
+        host.state.delegate_permits.available_permits(),
+        MAX_PENDING_DELEGATE_CALLS - 1
+    );
+
+    host.close_session(Request::new(proto::CloseSessionRequest { session_id }))
+        .await
+        .expect("close session with pending notification");
+    assert_eq!(
+        host.state.delegate_permits.available_permits(),
+        MAX_PENDING_DELEGATE_CALLS
+    );
 }

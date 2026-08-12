@@ -21,6 +21,7 @@ use codex_protocol::models::FunctionCallOutputContentItem;
 use futures::future::join_all;
 use serde_json::Value as JsonValue;
 use tokio::sync::OnceCell;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::CodeModeConfig;
@@ -64,6 +65,68 @@ pub(crate) fn is_exec_tool_name(tool_name: &ToolName) -> bool {
 pub(crate) struct ExecContext {
     pub(super) session: Arc<Session>,
     pub(super) turn: Arc<TurnContext>,
+}
+
+pub(super) struct NestedToolCallResult {
+    value: JsonValue,
+    yielded_exec: Option<YieldedExecDelivery>,
+    delivery_receipt: Option<oneshot::Sender<()>>,
+}
+
+#[derive(Clone)]
+pub(super) struct YieldedExecDelivery {
+    session: Arc<Session>,
+    call_id: String,
+    process_id: i32,
+}
+
+impl NestedToolCallResult {
+    pub(super) fn track_delivery(
+        &mut self,
+    ) -> Option<(YieldedExecDelivery, oneshot::Receiver<()>)> {
+        let delivery = self.yielded_exec.clone()?;
+        let (receipt_tx, receipt_rx) = oneshot::channel();
+        self.delivery_receipt = Some(receipt_tx);
+        Some((delivery, receipt_rx))
+    }
+
+    pub(super) fn into_delivery_parts(
+        mut self,
+    ) -> (
+        JsonValue,
+        Option<YieldedExecDelivery>,
+        Option<oneshot::Sender<()>>,
+    ) {
+        (
+            self.value,
+            self.yielded_exec.take(),
+            self.delivery_receipt.take(),
+        )
+    }
+
+    pub(super) async fn discard(self) {
+        if let Some(delivery) = &self.yielded_exec {
+            delivery.discard().await;
+        }
+    }
+}
+
+impl YieldedExecDelivery {
+    pub(super) async fn acknowledge(&self) {
+        self.session
+            .services
+            .unified_exec_manager
+            .acknowledge_code_mode_initial_exec_output(&self.call_id, self.process_id)
+            .await;
+    }
+
+    pub(super) async fn discard(&self) {
+        self.session
+            .services
+            .unified_exec_manager
+            .discard_code_mode_initial_exec_outputs(&self.call_id)
+            .await;
+    }
 }
 
 pub(crate) struct CodeModeService {
@@ -329,7 +392,7 @@ async fn call_nested_tool(
     tool_runtime: ToolCallRuntime,
     invocation: CodeModeNestedToolCall,
     cancellation_token: CancellationToken,
-) -> Result<JsonValue, FunctionCallError> {
+) -> Result<NestedToolCallResult, FunctionCallError> {
     let CodeModeNestedToolCall {
         cell_id,
         runtime_tool_call_id,
@@ -347,6 +410,8 @@ async fn call_nested_tool(
         Ok(payload) => payload,
         Err(error) => return Err(FunctionCallError::RespondToModel(error)),
     };
+    let acknowledges_yielded_exec =
+        tool_name.is_default_namespace() && tool_name.name == "exec_command";
 
     let call = ToolCall {
         tool_name: tool_name.with_default_namespace(),
@@ -354,6 +419,7 @@ async fn call_nested_tool(
         payload,
         encrypted_function_args: None,
     };
+    let nested_call_id = call.call_id.clone();
     exec.session
         .services
         .analytics_events_client
@@ -372,8 +438,46 @@ async fn call_nested_tool(
             },
             cancellation_token,
         )
-        .await?;
-    Ok(result.code_mode_result())
+        .await;
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            if acknowledges_yielded_exec {
+                exec.session
+                    .services
+                    .unified_exec_manager
+                    .discard_code_mode_initial_exec_outputs(&nested_call_id)
+                    .await;
+            }
+            return Err(error);
+        }
+    };
+    let result = result.code_mode_result();
+    let yielded_exec = if acknowledges_yielded_exec {
+        result
+            .get("session_id")
+            .and_then(JsonValue::as_i64)
+            .and_then(|session_id| i32::try_from(session_id).ok())
+            .map(|process_id| YieldedExecDelivery {
+                session: Arc::clone(&exec.session),
+                call_id: nested_call_id.clone(),
+                process_id,
+            })
+    } else {
+        None
+    };
+    if acknowledges_yielded_exec && yielded_exec.is_none() {
+        exec.session
+            .services
+            .unified_exec_manager
+            .discard_code_mode_initial_exec_outputs(&nested_call_id)
+            .await;
+    }
+    Ok(NestedToolCallResult {
+        value: result,
+        yielded_exec,
+        delivery_receipt: None,
+    })
 }
 
 fn build_nested_tool_payload(

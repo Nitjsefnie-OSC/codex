@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use codex_code_mode_protocol::CodeModeNestedToolCall;
 use codex_code_mode_protocol::host::ClientToHost;
@@ -46,6 +47,7 @@ impl CellKey {
 
 struct DelegateCall {
     cell: CellKey,
+    is_delivery_receipt: bool,
     cancellation: CancellationToken,
     completion_stop: CancellationToken,
 }
@@ -63,6 +65,11 @@ enum DelegateTask {
         call_id: String,
         cell_id: codex_code_mode_protocol::CellId,
         text: String,
+    },
+    ToolResultDelivered {
+        cell_id: codex_code_mode_protocol::CellId,
+        runtime_tool_call_id: String,
+        delivered: bool,
     },
 }
 
@@ -118,7 +125,17 @@ impl DelegateRuntime {
             return Err(DelegateStartError::Duplicate(id));
         }
         self.remember_request(id);
-        if self.calls.len() >= MAX_PENDING_DELEGATE_CALLS {
+        let is_delivery_receipt = matches!(&request, DelegateRequest::ToolResultDelivered { .. });
+        let ordinary_calls = self
+            .calls
+            .values()
+            .filter(|call| !call.is_delivery_receipt)
+            .count();
+        let receipt_active = self.calls.values().any(|call| call.is_delivery_receipt);
+        if (is_delivery_receipt
+            && (receipt_active || self.calls.len() >= MAX_PENDING_DELEGATE_CALLS + 1))
+            || (!is_delivery_receipt && ordinary_calls >= MAX_PENDING_DELEGATE_CALLS)
+        {
             return Err(DelegateStartError::CapacityExceeded);
         }
         let cancellation = CancellationToken::new();
@@ -137,6 +154,15 @@ impl DelegateRuntime {
                 cell_id: target.cell_id.clone(),
                 text,
             },
+            DelegateRequest::ToolResultDelivered {
+                cell_id: _,
+                runtime_tool_call_id,
+                delivered,
+            } => DelegateTask::ToolResultDelivered {
+                cell_id: target.cell_id.clone(),
+                runtime_tool_call_id,
+                delivered,
+            },
         };
         let delegate = target.delegate;
         let task_cancellation = cancellation.clone();
@@ -154,6 +180,14 @@ impl DelegateRuntime {
                     .notify(call_id, cell_id, text, task_cancellation)
                     .await
                     .map(|()| DelegateResponse::NotificationDelivered),
+                DelegateTask::ToolResultDelivered {
+                    cell_id,
+                    runtime_tool_call_id,
+                    delivered,
+                } => delegate
+                    .tool_result_delivered(cell_id, runtime_tool_call_id, delivered)
+                    .await
+                    .map(|()| DelegateResponse::ToolResultDeliveryRecorded),
             }
         });
         let completion_stop = CancellationToken::new();
@@ -164,6 +198,7 @@ impl DelegateRuntime {
                     session_id: target.session_id,
                     cell_id: target.cell_id,
                 },
+                is_delivery_receipt,
                 cancellation,
                 completion_stop: completion_stop.clone(),
             },
@@ -257,7 +292,8 @@ impl ConnectionDriver {
     ) -> bool {
         let wire_cell_id = match &request {
             DelegateRequest::InvokeTool { invocation } => &invocation.cell_id,
-            DelegateRequest::Notify { cell_id, .. } => cell_id,
+            DelegateRequest::Notify { cell_id, .. }
+            | DelegateRequest::ToolResultDelivered { cell_id, .. } => cell_id,
         };
         let target = match self.sessions.delegate_target(&session_id, wire_cell_id) {
             Ok(target) => target,
@@ -319,7 +355,59 @@ impl ConnectionDriver {
             }
         };
         let lane = message.transport_lane();
-        self.queue_frame(frame, lane)
+        let is_delivery_receipt = matches!(
+            message,
+            ClientToHost::DelegateResponse {
+                result: WireResult::Ok {
+                    value: DelegateResponse::ToolResultDeliveryRecorded,
+                },
+                ..
+            }
+        );
+        self.queue_delegate_response(frame, lane, is_delivery_receipt)
+    }
+
+    fn queue_delegate_response(
+        &mut self,
+        frame: EncodedFrame,
+        lane: codex_code_mode_protocol::host::TransportLane,
+        is_delivery_receipt: bool,
+    ) -> bool {
+        let permits = if is_delivery_receipt {
+            &self.receipt_response_permits
+        } else {
+            &self.delegate_response_permits
+        };
+        let Ok(permit) = Arc::clone(permits).try_acquire_owned() else {
+            self.fail("code-mode client has too many queued delegate responses".to_string());
+            return false;
+        };
+        let outgoing_tx = match lane {
+            codex_code_mode_protocol::host::TransportLane::Control => self.outgoing_tx.clone(),
+            codex_code_mode_protocol::host::TransportLane::Bulk => {
+                self.bulk_tx.as_ref().unwrap_or(&self.outgoing_tx).clone()
+            }
+        };
+        let event_tx = self.event_tx.clone();
+        let cancellation = self.cancellation.clone();
+        tokio::spawn(async move {
+            let result = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return,
+                result = outgoing_tx.send(frame) => result,
+            };
+            drop(permit);
+            if result.is_err() {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => {}
+                    _ = event_tx.send(DriverEvent::Failed(
+                        "code-mode host writer closed before delegate response".to_string(),
+                    )) => {}
+                }
+            }
+        });
+        true
     }
 
     pub(super) fn close_cell(&mut self, session_id: SessionId, cell_id: WireCellId) -> bool {
