@@ -147,7 +147,14 @@ pub(super) async fn handle(
     match mode {
         TurnInputMode::StartOrSteer => start_or_steer(session, request, submission_id).await,
         TurnInputMode::StartIfIdle => {
-            start_if_idle(session, request, submission_id, /*is_recovery*/ false).await
+            start_if_idle(
+                session,
+                request,
+                submission_id,
+                /*is_recovery*/ false,
+                MailboxParentProvenance::Ignore,
+            )
+            .await
         }
         TurnInputMode::Steer { expected_turn_id } => {
             steer(session, request, expected_turn_id, submission_id).await
@@ -161,7 +168,28 @@ pub(super) async fn handle_recovery(
     submission_id: String,
 ) -> CodexResult<TurnInputSubmission> {
     let request = TurnInputRequest::user_input(Vec::new()).with_thread_settings(thread_settings);
-    start_if_idle(session, request, submission_id, /*is_recovery*/ true).await
+    start_if_idle(
+        session,
+        request,
+        submission_id,
+        /*is_recovery*/ true,
+        MailboxParentProvenance::Ignore,
+    )
+    .await
+}
+
+pub(super) async fn handle_background_wake(
+    session: &Arc<Session>,
+    submission_id: String,
+) -> CodexResult<TurnInputSubmission> {
+    start_if_idle(
+        session,
+        TurnInputRequest::user_input(Vec::new()),
+        submission_id,
+        /*is_recovery*/ false,
+        MailboxParentProvenance::Attribute,
+    )
+    .await
 }
 
 async fn start_or_steer(
@@ -254,6 +282,7 @@ async fn start_if_idle(
     request: TurnInputRequest,
     submission_id: String,
     is_recovery: bool,
+    mailbox_parent_provenance: MailboxParentProvenance,
 ) -> CodexResult<TurnInputSubmission> {
     let _turn_start_guard = session.input_queue.lock_turn_start().await;
     if session
@@ -372,7 +401,7 @@ async fn start_if_idle(
             turn_context,
             task_input,
             RegularTask::new(),
-            MailboxParentProvenance::Ignore,
+            mailbox_parent_provenance,
         )
         .await;
     Ok(TurnInputSubmission::Started {
@@ -494,6 +523,10 @@ impl Session {
         responsesapi_client_metadata: Option<HashMap<String, String>>,
         incoming_root_turn_id: Option<Option<String>>,
     ) -> Result<String, NotSubmittedReason> {
+        let _delivery_guard = self
+            .input_queue
+            .lock_background_notification_delivery()
+            .await;
         let mut active = self.active_turn.lock().await;
         let Some(active_turn) = active.as_mut() else {
             return Err(NotSubmittedReason::NoActiveTurn);
@@ -565,8 +598,9 @@ impl Session {
                 .mark_root_turn_ambiguous();
         }
         self.input_queue
-            .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
+            .drain_mailbox_into_turn_state_before_input(
                 active_turn.turn_state.as_ref(),
+                Some(active_task.turn_context.turn_metadata_state.as_ref()),
                 pending_input,
             )
             .await;

@@ -6,6 +6,8 @@ use crate::config::ConfigBuilder;
 use crate::config::ConfigOverrides;
 use crate::config::test_config;
 use crate::context::ContextualUserFragment;
+use crate::context::ExecCommandCompletion;
+use crate::context::ExecCommandCompletionNotification;
 use crate::context::MonitorNotification;
 use crate::context::TurnAborted;
 use crate::environment_selection::ThreadEnvironments;
@@ -85,6 +87,7 @@ use tracing::Span;
 use crate::connectors::AppInfo;
 use crate::rollout::recorder::RolloutRecorder;
 use crate::state::ActiveTurn;
+use crate::state::FinishingTurn;
 use crate::state::TaskKind;
 use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskResult;
@@ -211,7 +214,9 @@ impl StepContext {
         let environments = turn.environments.clone();
         Arc::new(Self {
             turn: Arc::clone(&turn),
-            response_identity: Arc::new(crate::session::step_context::ResponseIdentityState::default()),
+            response_identity: Arc::new(
+                crate::session::step_context::ResponseIdentityState::default(),
+            ),
             environments,
             selected_capability_roots: Vec::new(),
             executor_capability_discovery: None,
@@ -7495,9 +7500,11 @@ async fn shutdown_complete_does_not_append_to_thread_store_after_shutdown() {
     assert!(session.async_hook_results.is_closed());
     assert!(session.async_hook_results.is_empty());
     assert!(result_sender.is_closed());
-    assert!(session
-        .shutdown_started
-        .load(std::sync::atomic::Ordering::Acquire));
+    assert!(
+        session
+            .shutdown_started
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
 
     assert_eq!(
         codex_thread_store::InMemoryThreadStoreCalls {
@@ -10815,6 +10822,493 @@ async fn trigger_turn_mailbox_mail_waits_for_next_turn_after_answer_boundary() {
     sess.abort_all_tasks(TurnAbortReason::Replaced).await;
 
     assert!(sess.input_queue.has_trigger_turn_mailbox_items().await);
+}
+
+#[tokio::test]
+async fn active_completion_preserves_earlier_mailbox_order() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let worker = AgentPath::try_from("/root/worker").expect("worker path should parse");
+    let progress = InterAgentCommunication::new(
+        worker.clone(),
+        AgentPath::root(),
+        Vec::new(),
+        "progress".to_string(),
+        /*trigger_turn*/ false,
+    );
+    let completion = InterAgentCommunication::new(
+        worker,
+        AgentPath::root(),
+        Vec::new(),
+        "done".to_string(),
+        /*trigger_turn*/ false,
+    );
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: true,
+        },
+    )
+    .await;
+    sess.input_queue
+        .enqueue_mailbox_communication(
+            progress.clone(),
+            /*parent_turn_id*/ None,
+            /*root_turn_id*/ None,
+        )
+        .await;
+
+    sess.deliver_inter_agent_completion(completion.clone())
+        .await;
+
+    assert_eq!(
+        (sess.input_queue.get_pending_input(&sess.active_turn).await).0,
+        vec![
+            TurnInput::InterAgentCommunication(progress),
+            TurnInput::AgentCompletion(completion),
+        ]
+    );
+    sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+}
+
+#[tokio::test]
+async fn active_mailbox_precedes_later_steer() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let progress = InterAgentCommunication::new(
+        AgentPath::try_from("/root/worker").expect("worker path should parse"),
+        AgentPath::root(),
+        Vec::new(),
+        "progress before steer".to_string(),
+        /*trigger_turn*/ false,
+    );
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: true,
+        },
+    )
+    .await;
+    {
+        let _delivery_guard = sess
+            .input_queue
+            .lock_background_notification_delivery()
+            .await;
+        sess.input_queue
+            .enqueue_or_inject_mailbox_communication(
+                &sess.active_turn,
+                progress.clone(),
+                /*parent_turn_id*/ None,
+                /*root_turn_id*/ None,
+            )
+            .await;
+    }
+
+    assert_eq!(
+        submit_steer_only(
+            &sess,
+            vec![UserInput::Text {
+                text: "steer after progress".to_string(),
+                text_elements: Vec::new(),
+            }],
+            &tc.sub_id,
+        )
+        .await,
+        TurnInputSubmission::Steered {
+            turn_id: tc.sub_id.clone(),
+        }
+    );
+
+    assert_eq!(
+        (sess.input_queue.get_pending_input(&sess.active_turn).await).0,
+        vec![
+            TurnInput::InterAgentCommunication(progress),
+            TurnInput::UserInput {
+                content: vec![UserInput::Text {
+                    text: "steer after progress".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                client_id: None,
+            },
+        ]
+    );
+    sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+}
+
+#[tokio::test]
+async fn deferred_mailbox_precedes_later_injected_context() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let progress = InterAgentCommunication::new(
+        AgentPath::try_from("/root/worker").expect("worker path should parse"),
+        AgentPath::root(),
+        Vec::new(),
+        "progress before injected context".to_string(),
+        /*trigger_turn*/ false,
+    );
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: true,
+        },
+    )
+    .await;
+    sess.input_queue
+        .defer_mailbox_delivery_to_next_turn(&sess.active_turn, &tc.sub_id)
+        .await;
+    sess.input_queue
+        .enqueue_mailbox_communication(
+            progress.clone(),
+            /*parent_turn_id*/ None,
+            /*root_turn_id*/ None,
+        )
+        .await;
+    let injected = user_message("context after progress");
+
+    sess.inject_if_running(vec![injected.clone()])
+        .await
+        .expect("context should inject into the running turn");
+
+    assert_eq!(
+        (sess.input_queue.get_pending_input(&sess.active_turn).await).0,
+        vec![
+            TurnInput::InterAgentCommunication(progress),
+            TurnInput::ResponseItem(injected.into()),
+        ]
+    );
+    sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+}
+
+#[tokio::test]
+async fn idle_mailbox_precedes_later_history_injection() {
+    let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
+    let progress = InterAgentCommunication::new(
+        AgentPath::try_from("/root/worker").expect("worker path should parse"),
+        AgentPath::root(),
+        Vec::new(),
+        "idle progress before injection".to_string(),
+        /*trigger_turn*/ false,
+    );
+    sess.input_queue
+        .enqueue_mailbox_communication(
+            progress, /*parent_turn_id*/ None, /*root_turn_id*/ None,
+        )
+        .await;
+
+    sess.inject_no_new_turn(
+        vec![user_message("history injection after progress")],
+        /*current_turn_context*/ None,
+    )
+    .await;
+
+    let history = sess.clone_history().await;
+    let texts = history
+        .raw_items()
+        .filter_map(|item| match item {
+            ResponseItem::AgentMessage { content, .. } => {
+                content.first().and_then(|content| match content {
+                    AgentMessageInputContent::InputText { text } => Some(text.as_str()),
+                    AgentMessageInputContent::EncryptedContent { .. } => None,
+                })
+            }
+            ResponseItem::Message { content, .. } => {
+                content.first().and_then(|content| match content {
+                    ContentItem::InputText { text } => Some(text.as_str()),
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        texts,
+        vec![
+            "idle progress before injection",
+            "history injection after progress",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn non_regular_task_persists_older_idle_mailbox_before_start() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let progress = InterAgentCommunication::new(
+        AgentPath::try_from("/root/worker").expect("worker path should parse"),
+        AgentPath::root(),
+        Vec::new(),
+        "idle progress before review".to_string(),
+        /*trigger_turn*/ false,
+    );
+    sess.input_queue
+        .enqueue_mailbox_communication(
+            progress, /*parent_turn_id*/ None, /*root_turn_id*/ None,
+        )
+        .await;
+
+    sess.spawn_task(
+        Arc::clone(&tc),
+        vec![TurnInput::UserInput {
+            content: vec![UserInput::Text {
+                text: "review after progress".to_string(),
+                text_elements: Vec::new(),
+            }],
+            client_id: None,
+        }],
+        NeverEndingTask {
+            kind: TaskKind::Review,
+            listen_to_cancellation_token: true,
+        },
+    )
+    .await;
+
+    let history = sess.clone_history().await;
+    assert!(history.raw_items().any(|item| {
+        matches!(item, ResponseItem::AgentMessage { content, .. }
+            if matches!(content.first(), Some(AgentMessageInputContent::InputText { text }) if text == "idle progress before review"))
+    }));
+    sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+}
+
+#[tokio::test]
+async fn non_regular_task_preserves_older_trigger_mail_wake() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let trigger = InterAgentCommunication::new(
+        AgentPath::try_from("/root/worker").expect("worker path should parse"),
+        AgentPath::root(),
+        Vec::new(),
+        "trigger before review".to_string(),
+        /*trigger_turn*/ true,
+    );
+    sess.input_queue
+        .enqueue_mailbox_communication(
+            trigger,
+            Some("parent-turn".to_string()),
+            /*root_turn_id*/ None,
+        )
+        .await;
+
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        NeverEndingTask {
+            kind: TaskKind::Review,
+            listen_to_cancellation_token: true,
+        },
+    )
+    .await;
+
+    assert!(sess.input_queue.background_wake_requested());
+    sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+}
+
+#[tokio::test]
+async fn interrupted_finishing_turn_publishes_persisted_completion_wake() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let completion = InterAgentCommunication::new(
+        AgentPath::try_from("/root/worker").expect("worker path should parse"),
+        AgentPath::root(),
+        Vec::new(),
+        "completion during finish".to_string(),
+        /*trigger_turn*/ false,
+    );
+    let (terminal_persisted_tx, terminal_persisted_rx) = tokio::sync::watch::channel(false);
+    {
+        let mut active = sess.active_turn.lock().await;
+        let active_turn = active.get_or_insert_with(ActiveTurn::default);
+        active_turn.finishing = Some(FinishingTurn {
+            turn_context: Arc::clone(&tc),
+            terminal_persisted: terminal_persisted_rx,
+        });
+    }
+    sess.deliver_inter_agent_completion(completion).await;
+    terminal_persisted_tx.send_replace(true);
+
+    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        sess.input_queue.background_wake_notified(),
+    )
+    .await
+    .expect("interrupt should publish the persisted completion wake");
+    let (_, pending_activity) = sess.input_queue.subscribe_activity(None).await;
+    assert_eq!(pending_activity, Some(InputQueueActivity::Mailbox));
+}
+
+#[tokio::test]
+async fn interrupted_finishing_turn_does_not_wake_for_queue_only_mail() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let progress = InterAgentCommunication::new(
+        AgentPath::try_from("/root/worker").expect("worker path should parse"),
+        AgentPath::root(),
+        Vec::new(),
+        "queue only during finish".to_string(),
+        /*trigger_turn*/ false,
+    );
+    let (terminal_persisted_tx, terminal_persisted_rx) = tokio::sync::watch::channel(false);
+    {
+        let mut active = sess.active_turn.lock().await;
+        let active_turn = active.get_or_insert_with(ActiveTurn::default);
+        active_turn.finishing = Some(FinishingTurn {
+            turn_context: Arc::clone(&tc),
+            terminal_persisted: terminal_persisted_rx,
+        });
+    }
+    sess.input_queue
+        .enqueue_mailbox_communication(
+            progress, /*parent_turn_id*/ None, /*root_turn_id*/ None,
+        )
+        .await;
+    terminal_persisted_tx.send_replace(true);
+
+    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+
+    assert!(!sess.input_queue.background_wake_requested());
+}
+
+#[tokio::test]
+async fn replaced_finishing_turn_persists_older_mailbox_input() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let progress = InterAgentCommunication::new(
+        AgentPath::try_from("/root/worker").expect("worker path should parse"),
+        AgentPath::root(),
+        Vec::new(),
+        "mail before replacement".to_string(),
+        /*trigger_turn*/ false,
+    );
+    let (terminal_persisted_tx, terminal_persisted_rx) = tokio::sync::watch::channel(false);
+    {
+        let mut active = sess.active_turn.lock().await;
+        let active_turn = active.get_or_insert_with(ActiveTurn::default);
+        active_turn.finishing = Some(FinishingTurn {
+            turn_context: Arc::clone(&tc),
+            terminal_persisted: terminal_persisted_rx,
+        });
+    }
+    sess.input_queue
+        .enqueue_mailbox_communication(
+            progress, /*parent_turn_id*/ None, /*root_turn_id*/ None,
+        )
+        .await;
+    terminal_persisted_tx.send_replace(true);
+
+    sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+
+    let history = sess.clone_history().await;
+    let texts = history
+        .raw_items()
+        .filter_map(|item| match item {
+            ResponseItem::AgentMessage { content, .. } => content.first(),
+            _ => None,
+        })
+        .filter_map(|content| match content {
+            AgentMessageInputContent::InputText { text } => Some(text.as_str()),
+            AgentMessageInputContent::EncryptedContent { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(texts, vec!["mail before replacement"]);
+}
+
+#[tokio::test]
+async fn active_exec_completion_does_not_publish_agent_mailbox_activity() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: true,
+        },
+    )
+    .await;
+    let turn_state = sess
+        .active_turn
+        .lock()
+        .await
+        .as_ref()
+        .map(|turn| Arc::clone(&turn.turn_state))
+        .expect("active turn state");
+    let (mut activity_rx, pending_activity) = sess
+        .input_queue
+        .subscribe_activity(Some(turn_state.as_ref()))
+        .await;
+    assert_eq!(pending_activity, None);
+
+    sess.deliver_exec_command_completion_notification(
+        ExecCommandCompletionNotification {
+            session_id: 1,
+            command: "build".to_string(),
+            completion: ExecCommandCompletion::Exited { exit_code: 0 },
+            output_may_be_available: true,
+        },
+        tc.as_ref(),
+    )
+    .await;
+
+    tokio::select! {
+        biased;
+        _ = activity_rx.changed() => panic!("exec completion must not publish agent mailbox activity"),
+        _ = tokio::task::yield_now() => {}
+    }
+    sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+}
+
+#[tokio::test]
+async fn aborted_active_turn_persists_ordered_mail_and_completion() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let worker = AgentPath::try_from("/root/worker").expect("worker path should parse");
+    let progress = InterAgentCommunication::new(
+        worker.clone(),
+        AgentPath::root(),
+        Vec::new(),
+        "progress before abort".to_string(),
+        /*trigger_turn*/ false,
+    );
+    let completion = InterAgentCommunication::new(
+        worker,
+        AgentPath::root(),
+        Vec::new(),
+        "completion before abort".to_string(),
+        /*trigger_turn*/ false,
+    );
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: true,
+        },
+    )
+    .await;
+    sess.input_queue
+        .enqueue_mailbox_communication(
+            progress, /*parent_turn_id*/ None, /*root_turn_id*/ None,
+        )
+        .await;
+    sess.deliver_inter_agent_completion(completion).await;
+
+    sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+
+    let history = sess.clone_history().await;
+    let texts = history
+        .raw_items()
+        .filter_map(|item| match item {
+            ResponseItem::AgentMessage { content, .. } => content.first(),
+            _ => None,
+        })
+        .filter_map(|content| match content {
+            AgentMessageInputContent::InputText { text } => Some(text.as_str()),
+            AgentMessageInputContent::EncryptedContent { .. } => None,
+        })
+        .filter(|text| text.contains("before abort"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        texts,
+        vec!["progress before abort", "completion before abort"]
+    );
 }
 
 #[tokio::test]

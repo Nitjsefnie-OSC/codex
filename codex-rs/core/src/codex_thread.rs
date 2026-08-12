@@ -26,6 +26,7 @@ use codex_protocol::error::Result as CodexResult;
 use codex_protocol::mcp::CallToolResult;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::models::ActivePermissionProfile;
+#[cfg(test)]
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
@@ -551,6 +552,7 @@ impl CodexThread {
     }
 
     /// Records a user-role session-prefix message without creating a new user turn boundary.
+    #[cfg(test)]
     pub(crate) async fn inject_user_message_without_turn(&self, message: String) {
         let item = ResponseItem::Message {
             id: None,

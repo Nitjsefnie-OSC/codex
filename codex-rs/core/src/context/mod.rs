@@ -97,4 +97,5 @@ pub(crate) use user_shell_command::UserShellCommand;
 pub(crate) fn is_background_notification(item: &codex_protocol::models::ResponseItem) -> bool {
     MonitorNotification::is_response_item(item)
         || ExecCommandCompletionNotification::is_response_item(item)
+        || SubagentNotification::is_response_item(item)
 }

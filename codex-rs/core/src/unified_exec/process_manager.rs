@@ -2120,11 +2120,6 @@ impl UnifiedExecProcessManager {
         seed
     }
 
-    pub(crate) async fn join_monitor_watchers(&self) {
-        let _watcher_lifecycle_guard = self.watcher_lifecycle_lock.lock().await;
-        self.join_monitor_watchers_locked().await;
-    }
-
     async fn join_exec_watchers_locked(&self) {
         let watchers = std::mem::take(&mut *self.exec_watcher_tasks.lock().await);
         for watcher in watchers {
