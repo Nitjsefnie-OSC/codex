@@ -234,6 +234,20 @@ async fn filtered_subscriptions_receive_ordered_calls_and_unary_completions() {
             }
         ))
     ));
+    for sequence in [1, 2] {
+        assert_eq!(
+            session_events.next().await.unwrap().unwrap(),
+            proto::SessionEvent {
+                event: Some(proto::session_event::Event::ToolResultDelivered(
+                    proto::ToolResultDelivered {
+                        cell_id: cell_id.clone(),
+                        runtime_tool_call_id: format!("tool-{sequence}"),
+                        delivered: true,
+                    },
+                )),
+            }
+        );
+    }
     assert_eq!(
         session_events.next().await.unwrap().unwrap(),
         proto::SessionEvent {
