@@ -101,6 +101,7 @@ pub(crate) struct TurnMetadataState {
     forked_from_thread_id: Option<ThreadId>,
     parent_thread_id: Option<ThreadId>,
     parent_turn_id: OnceLock<String>,
+    attribute_background_parent_turn: AtomicBool,
     subagent_header: Option<String>,
     subagent_kind: Option<String>,
     thread_source: Option<ThreadSource>,
@@ -152,6 +153,7 @@ impl TurnMetadataState {
             forked_from_thread_id,
             parent_thread_id,
             parent_turn_id: OnceLock::new(),
+            attribute_background_parent_turn: AtomicBool::new(false),
             subagent_header: subagent_header_value(session_source),
             subagent_kind: subagent_metadata_kind(session_source),
             thread_source,
@@ -241,6 +243,16 @@ impl TurnMetadataState {
             return;
         }
         let _ = self.parent_turn_id.set(parent_turn_id);
+    }
+
+    pub(crate) fn set_attribute_background_parent_turn(&self, attribute: bool) {
+        self.attribute_background_parent_turn
+            .store(attribute, Ordering::Release);
+    }
+
+    pub(crate) fn attribute_background_parent_turn(&self) -> bool {
+        self.attribute_background_parent_turn
+            .load(Ordering::Acquire)
     }
 
     pub(crate) fn set_responsesapi_client_metadata(

@@ -9,6 +9,7 @@ use codex_features::Feature;
 use codex_login::CodexAuth;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErrorDetails;
+use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -133,6 +134,61 @@ async fn interrupted_v2_agent_is_lost_after_residency_eviction() {
     }
 }
 
+#[tokio::test]
+async fn residency_evicts_completed_children_before_their_completed_parent() {
+    let mut config = test_config().await;
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    config.multi_agent_v2.max_concurrent_threads_per_session = 3;
+    let temp_home = tempfile::tempdir().expect("create temp home");
+    config.codex_home = temp_home.path().to_path_buf().try_into().unwrap();
+    config.cwd = temp_home.path().to_path_buf().try_into().unwrap();
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let root = manager
+        .start_thread(StartThreadOptions::new(config.clone()))
+        .await
+        .expect("start root thread");
+    let control = manager.agent_control();
+    let state = control.upgrade().expect("thread manager should be live");
+
+    let parent_slot = control
+        .reserve_v2_residency_slot(&state, &config, /*protected_thread_id*/ None)
+        .await
+        .expect("parent resident slot");
+    let parent =
+        spawn_v2_subagent(&control, &state, config.clone(), root.thread_id, "parent").await;
+    parent_slot.commit(parent.thread_id);
+
+    let child_slot = control
+        .reserve_v2_residency_slot(&state, &config, /*protected_thread_id*/ None)
+        .await
+        .expect("child resident slot");
+    let child =
+        spawn_v2_subagent(&control, &state, config.clone(), parent.thread_id, "child").await;
+    child_slot.commit(child.thread_id);
+    mark_thread_completed(child.thread.as_ref()).await;
+    mark_thread_completed(parent.thread.as_ref()).await;
+
+    let replacement_slot = control
+        .reserve_v2_residency_slot(&state, &config, /*protected_thread_id*/ None)
+        .await
+        .expect("completed leaf should be evictable");
+
+    assert!(manager.get_thread(parent.thread_id).await.is_ok());
+    match manager.get_thread(child.thread_id).await {
+        Err(err) => match err.details() {
+            CodexErrorDetails::ThreadNotFound(thread_id) => assert_eq!(*thread_id, child.thread_id),
+            _ => panic!("expected evicted child to be missing, got {err:?}"),
+        },
+        Ok(_) => panic!("expected completed child to be evicted before its parent"),
+    }
+    drop(replacement_slot);
+}
+
 async fn spawn_v2_subagent(
     control: &AgentControl,
     state: &Arc<ThreadManagerState>,
@@ -144,7 +200,13 @@ async fn spawn_v2_subagent(
         .spawn_new_thread_with_source(
             config,
             control.clone(),
-            SessionSource::SubAgent(SubAgentSource::Other(label.to_string())),
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: Some(label.to_string()),
+                agent_role: None,
+            }),
             /*history_mode*/ None,
             Some(parent_thread_id),
             /*forked_from_thread_id*/ None,
@@ -162,9 +224,9 @@ async fn mark_thread_completed(thread: &CodexThread) {
     let turn = thread.session.new_default_turn().await;
     thread
         .session
-        .send_event(
-            turn.as_ref(),
-            EventMsg::TurnComplete(TurnCompleteEvent {
+        .send_event_raw(Event {
+            id: turn.sub_id.clone(),
+            msg: EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: turn.sub_id.clone(),
                 started_at: None,
                 last_agent_message: Some("done".to_string()),
@@ -173,7 +235,7 @@ async fn mark_thread_completed(thread: &CodexThread) {
                 duration_ms: None,
                 time_to_first_token_ms: None,
             }),
-        )
+        })
         .await;
     clear_active_turn(thread).await;
 }
@@ -182,16 +244,16 @@ async fn mark_thread_interrupted(thread: &CodexThread) {
     let turn = thread.session.new_default_turn().await;
     thread
         .session
-        .send_event(
-            turn.as_ref(),
-            EventMsg::TurnAborted(TurnAbortedEvent {
+        .send_event_raw(Event {
+            id: turn.sub_id.clone(),
+            msg: EventMsg::TurnAborted(TurnAbortedEvent {
                 turn_id: Some(turn.sub_id.clone()),
                 started_at: None,
                 reason: TurnAbortReason::Interrupted,
                 completed_at: None,
                 duration_ms: None,
             }),
-        )
+        })
         .await;
     clear_active_turn(thread).await;
 }

@@ -246,10 +246,35 @@ impl AgentControl {
         .await
     }
 
-    pub(crate) async fn ensure_v2_agent_loaded(
+    pub(crate) fn ensure_v2_agent_loaded(
+        &self,
+        config: Config,
+        thread_id: ThreadId,
+    ) -> BoxFuture<'_, CodexResult<()>> {
+        Box::pin(self.ensure_v2_agent_loaded_with_admission(
+            config,
+            thread_id,
+            V2ReloadAdmission::CapacityBounded,
+        ))
+    }
+
+    pub(crate) fn ensure_v2_agent_loaded_for_completion(
+        &self,
+        config: Config,
+        thread_id: ThreadId,
+    ) -> BoxFuture<'_, CodexResult<()>> {
+        Box::pin(self.ensure_v2_agent_loaded_with_admission(
+            config,
+            thread_id,
+            V2ReloadAdmission::CompletionDelivery,
+        ))
+    }
+
+    async fn ensure_v2_agent_loaded_with_admission(
         &self,
         mut config: Config,
         thread_id: ThreadId,
+        admission: V2ReloadAdmission,
     ) -> CodexResult<()> {
         let state = self.upgrade()?;
         if state.get_thread(thread_id).await.is_ok() {
@@ -285,7 +310,11 @@ impl AgentControl {
         let (session_source, _) = initial_history
             .get_resumed_session_sources()
             .unwrap_or((stored_source, None));
-        if let Some(role_name) = session_source.get_agent_role() {
+        if matches!(
+            &session_source,
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
+        ) {
+            let role_name = session_source.get_agent_role();
             let runtime_approval_policy = config.permissions.approval_policy.value();
             let runtime_approvals_reviewer = config.approvals_reviewer;
             let runtime_cwd = config.cwd.clone();
@@ -302,7 +331,7 @@ impl AgentControl {
                 ),
             };
 
-            apply_role_to_config_for_multi_agent_v2(&mut config, Some(&role_name))
+            apply_role_to_config_for_multi_agent_v2(&mut config, role_name.as_deref())
                 .await
                 .map_err(CodexErr::InvalidRequest)?;
             config
@@ -336,9 +365,13 @@ impl AgentControl {
                 })?;
             config.model_provider_id = stored_model_provider;
         }
-        let residency_slot = self
-            .reserve_v2_residency_slot(&state, &config, Some(thread_id))
-            .await?;
+        let residency_slot = match admission {
+            V2ReloadAdmission::CapacityBounded => Some(
+                self.reserve_v2_residency_slot(&state, &config, Some(thread_id))
+                    .await?,
+            ),
+            V2ReloadAdmission::CompletionDelivery => None,
+        };
 
         let parent_thread_id = initial_history
             .get_resumed_parent_thread_id()
@@ -363,7 +396,12 @@ impl AgentControl {
             .await
         {
             Ok(reloaded_thread) => {
-                residency_slot.commit(reloaded_thread.thread_id);
+                if let Some(residency_slot) = residency_slot {
+                    residency_slot.commit(reloaded_thread.thread_id);
+                } else {
+                    self.touch_loaded_v2_residency(&state, reloaded_thread.thread_id)
+                        .await;
+                }
                 state.notify_thread_created(reloaded_thread.thread_id);
                 Ok(())
             }

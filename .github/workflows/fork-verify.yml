@@ -79,6 +79,114 @@ jobs:
           run_exact cargo test -p codex-core --test all \
             suite::unified_exec_idle_wake::code_mode_nested_yield_survives_outer_turn_completion_and_wakes_idle_session \
             -- --exact --nocapture --test-threads=1
+          run_exact cargo test -p codex-core --test all \
+            suite::subagent_notifications::multi_agent_v2_completion_wakes_idle_parent_without_wait_or_user_turn \
+            -- --exact --nocapture --test-threads=1
+          run_exact cargo test -p codex-core --test all \
+            suite::subagent_notifications::legacy_completion_wakes_idle_parent_without_wait_or_user_turn \
+            -- --exact --nocapture --test-threads=1
+          run_exact cargo test -p codex-core --lib \
+            session_prefix::tests::successful_completion_messages_are_bounded \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session_prefix::tests::completion_item_is_bounded_with_maximum_path_and_status \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::input_queue::tests::background_notifications_can_be_recovered_before_turn_state_cleanup \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::input_queue::tests::pending_agent_completion_is_reported_as_mailbox_activity \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::input_queue::tests::pending_agent_completion_activity_is_reported_as_mailbox_activity \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::input_queue::tests::pending_legacy_completion_is_reported_as_mailbox_activity \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::input_queue::tests::pending_process_notification_is_not_reported_as_mailbox_activity \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::input_queue::tests::injected_agent_completion_publishes_mailbox_activity \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::input_queue::tests::completion_batch_preserves_earlier_mailbox_order_and_parent \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::input_queue::tests::background_wake_receipts_partition_parent_provenance \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::input_queue::tests::represented_empty_parent_clears_only_that_request_metadata \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::input_queue::tests::foreground_input_remains_ahead_of_later_completion \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::input_queue::tests::interleaved_background_batches_keep_separate_parent_turns \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::tests::active_completion_preserves_earlier_mailbox_order \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::tests::active_mailbox_precedes_later_steer \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::tests::deferred_mailbox_precedes_later_injected_context \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::tests::idle_mailbox_precedes_later_history_injection \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::tests::non_regular_task_persists_older_idle_mailbox_before_start \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::tests::non_regular_task_preserves_older_trigger_mail_wake \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::tests::interrupted_finishing_turn_publishes_persisted_completion_wake \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::tests::interrupted_finishing_turn_does_not_wake_for_queue_only_mail \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::tests::replaced_finishing_turn_persists_older_mailbox_input \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::tests::active_exec_completion_does_not_publish_agent_mailbox_activity \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::tests::aborted_active_turn_persists_ordered_mail_and_completion \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            agent::control::residency::tests::residency_evicts_completed_children_before_their_completed_parent \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            agent::control::tests::ensure_v2_agent_loaded_reloads_registered_unloaded_agent \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            agent::control::tests::multi_agent_v2_completion_queues_message_for_direct_parent \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            thread_manager::tests::thread_prepared_before_shutdown_is_rejected_after_manager_reopens \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            thread_manager::tests::thread_start_is_rejected_while_shutdown_is_in_progress \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            thread_manager::tests::successful_shutdown_reopens_manager_for_fresh_thread_start \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            thread_manager::tests::incomplete_shutdown_keeps_thread_start_fenced \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            thread_manager::tests::overlapping_shutdown_calls_are_serialized \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            tools::handlers::multi_agents::tests::multi_agent_v2_spawn_rejects_oversized_agent_path \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-protocol --lib \
+            agent_path::tests::invalid_names_and_paths_are_rejected \
+            -- --exact --nocapture
           run_exact cargo test -p codex-core --lib \
             unified_exec::tests::yielded_exec_terminal_notification_waits_for_result_and_is_claimed_once \
             -- --exact --nocapture

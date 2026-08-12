@@ -263,22 +263,47 @@ async fn run_turn_sampling_loop_inner(
         // Note that pending_input would be something like a message the user
         // submitted through the UI while the model was running. Though the UI
         // may support this, the model might not.
-        let pending_input = if can_drain_pending_input {
-            sess.input_queue
-                .get_pending_input(&sess.active_turn)
+        let (pending_input, background_batch_persisted) = if can_drain_pending_input {
+            let background_delivery_guard = sess
+                .input_queue
+                .lock_background_notification_delivery()
+                .await;
+            match sess
+                .input_queue
+                .take_next_pending_input_batch(&sess.active_turn)
                 .await
-                .0
+            {
+                crate::session::input_queue::PendingInputBatch::Foreground(items) => {
+                    drop(background_delivery_guard);
+                    (items, false)
+                }
+                crate::session::input_queue::PendingInputBatch::Background {
+                    items,
+                    parent_turn,
+                } => {
+                    let pending_input = items.clone();
+                    sess.persist_background_input_batch(
+                        Arc::clone(&turn_context),
+                        items,
+                        parent_turn,
+                        background_delivery_guard,
+                    )
+                    .await;
+                    (pending_input, true)
+                }
+            }
         } else {
-            Vec::new()
+            (Vec::new(), false)
         };
 
-        if run_hooks_and_record_inputs(
-            &sess,
-            &turn_context,
-            &pending_input,
-            PersistContext::Standard,
-        )
-        .await
+        if !background_batch_persisted
+            && run_hooks_and_record_inputs(
+                &sess,
+                &turn_context,
+                &pending_input,
+                PersistContext::Standard,
+            )
+            .await
         {
             break;
         }
@@ -292,28 +317,27 @@ async fn run_turn_sampling_loop_inner(
         .await;
 
         // Capture once so context, advertised tools, and tool calls share one request view.
-        let step_context = match next_step_context.take() {
-            Some(step_context) => step_context,
-            None if pending_input.is_empty() => {
-                sess.capture_step_context(Arc::clone(&turn_context), &cancellation_token)
-                    .await?
+        let step_context = if pending_input.is_empty() {
+            match next_step_context.take() {
+                Some(step_context) => step_context,
+                None => {
+                    sess.capture_step_context(Arc::clone(&turn_context), &cancellation_token)
+                        .await?
+                }
             }
-            None => {
-                let pending_user_input = turn_user_input(&pending_input);
-                let (required_servers, _) = required_mcp_servers_for_input(
-                    &sess,
-                    turn_context.as_ref(),
-                    &pending_user_input,
-                )
-                .or_cancel(&cancellation_token)
-                .await?;
-                sess.capture_step_context_with_required_mcp_servers(
-                    Arc::clone(&turn_context),
-                    &cancellation_token,
-                    &required_servers,
-                )
-                .await?
-            }
+        } else {
+            next_step_context = None;
+            let pending_user_input = turn_user_input(&pending_input);
+            let (required_servers, _) =
+                required_mcp_servers_for_input(&sess, turn_context.as_ref(), &pending_user_input)
+                    .or_cancel(&cancellation_token)
+                    .await?;
+            sess.capture_step_context_with_required_mcp_servers(
+                Arc::clone(&turn_context),
+                &cancellation_token,
+                &required_servers,
+            )
+            .await?
         };
         let sampling_request_future = async {
             super::time_reminder::maybe_record_current_time_reminder(
@@ -344,15 +368,21 @@ async fn run_turn_sampling_loop_inner(
             }
             .instrument(trace_span!("run_turn.prepare_sampling_request_input"))
             .await;
-            sess.input_queue.claim_background_wake();
-            drop(background_delivery_guard);
-
-            let responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(
+            let background_wake_receipt = sess.input_queue.snapshot_background_wake();
+            let mut responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(
                 sess.installation_id.clone(),
                 window_id,
                 CodexResponsesRequestKind::Turn,
             );
-            run_sampling_request(
+            if turn_context
+                .turn_metadata_state
+                .attribute_background_parent_turn()
+            {
+                background_wake_receipt.apply_parent_turn(&mut responses_metadata);
+            }
+            drop(background_delivery_guard);
+
+            let result = run_sampling_request(
                 Arc::clone(&sess),
                 Arc::clone(&step_context),
                 Arc::clone(&turn_context.extension_data),
@@ -362,11 +392,25 @@ async fn run_turn_sampling_loop_inner(
                 sampling_request_input,
                 cancellation_token.child_token(),
             )
-            .await
+            .await;
+            Ok::<_, CodexErr>((result, background_wake_receipt))
         };
-        let sampling_request_result: CodexResult<_> = sampling_request_future.boxed().await;
+        let (sampling_request_result, background_wake_receipt) =
+            sampling_request_future.boxed().await?;
         match sampling_request_result {
             Ok((sampling_request_output, sampling_request_input)) => {
+                let _delivery_guard = sess
+                    .input_queue
+                    .lock_background_notification_delivery()
+                    .await;
+                sess.input_queue
+                    .acknowledge_background_wake(background_wake_receipt);
+                sess.input_queue
+                    .refresh_injected_agent_completion_activity(
+                        &sess.active_turn,
+                        &turn_context.sub_id,
+                    )
+                    .await;
                 let SamplingRequestResult {
                     needs_follow_up: model_needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
@@ -379,6 +423,7 @@ async fn run_turn_sampling_loop_inner(
                         )
                         .await;
                 }
+                drop(_delivery_guard);
                 can_drain_pending_input = true;
                 // Process async hooks only after sampling and its tools have finished.
                 drain_async_hook_results(&sess, &turn_context, /*before_user_prompt*/ false).await;
@@ -575,22 +620,11 @@ async fn prepare_turn_setup(
     // new user message are recorded. Estimate pending incoming items (context
     // diffs/full reinjection + user input) and trigger compaction preemptively
     // when they would push the thread over the compaction threshold.
-    if let Err(err) = run_pre_sampling_compact(
-        sess,
-        turn_context,
-        &mut client_session,
-        cancellation_token,
-    )
-    .await
+    if let Err(err) =
+        run_pre_sampling_compact(sess, turn_context, &mut client_session, cancellation_token).await
     {
         if matches!(err.details(), CodexErrorDetails::TurnAborted) {
-            run_hooks_and_record_inputs(
-                sess,
-                turn_context,
-                &input,
-                PersistContext::Standard,
-            )
-            .await;
+            run_hooks_and_record_inputs(sess, turn_context, &input, PersistContext::Standard).await;
             return Err(err);
         }
         if matches!(err.details(), CodexErrorDetails::ToolCollision(_)) {
@@ -610,13 +644,8 @@ async fn prepare_turn_setup(
         {
             Ok(requirements) => requirements,
             Err(err) => {
-                run_hooks_and_record_inputs(
-                    sess,
-                    turn_context,
-                    &input,
-                    PersistContext::Standard,
-                )
-                .await;
+                run_hooks_and_record_inputs(sess, turn_context, &input, PersistContext::Standard)
+                    .await;
                 return Err(err.into());
             }
         };
@@ -632,13 +661,7 @@ async fn prepare_turn_setup(
     {
         Ok(step_context) => step_context,
         Err(err) if matches!(err.details(), CodexErrorDetails::TurnAborted) => {
-            run_hooks_and_record_inputs(
-                sess,
-                turn_context,
-                &input,
-                PersistContext::Standard,
-            )
-            .await;
+            run_hooks_and_record_inputs(sess, turn_context, &input, PersistContext::Standard).await;
             return Err(err);
         }
         Err(err) => return Err(err),
@@ -755,7 +778,9 @@ fn turn_user_input(input: &[TurnInput]) -> Vec<UserInput> {
         .iter()
         .filter_map(|item| match item {
             TurnInput::UserInput { content, .. } => Some(content.as_slice()),
-            TurnInput::ResponseItem(_) | TurnInput::InterAgentCommunication(_) => None,
+            TurnInput::ResponseItem(_)
+            | TurnInput::InterAgentCommunication(_)
+            | TurnInput::AgentCompletion(_) => None,
         })
         .flatten()
         .cloned()
@@ -1108,7 +1133,9 @@ async fn track_turn_resolved_config_analytics(
                 .iter()
                 .filter_map(|item| match item {
                     TurnInput::UserInput { content, .. } => Some(content.as_slice()),
-                    TurnInput::ResponseItem(_) | TurnInput::InterAgentCommunication(_) => None,
+                    TurnInput::ResponseItem(_)
+                    | TurnInput::InterAgentCommunication(_)
+                    | TurnInput::AgentCompletion(_) => None,
                 })
                 .flatten()
                 .filter(|item| {
@@ -1250,88 +1277,88 @@ fn maybe_run_previous_model_inline_compact_after_settings<'a>(
     previous_turn_settings: PreviousTurnSettings,
 ) -> BoxFuture<'a, CodexResult<()>> {
     Box::pin(async move {
-    let should_compact_for_comp_hash_change = comp_hash_changed(
-        previous_turn_settings.comp_hash.as_deref(),
-        turn_context.model_info.comp_hash.as_deref(),
-    );
-    let previous_model = previous_turn_settings.model;
-    let previous_model_turn_context = Arc::new(
-        turn_context
-            .with_model(previous_model.clone(), &sess.services.models_manager)
-            .await,
-    );
+        let should_compact_for_comp_hash_change = comp_hash_changed(
+            previous_turn_settings.comp_hash.as_deref(),
+            turn_context.model_info.comp_hash.as_deref(),
+        );
+        let previous_model = previous_turn_settings.model;
+        let previous_model_turn_context = Arc::new(
+            turn_context
+                .with_model(previous_model.clone(), &sess.services.models_manager)
+                .await,
+        );
 
-    if should_compact_for_comp_hash_change {
-        let step_context = sess
-            .capture_step_context(Arc::clone(&previous_model_turn_context), cancellation_token)
+        if should_compact_for_comp_hash_change {
+            let step_context = sess
+                .capture_step_context(Arc::clone(&previous_model_turn_context), cancellation_token)
+                .await?;
+            let fallback_step_context = capture_current_model_fallback_step_context(
+                sess,
+                turn_context,
+                previous_model.as_str(),
+                cancellation_token,
+            )
             .await?;
-        let fallback_step_context = capture_current_model_fallback_step_context(
-            sess,
-            turn_context,
-            previous_model.as_str(),
-            cancellation_token,
-        )
-        .await?;
-        run_auto_compact(
-            sess,
-            step_context,
-            fallback_step_context,
-            client_session,
-            InitialContextInjection::DoNotInject,
-            CompactionReason::CompHashChanged,
-            CompactionPhase::PreTurn,
-        )
-        .await?;
-        return Ok(());
-    }
-
-    let Some(old_context_window) = previous_model_turn_context.model_context_window() else {
-        return Ok(());
-    };
-    let Some(new_context_window) = turn_context.model_context_window() else {
-        return Ok(());
-    };
-    let active_context_tokens = sess.get_total_token_usage().await;
-    let previous_model_limit_reached = match turn_context
-        .config
-        .model_auto_compact_token_limit_scope
-    {
-        AutoCompactTokenLimitScope::Total => {
-            let new_auto_compact_limit = turn_context
-                .model_info
-                .auto_compact_token_limit()
-                .unwrap_or(i64::MAX);
-            active_context_tokens > new_auto_compact_limit
-                || active_context_tokens >= new_context_window
+            run_auto_compact(
+                sess,
+                step_context,
+                fallback_step_context,
+                client_session,
+                InitialContextInjection::DoNotInject,
+                CompactionReason::CompHashChanged,
+                CompactionPhase::PreTurn,
+            )
+            .await?;
+            return Ok(());
         }
-        AutoCompactTokenLimitScope::BodyAfterPrefix => active_context_tokens >= new_context_window,
-    };
-    let should_run = previous_model_limit_reached
-        && previous_model_turn_context.model_info.slug != turn_context.model_info.slug
-        && old_context_window > new_context_window;
-    if should_run {
-        let step_context = sess
-            .capture_step_context(Arc::clone(&previous_model_turn_context), cancellation_token)
+
+        let Some(old_context_window) = previous_model_turn_context.model_context_window() else {
+            return Ok(());
+        };
+        let Some(new_context_window) = turn_context.model_context_window() else {
+            return Ok(());
+        };
+        let active_context_tokens = sess.get_total_token_usage().await;
+        let previous_model_limit_reached =
+            match turn_context.config.model_auto_compact_token_limit_scope {
+                AutoCompactTokenLimitScope::Total => {
+                    let new_auto_compact_limit = turn_context
+                        .model_info
+                        .auto_compact_token_limit()
+                        .unwrap_or(i64::MAX);
+                    active_context_tokens > new_auto_compact_limit
+                        || active_context_tokens >= new_context_window
+                }
+                AutoCompactTokenLimitScope::BodyAfterPrefix => {
+                    active_context_tokens >= new_context_window
+                }
+            };
+        let should_run = previous_model_limit_reached
+            && previous_model_turn_context.model_info.slug != turn_context.model_info.slug
+            && old_context_window > new_context_window;
+        if should_run {
+            let step_context = sess
+                .capture_step_context(Arc::clone(&previous_model_turn_context), cancellation_token)
+                .await?;
+            let fallback_step_context = capture_current_model_fallback_step_context(
+                sess,
+                turn_context,
+                previous_model.as_str(),
+                cancellation_token,
+            )
             .await?;
-        let fallback_step_context = capture_current_model_fallback_step_context(
-            sess,
-            turn_context,
-            previous_model.as_str(),
-            cancellation_token,
-        )
-        .await?;
-        run_auto_compact(
-            sess,
-            step_context,
-            fallback_step_context,
-            client_session,
-            InitialContextInjection::DoNotInject,
-            CompactionReason::ModelDownshift,
-            CompactionPhase::PreTurn,
-        )
-        .await?;
-    }
-    Ok(())
+            run_auto_compact(
+                sess,
+                step_context,
+                fallback_step_context,
+                client_session,
+                InitialContextInjection::DoNotInject,
+                CompactionReason::ModelDownshift,
+                CompactionPhase::PreTurn,
+            )
+            .await?;
+        }
+        Ok(())
     })
 }
 
@@ -2607,11 +2634,10 @@ async fn try_run_sampling_request_inner<'a>(
                     | ResponseItem::Other => false,
                 };
 
-                let output_result = {
-                    handle_output_item_done(&mut ctx, item, previously_streamed_item)
-                }
-                .instrument(handle_responses)
-                .await;
+                let output_result =
+                    { handle_output_item_done(&mut ctx, item, previously_streamed_item) }
+                        .instrument(handle_responses)
+                        .await;
                 let output_result = match output_result {
                     Ok(output_result) => output_result,
                     Err(err) => break Err(err),

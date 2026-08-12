@@ -320,7 +320,7 @@ mod tests {
             .request_reasoning_effort()
             .map(|effort| effort.as_str().to_string());
         let turn = Arc::new(turn);
-        let mut invocation = make_invocation(session, Arc::clone(&turn));
+        let invocation = make_invocation(session, Arc::clone(&turn));
         let response_generation = invocation
             .step_context
             .response_identity

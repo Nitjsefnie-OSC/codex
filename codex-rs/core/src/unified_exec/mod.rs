@@ -378,6 +378,7 @@ impl InitialExecCommandState {
             .then_some(previous & TERMINAL_RESULT_AVAILABLE != 0)
     }
 
+    #[cfg(test)]
     fn terminal_result_available(&self) -> bool {
         self.terminal_state.load(Ordering::Acquire) & TERMINAL_RESULT_AVAILABLE != 0
     }
@@ -409,6 +410,7 @@ impl InitialExecCommandState {
         }
     }
 
+    #[cfg(test)]
     fn resolve(&self, outcome: InitialExecCommandOutcome) {
         self.resolve_pending(outcome);
     }

@@ -12,6 +12,7 @@ use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -35,6 +36,8 @@ use core_test_support::responses::start_mock_server;
 use core_test_support::responses::strip_metadata_from_json;
 use core_test_support::responses::strip_response_item_ids_from_json;
 use core_test_support::skip_if_no_network;
+use core_test_support::streaming_sse::StreamingSseChunk;
+use core_test_support::streaming_sse::start_streaming_sse_server;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
@@ -46,11 +49,14 @@ use serde_json::Value;
 use serde_json::json;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 use test_case::test_case;
+use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio::time::sleep;
+use tokio::time::timeout;
 use tracing::Level;
 use tracing_test::internal::MockWriter;
 use wiremock::MockServer;
@@ -1710,6 +1716,364 @@ async fn multi_agent_v2_spawn_sends_agent_message_to_child(
 enum CompletionScenario {
     Completed,
     TerminalError,
+}
+
+struct ThreadIdleNotifier(watch::Sender<u64>);
+
+impl codex_extension_api::ThreadLifecycleContributor<codex_core::config::Config>
+    for ThreadIdleNotifier
+{
+    fn on_thread_idle<'a>(
+        &'a self,
+        _input: codex_extension_api::ThreadIdleInput<'a>,
+    ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+        Box::pin(async move {
+            self.0.send_modify(|generation| *generation += 1);
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_agent_v2_completion_wakes_idle_parent_without_wait_or_user_turn() -> Result<()> {
+    let server = start_mock_server().await;
+    let progress_args = serde_json::to_string(&json!({
+        "target": "/root",
+        "message": "progress",
+    }))?;
+    let (child_response_gate_tx, child_response_gate_rx) = tokio::sync::oneshot::channel();
+    let (child_response_server, _child_response_completions) =
+        start_streaming_sse_server(vec![vec![StreamingSseChunk {
+            gate: Some(child_response_gate_rx),
+            body: sse(vec![
+                ev_response_created("resp-child-1"),
+                ev_function_call_with_namespace(
+                    "progress-call",
+                    MULTI_AGENT_V2_NAMESPACE,
+                    "send_message",
+                    &progress_args,
+                ),
+                ev_completed("resp-child-1"),
+            ]),
+        }]])
+        .await;
+    let spawn_args = serde_json::to_string(&json!({
+        "message": CHILD_PROMPT,
+        "task_name": "worker",
+        "fork_turns": "none",
+    }))?;
+    mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            body_contains(req, TURN_1_PROMPT) && !request_has_input_type(req, "agent_message")
+        },
+        sse(vec![
+            ev_response_created("resp-parent-1"),
+            ev_function_call_with_namespace(
+                SPAWN_CALL_ID,
+                MULTI_AGENT_V2_NAMESPACE,
+                "spawn_agent",
+                &spawn_args,
+            ),
+            ev_completed("resp-parent-1"),
+        ]),
+    )
+    .await;
+    let _child_request = mount_response_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            request_has_input_type(req, "agent_message")
+                && body_contains(req, CHILD_PROMPT)
+                && !body_contains(req, SPAWN_CALL_ID)
+        },
+        wiremock::ResponseTemplate::new(307).insert_header(
+            "location",
+            format!("{}/v1/responses", child_response_server.uri()),
+        ),
+    )
+    .await;
+    let _child_completion_request = mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            decoded_body(req)
+                .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
+                .and_then(|body| body.get("input").and_then(Value::as_array).cloned())
+                .is_some_and(|items| {
+                    items.iter().any(|item| {
+                        item.get("type").and_then(Value::as_str) == Some("function_call_output")
+                            && item.get("call_id").and_then(Value::as_str) == Some("progress-call")
+                            && item.get("output").and_then(Value::as_str) == Some("")
+                    })
+                })
+        },
+        sse(vec![
+            ev_response_created("resp-child-2"),
+            ev_assistant_message("msg-child-2", "child done"),
+            ev_completed("resp-child-2"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            body_contains(req, SPAWN_CALL_ID) && !body_contains(req, "Message Type: FINAL_ANSWER")
+        },
+        sse(vec![
+            ev_response_created("resp-parent-2"),
+            ev_assistant_message("msg-parent-2", "parent done"),
+            ev_completed("resp-parent-2"),
+        ]),
+    )
+    .await;
+    let idle_wake = mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            body_contains(req, "Message Type: MESSAGE")
+                && body_contains(req, "progress")
+                && body_contains(req, "Message Type: FINAL_ANSWER")
+                && body_contains(req, "/root/worker")
+                && body_contains(req, "child done")
+        },
+        sse(vec![
+            ev_response_created("resp-parent-3"),
+            ev_assistant_message("msg-parent-3", "idle parent woke"),
+            ev_completed("resp-parent-3"),
+        ]),
+    )
+    .await;
+    let (parent_idle_tx, mut parent_idle_rx) = watch::channel(0_u64);
+    let mut extensions =
+        codex_extension_api::ExtensionRegistryBuilder::<codex_core::config::Config>::new();
+    extensions.thread_lifecycle_contributor(Arc::new(ThreadIdleNotifier(parent_idle_tx)));
+    let mut builder = test_codex()
+        .with_model_info_override("gpt-5.4", |model_info| {
+            model_info.multi_agent_version = Some(MultiAgentVersion::V2);
+        })
+        .with_extensions(Arc::new(extensions.build()))
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::Collab)
+                .expect("test config should allow feature update");
+            config
+                .features
+                .enable(Feature::MultiAgentV2)
+                .expect("test config should allow feature update");
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(0);
+            config.model_provider.supports_websockets = false;
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+
+    let idle_generation_before_turn = *parent_idle_rx.borrow_and_update();
+    test.submit_turn(TURN_1_PROMPT).await?;
+    timeout(
+        Duration::from_secs(10),
+        parent_idle_rx.wait_for(|generation| *generation > idle_generation_before_turn),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("parent did not become idle before child completion"))?
+    .map_err(|_| anyhow::anyhow!("parent idle lifecycle channel closed"))?;
+    timeout(
+        Duration::from_secs(10),
+        child_response_server.wait_for_request_count(1),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("child did not start its gated response request"))?;
+    let child_thread_id = ThreadId::from_string(&wait_for_spawned_thread_id(&test).await?)?;
+    let child = test.thread_manager.get_thread(child_thread_id).await?;
+    assert_eq!(child.agent_status().await, AgentStatus::Running);
+    if child_response_gate_tx.send(()).is_err() {
+        anyhow::bail!("child response gate closed before release");
+    }
+    wait_for_event(child.as_ref(), |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let idle_wake_request = loop {
+        if let Some(request) = idle_wake.requests().into_iter().find(|request| {
+            serde_json::to_string(&request.input()).is_ok_and(|input| {
+                input.contains("Message Type: MESSAGE")
+                    && input.contains("progress")
+                    && input.contains("Message Type: FINAL_ANSWER")
+                    && input.contains("child done")
+            })
+        }) {
+            break request;
+        }
+        if Instant::now() >= deadline {
+            let captured_inputs = idle_wake
+                .requests()
+                .into_iter()
+                .map(|request| serde_json::to_value(request.input()))
+                .collect::<serde_json::Result<Vec<_>>>()?;
+            anyhow::bail!(
+                "idle parent did not wake for completed native agent; captured inputs: {}",
+                serde_json::to_string_pretty(&captured_inputs)?
+            );
+        }
+        sleep(Duration::from_millis(10)).await;
+    };
+    let request_input = serde_json::to_string(&idle_wake_request.input())?;
+    let progress_index = request_input
+        .find("progress")
+        .ok_or_else(|| anyhow::anyhow!("idle wake request omitted the earlier child message"))?;
+    let completion_index = request_input
+        .find("Message Type: FINAL_ANSWER")
+        .ok_or_else(|| anyhow::anyhow!("idle wake request omitted the child completion"))?;
+    assert!(
+        progress_index < completion_index,
+        "child progress must precede child completion in the idle wake request"
+    );
+
+    child_response_server.shutdown().await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_completion_wakes_idle_parent_without_wait_or_user_turn() -> Result<()> {
+    let server = start_mock_server().await;
+    let (child_response_gate_tx, child_response_gate_rx) = tokio::sync::oneshot::channel();
+    let (child_response_server, _child_response_completions) =
+        start_streaming_sse_server(vec![vec![StreamingSseChunk {
+            gate: Some(child_response_gate_rx),
+            body: sse(vec![
+                ev_response_created("resp-legacy-child-1"),
+                ev_assistant_message("msg-legacy-child-1", "child done"),
+                ev_completed("resp-legacy-child-1"),
+            ]),
+        }]])
+        .await;
+    let spawn_args = serde_json::to_string(&json!({
+        "message": CHILD_PROMPT,
+    }))?;
+    mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            body_contains(req, TURN_1_PROMPT) && !body_contains(req, "<subagent_notification>")
+        },
+        sse(vec![
+            ev_response_created("resp-legacy-parent-1"),
+            ev_function_call_with_namespace(
+                SPAWN_CALL_ID,
+                MULTI_AGENT_V1_NAMESPACE,
+                "spawn_agent",
+                &spawn_args,
+            ),
+            ev_completed("resp-legacy-parent-1"),
+        ]),
+    )
+    .await;
+    let _child_request = mount_response_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            body_contains(req, CHILD_PROMPT) && !body_contains(req, SPAWN_CALL_ID)
+        },
+        wiremock::ResponseTemplate::new(307).insert_header(
+            "location",
+            format!("{}/v1/responses", child_response_server.uri()),
+        ),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            body_contains(req, SPAWN_CALL_ID) && !body_contains(req, "<subagent_notification>")
+        },
+        sse(vec![
+            ev_response_created("resp-legacy-parent-2"),
+            ev_assistant_message("msg-legacy-parent-2", "parent done"),
+            ev_completed("resp-legacy-parent-2"),
+        ]),
+    )
+    .await;
+    let idle_wake = mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            body_contains(req, "<subagent_notification>") && body_contains(req, "child done")
+        },
+        sse(vec![
+            ev_response_created("resp-legacy-parent-3"),
+            ev_assistant_message("msg-legacy-parent-3", "idle parent woke"),
+            ev_completed("resp-legacy-parent-3"),
+        ]),
+    )
+    .await;
+    let (parent_idle_tx, mut parent_idle_rx) = watch::channel(0_u64);
+    let mut extensions =
+        codex_extension_api::ExtensionRegistryBuilder::<codex_core::config::Config>::new();
+    extensions.thread_lifecycle_contributor(Arc::new(ThreadIdleNotifier(parent_idle_tx)));
+    let mut builder = test_codex()
+        .with_model("koffing")
+        .with_extensions(Arc::new(extensions.build()))
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::Collab)
+                .expect("test config should allow feature update");
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(0);
+            config.model_provider.supports_websockets = false;
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+
+    let idle_generation_before_turn = *parent_idle_rx.borrow_and_update();
+    test.submit_turn(TURN_1_PROMPT).await?;
+    timeout(
+        Duration::from_secs(10),
+        parent_idle_rx.wait_for(|generation| *generation > idle_generation_before_turn),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("legacy parent did not become idle before child completion"))?
+    .map_err(|_| anyhow::anyhow!("legacy parent idle lifecycle channel closed"))?;
+    timeout(
+        Duration::from_secs(10),
+        child_response_server.wait_for_request_count(1),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("legacy child did not start its gated response request"))?;
+    let child_thread_id = wait_for_spawned_thread_id(&test).await?;
+    let child = test
+        .thread_manager
+        .get_thread(ThreadId::from_string(&child_thread_id)?)
+        .await?;
+    assert_eq!(child.agent_status().await, AgentStatus::Running);
+    if child_response_gate_tx.send(()).is_err() {
+        anyhow::bail!("legacy child response gate closed before release");
+    }
+    wait_for_event(child.as_ref(), |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if !idle_wake.requests().is_empty() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("idle legacy parent did not wake for completed native agent");
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    let notification = idle_wake
+        .single_request()
+        .message_input_texts("user")
+        .into_iter()
+        .find(|text| text.contains("<subagent_notification>"))
+        .expect("legacy completion notification should be model-visible");
+    assert_eq!(
+        notification,
+        format!(
+            "<subagent_notification>\n{{\"agent_path\":\"{child_thread_id}\",\"status\":{{\"completed\":\"child done\"}}}}\n</subagent_notification>"
+        )
+    );
+
+    child_response_server.shutdown().await;
+
+    Ok(())
 }
 
 #[test_case(CompletionScenario::Completed ; "completed")]

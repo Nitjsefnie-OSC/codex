@@ -122,26 +122,24 @@ async fn handle_spawn_agent(
         /*trigger_turn*/ true,
     );
     let context = AgentCommunicationContext::new(AgentCommunicationKind::Spawn, session.thread_id);
-    let spawned_agent = Box::pin(
-        session
-            .services
-            .agent_control
-            .spawn_agent_with_communication(
-                config,
-                communication,
-                context,
-                Some(spawn_source),
-                SpawnAgentOptions {
-                    fork_parent_spawn_call_id: fork_mode.as_ref().map(|_| call_id.clone()),
-                    fork_mode,
-                    parent_thread_id: Some(session.thread_id),
-                    parent_turn_id: Some(turn.sub_id.clone()),
-                    environments: Some(step_context.environments.to_selections()),
-                },
-            ),
-    )
-    .await
-    .map_err(collab_spawn_error)?;
+    let spawned_agent = session
+        .services
+        .agent_control
+        .spawn_agent_with_communication(
+            config,
+            communication,
+            context,
+            Some(spawn_source),
+            SpawnAgentOptions {
+                fork_parent_spawn_call_id: fork_mode.as_ref().map(|_| call_id.clone()),
+                fork_mode,
+                parent_thread_id: Some(session.thread_id),
+                parent_turn_id: Some(turn.sub_id.clone()),
+                environments: Some(step_context.environments.to_selections()),
+            },
+        )
+        .await
+        .map_err(collab_spawn_error)?;
     let new_thread_id = spawned_agent.thread_id;
     let agent_snapshot = session
         .services

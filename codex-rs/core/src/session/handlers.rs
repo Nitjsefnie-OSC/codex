@@ -305,9 +305,18 @@ pub async fn inter_agent_communication(
     parent_turn_id: Option<String>,
 ) {
     let trigger_turn = communication.trigger_turn;
-    sess.input_queue
-        .enqueue_mailbox_communication(communication, parent_turn_id.filter(|_| trigger_turn))
+    let _delivery_guard = sess
+        .input_queue
+        .lock_background_notification_delivery()
         .await;
+    sess.input_queue
+        .enqueue_or_inject_mailbox_communication(
+            &sess.active_turn,
+            communication,
+            parent_turn_id.filter(|_| trigger_turn),
+        )
+        .await;
+    drop(_delivery_guard);
     crate::agent_communication::emit_agent_communication_receive(&sub_id);
     if trigger_turn || sess.has_outstanding_durable_sleep() {
         sess.maybe_start_turn_for_pending_work_with_sub_id(sub_id)
@@ -835,6 +844,23 @@ fn dispatch_submission(
             Op::InterAgentCommunication { communication } => {
                 inter_agent_communication(&sess, sub.id.clone(), communication, sub.parent_turn_id)
                     .await;
+                false
+            }
+            Op::InterAgentCompletion { communication } => {
+                sess.deliver_inter_agent_completion(communication).await;
+                crate::agent_communication::emit_agent_communication_receive(&sub.id);
+                false
+            }
+            Op::SubagentCompletion {
+                agent_reference,
+                status,
+                turn_id,
+            } => {
+                let mut item = crate::context::ContextualUserFragment::into(
+                    crate::context::SubagentNotification::new(agent_reference, status),
+                );
+                item.set_turn_id_if_missing(&turn_id);
+                sess.deliver_subagent_completion_item(item).await;
                 false
             }
             Op::ExecApproval {

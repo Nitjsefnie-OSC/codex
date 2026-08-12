@@ -585,6 +585,18 @@ pub enum Op {
         communication: InterAgentCommunication,
     },
 
+    /// A terminal child result that must preserve submission ordering before durable wakeup.
+    InterAgentCompletion {
+        communication: InterAgentCommunication,
+    },
+
+    /// A legacy subagent terminal result that must preserve parent submission ordering.
+    SubagentCompletion {
+        agent_reference: String,
+        status: AgentStatus,
+        turn_id: String,
+    },
+
     /// Approve a command execution
     ExecApproval {
         /// The id of the submission we are approving
@@ -877,6 +889,8 @@ impl Op {
             Self::UserInput { .. } => "user_input",
             Self::ThreadSettings { .. } => "thread_settings",
             Self::InterAgentCommunication { .. } => "inter_agent_communication",
+            Self::InterAgentCompletion { .. } => "inter_agent_completion",
+            Self::SubagentCompletion { .. } => "subagent_completion",
             Self::ExecApproval { .. } => "exec_approval",
             Self::PatchApproval { .. } => "patch_approval",
             Self::ResolveElicitation { .. } => "resolve_elicitation",

@@ -11,6 +11,7 @@ pub(crate) use auto_compact_window::AutoCompactWindowSnapshot;
 pub(crate) use service::SessionServices;
 pub(crate) use session::SessionState;
 pub(crate) use turn::ActiveTurn;
+pub(crate) use turn::FinishingTurn;
 pub(crate) use turn::MailboxDeliveryPhase;
 pub(crate) use turn::PendingRequestPermissions;
 pub(crate) use turn::RunningTask;
