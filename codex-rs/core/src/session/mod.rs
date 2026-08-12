@@ -3388,6 +3388,7 @@ impl Session {
         let rollout_items = items
             .iter()
             .cloned()
+            .map(ResponseItemEnvelope::new)
             .map(RolloutItem::ResponseItem)
             .collect::<Vec<_>>();
         let persistence = tokio::spawn(async move {

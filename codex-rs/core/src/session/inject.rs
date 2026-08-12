@@ -239,7 +239,6 @@ impl Session {
                     turn_context,
                     Vec::new(),
                     RegularTask::new(),
-                    /*input_persisted*/ None,
                     MailboxParentProvenance::Ignore,
                 )
                 .await;

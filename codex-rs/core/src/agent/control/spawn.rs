@@ -770,9 +770,10 @@ impl AgentControl {
             }
 
             match item {
-                RolloutItem::ResponseItem(response_item) => {
-                    retain_forked_item(response_item, &mut replaced_parent_developer_instructions)
-                }
+                RolloutItem::ResponseItem(response_item) => retain_forked_item(
+                    &mut response_item.item,
+                    &mut replaced_parent_developer_instructions,
+                ),
                 RolloutItem::Compacted(compacted) => {
                     if let Some(replacement_history) = compacted.replacement_history.as_mut() {
                         // Matches before this checkpoint cannot survive its replacement history.

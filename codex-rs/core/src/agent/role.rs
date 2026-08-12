@@ -80,7 +80,6 @@ pub async fn apply_exec_agent_role(config: &mut Config, role_name: &str) -> Resu
     let runtime_codex_linux_sandbox_exe = config.codex_linux_sandbox_exe.clone();
     let runtime_main_execve_wrapper_exe = config.main_execve_wrapper_exe.clone();
     let runtime_zsh_path = config.zsh_path.clone();
-    let runtime_psp = config.psp;
 
     apply_role_to_config(config, Some(role_name)).await?;
 
@@ -97,7 +96,6 @@ pub async fn apply_exec_agent_role(config: &mut Config, role_name: &str) -> Resu
     config.codex_linux_sandbox_exe = runtime_codex_linux_sandbox_exe;
     config.main_execve_wrapper_exe = runtime_main_execve_wrapper_exe;
     config.zsh_path = runtime_zsh_path;
-    config.psp = runtime_psp;
     Ok(())
 }
 

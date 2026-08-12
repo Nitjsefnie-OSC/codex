@@ -322,7 +322,6 @@ impl Session {
                     turn_context,
                     input,
                     task,
-                    input_persisted,
                     mailbox_parent_provenance,
                 )
                 .await;
@@ -334,9 +333,6 @@ impl Session {
         turn_context: Arc<TurnContext>,
         input: Vec<TurnInput>,
         task: T,
-        input_persisted: Option<
-            tokio::sync::oneshot::Sender<Result<(), TryStartTurnIfIdleRejectionReason>>,
-        >,
         mailbox_parent_provenance: MailboxParentProvenance,
     ) {
         let task: Arc<dyn AnySessionTask> = Arc::new(task);
