@@ -18,6 +18,7 @@ use codex_code_mode_protocol::enabled_tool_metadata;
 use codex_protocol::ToolName;
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 
 use crate::TaskFailureHandler;
 use crate::v8_init::ensure_v8_initialized;
@@ -26,9 +27,18 @@ const EXIT_SENTINEL: &str = "__codex_code_mode_exit__";
 
 #[derive(Debug)]
 pub(crate) enum RuntimeCommand {
-    ToolResponse { id: String, result: JsonValue },
-    ToolError { id: String, error_text: String },
-    TimeoutFired { id: u64 },
+    ToolResponse {
+        id: String,
+        result: JsonValue,
+        delivery_tx: oneshot::Sender<bool>,
+    },
+    ToolError {
+        id: String,
+        error_text: String,
+    },
+    TimeoutFired {
+        id: u64,
+    },
     ObservePendingFrontier,
     Terminate,
 }
@@ -231,10 +241,14 @@ fn run_runtime(
     {
         match command {
             RuntimeCommand::Terminate => break,
-            RuntimeCommand::ToolResponse { id, result } => {
-                if let Err(error_text) =
-                    module_loader::resolve_tool_response(scope, &id, Ok(result))
-                {
+            RuntimeCommand::ToolResponse {
+                id,
+                result,
+                delivery_tx,
+            } => {
+                let resolution = module_loader::resolve_tool_response(scope, &id, Ok(result));
+                let _ = delivery_tx.send(resolution.is_ok());
+                if let Err(error_text) = resolution {
                     capture_scope_send_error(scope, &event_tx, Some(error_text));
                     return;
                 }

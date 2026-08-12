@@ -22,9 +22,40 @@ const TRUNCATED_NOTIFICATION_SUFFIX: &str = "... [truncated]";
 impl SessionInner {
     pub(super) fn spawn_session_events(
         self: &Arc<Self>,
-        events: tonic::Streaming<grpc::SessionEvent>,
+        mut events: tonic::Streaming<grpc::SessionEvent>,
     ) {
-        self.spawn_stream(events, "session lease", Self::handle_session_event);
+        let inner = Arc::clone(self);
+        self.stream_tasks.spawn(async move {
+            loop {
+                let event = tokio::select! {
+                    biased;
+                    _ = inner.stopped.cancelled() => return,
+                    event = events.message() => event,
+                };
+                match event {
+                    Ok(Some(event)) => {
+                        if let Err(error) = inner.handle_session_event(event).await {
+                            inner.fail(error);
+                            return;
+                        }
+                    }
+                    Ok(None) => {
+                        if !inner.shutdown_requested.load(Ordering::Acquire) {
+                            inner.fail(
+                                "gRPC code-mode session lease closed unexpectedly".to_string(),
+                            );
+                        }
+                        return;
+                    }
+                    Err(error) => {
+                        if !inner.shutdown_requested.load(Ordering::Acquire) {
+                            inner.fail(deadline::failure("session lease", error));
+                        }
+                        return;
+                    }
+                }
+            }
+        });
     }
 
     pub(super) fn spawn_tool_subscription(
@@ -72,7 +103,10 @@ impl SessionInner {
         });
     }
 
-    fn handle_session_event(self: &Arc<Self>, event: grpc::SessionEvent) -> Result<(), String> {
+    async fn handle_session_event(
+        self: &Arc<Self>,
+        event: grpc::SessionEvent,
+    ) -> Result<(), String> {
         match event
             .event
             .ok_or_else(|| "gRPC code-mode host sent an empty session event".to_string())?
@@ -91,6 +125,17 @@ impl SessionInner {
                 self.handle_notification(notification)
             }
             grpc::session_event::Event::NotificationCancelled(_) => Ok(()),
+            grpc::session_event::Event::ToolResultDelivered(receipt) => {
+                tokio::select! {
+                    biased;
+                    _ = self.stopped.cancelled() => Ok(()),
+                    result = self.delegate.tool_result_delivered(
+                        CellId::new(receipt.cell_id),
+                        receipt.runtime_tool_call_id,
+                        receipt.delivered,
+                    ) => result,
+                }
+            }
             grpc::session_event::Event::CellClosed(closed) => {
                 let cell = self
                     .state
@@ -211,11 +256,32 @@ impl SessionInner {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .admit_notification(&notification)?;
+        let notification_id = notification.notification_id.clone();
         let cancellation = match admission {
             CallbackAdmission::Active(cancellation) => cancellation,
-            CallbackAdmission::Cancelled | CallbackAdmission::Closed => return Ok(()),
+            CallbackAdmission::Cancelled | CallbackAdmission::Closed => {
+                let inner = Arc::clone(self);
+                tokio::spawn(async move {
+                    if let Err(error) = inner
+                        .acknowledge_notification(notification_id)
+                        .await
+                    {
+                        inner.fail(error);
+                    }
+                });
+                return Ok(());
+            }
             CallbackAdmission::Rejected(error) => {
                 warn!("code-mode notification was dropped: {error}");
+                let inner = Arc::clone(self);
+                tokio::spawn(async move {
+                    if let Err(error) = inner
+                        .acknowledge_notification(notification_id)
+                        .await
+                    {
+                        inner.fail(error);
+                    }
+                });
                 return Ok(());
             }
         };
@@ -246,6 +312,13 @@ impl SessionInner {
                 Ok(Err(error)) => warn!("code-mode notification delegate failed: {error}"),
                 Err(_) => warn!("code-mode notification delegate panicked"),
             }
+            if let Err(error) = inner
+                .acknowledge_notification(notification_id)
+                .await
+            {
+                inner.fail(error);
+                return;
+            }
             let cell = inner
                 .state
                 .lock()
@@ -253,6 +326,21 @@ impl SessionInner {
                 .finish_notification(&execution_id);
             inner.report_closed_cell(cell);
         });
+        Ok(())
+    }
+
+    async fn acknowledge_notification(&self, notification_id: String) -> Result<(), String> {
+        let mut client = self.client();
+        deadline::request(
+            self,
+            "notification acknowledgement",
+            Duration::ZERO,
+            client.acknowledge_notification(grpc::AcknowledgeNotificationRequest {
+                session_id: self.id.clone(),
+                notification_id,
+            }),
+        )
+        .await?;
         Ok(())
     }
 }

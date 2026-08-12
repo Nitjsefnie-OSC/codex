@@ -50,13 +50,19 @@ async fn yielded_exec_terminal_notification_waits_for_result_and_is_claimed_once
         "terminal delivery must wait until exec_command decides whether it yielded"
     );
 
-    state.mark_yielded();
+    state.mark_returned();
     assert!(
+        !first_claim.is_finished(),
+        "terminal delivery must wait until the yielded result is recorded"
+    );
+    state.mark_yielded();
+    assert_eq!(
         first_claim
             .await
-            .expect("terminal claim task should not panic")
+            .expect("terminal claim task should not panic"),
+        Some(true)
     );
-    assert!(!state.claim_terminal_notification().await);
+    assert_eq!(state.claim_terminal_notification().await, None);
 }
 
 #[tokio::test]
@@ -64,17 +70,88 @@ async fn terminal_notification_is_not_claimed_when_exec_command_did_not_yield() 
     let state = InitialExecCommandState::new();
     state.mark_not_yielded();
 
-    assert!(!state.claim_terminal_notification().await);
+    assert_eq!(state.claim_terminal_notification().await, None);
 }
 
 #[tokio::test]
 async fn removing_terminal_result_does_not_suppress_notification() {
     let state = InitialExecCommandState::new();
+    state.mark_returned();
     state.mark_yielded();
 
     state.mark_terminal_result_unavailable();
-    assert!(state.claim_terminal_notification().await);
+    assert_eq!(state.claim_terminal_notification().await, Some(false));
     assert!(!state.terminal_result_available());
+}
+
+#[tokio::test]
+async fn recorded_and_code_mode_outputs_resolve_duplicate_call_ids_by_process_id() {
+    let manager = UnifiedExecProcessManager::default();
+    let process = Arc::new(
+        crate::unified_exec::process_tests::remote_process(
+            WriteStatus::Accepted,
+            /*terminate_error*/ None,
+            SandboxType::None,
+        )
+        .await,
+    );
+    let first = Arc::new(InitialExecCommandState::new());
+    let second = Arc::new(InitialExecCommandState::new());
+    first.mark_returned();
+    second.mark_returned();
+    manager
+        .initial_exec_outputs_pending_recording
+        .lock()
+        .await
+        .insert(
+            "duplicate".to_string(),
+            vec![
+                PendingInitialExecCommandOutput {
+                    process_id: 1234,
+                    state: Arc::clone(&first),
+                    process: Arc::clone(&process),
+                    destination: InitialExecCommandOutputDestination::Rollout,
+                },
+                PendingInitialExecCommandOutput {
+                    process_id: 12345,
+                    state: Arc::clone(&second),
+                    process,
+                    destination: InitialExecCommandOutputDestination::CodeMode,
+                },
+            ],
+        );
+
+    manager
+        .prepare_initial_exec_command_output_persistence(&[(
+            "duplicate".to_string(),
+            "completed without yielding".to_string(),
+        )])
+        .await
+        .commit();
+    assert_eq!(
+        (first.is_unrecorded(), second.is_unrecorded()),
+        (true, true)
+    );
+
+    manager
+        .prepare_initial_exec_command_output_persistence(&[(
+            "duplicate".to_string(),
+            "Process running with session ID 1234".to_string(),
+        )])
+        .await
+        .commit();
+    assert_eq!(first.claim_terminal_notification().await, Some(true));
+    assert!(second.is_unrecorded());
+
+    manager
+        .discard_unrecorded_initial_exec_command_outputs()
+        .await;
+    assert!(second.is_unrecorded());
+
+    manager
+        .acknowledge_code_mode_initial_exec_output("duplicate", 12345)
+        .await;
+    assert_eq!(second.claim_terminal_notification().await, Some(true));
 }
 
 async fn test_session_and_turn() -> (Arc<Session>, Arc<TurnContext>) {
@@ -169,6 +246,7 @@ async fn exec_command_with_tty(
         Arc::clone(session),
         crate::session::step_context::StepContext::for_test(Arc::clone(turn)),
         "call".to_string(),
+        InitialExecCommandOutputDestination::Rollout,
     );
     let started_at = Instant::now();
     let process_started_alive = !process.has_exited() && process.exit_code().is_none();
@@ -223,6 +301,7 @@ async fn exec_command_with_tty(
             .processes
             .get_mut(&process_id)
     {
+        entry.initial_exec_command_state.mark_returned();
         entry.initial_exec_command_state.mark_yielded();
     }
 
@@ -676,6 +755,7 @@ async fn terminating_initial_exec_command_rechecks_initial_response_state() -> a
             .processes
             .get_mut(&process_id)
             .expect("process should remain stored until initial response returns");
+        entry.initial_exec_command_state.mark_returned();
         entry.initial_exec_command_state.mark_yielded();
     }
 

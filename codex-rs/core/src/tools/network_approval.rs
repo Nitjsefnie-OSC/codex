@@ -37,6 +37,7 @@ use std::io;
 use std::sync::Arc;
 use std::sync::Mutex as SyncMutex;
 use std::sync::OnceLock as SyncOnceLock;
+use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio::sync::OnceCell;
@@ -67,7 +68,7 @@ pub(crate) struct NetworkApprovalSpec {
 
 #[derive(Clone, Debug)]
 pub(crate) struct DeferredNetworkApproval {
-    registration_id: String,
+    registration: Arc<NetworkApprovalRegistration>,
     cancellation_token: CancellationToken,
     finish_outcome: Arc<OnceCell<Option<NetworkApprovalOutcome>>>,
     _execution_proxy: Option<NetworkProxy>,
@@ -75,7 +76,7 @@ pub(crate) struct DeferredNetworkApproval {
 
 impl DeferredNetworkApproval {
     pub(crate) fn registration_id(&self) -> &str {
-        &self.registration_id
+        &self.registration.registration_id
     }
 
     pub(crate) fn cancellation_token(&self) -> CancellationToken {
@@ -89,7 +90,11 @@ impl DeferredNetworkApproval {
     async fn finish(&self, service: &NetworkApprovalService) -> Result<(), ToolError> {
         let outcome = self
             .finish_outcome
-            .get_or_init(|| async { service.finish_call_outcome(&self.registration_id).await })
+            .get_or_init(|| async {
+                service
+                    .finish_call_outcome(&self.registration.registration_id)
+                    .await
+            })
             .await
             .clone();
         let outcome =
@@ -98,9 +103,34 @@ impl DeferredNetworkApproval {
     }
 }
 
+struct NetworkApprovalRegistration {
+    registration_id: String,
+    service: Arc<NetworkApprovalService>,
+    runtime_handle: Handle,
+}
+
+impl std::fmt::Debug for NetworkApprovalRegistration {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NetworkApprovalRegistration")
+            .field("registration_id", &self.registration_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for NetworkApprovalRegistration {
+    fn drop(&mut self) {
+        let registration_id = self.registration_id.clone();
+        let service = Arc::clone(&self.service);
+        drop(self.runtime_handle.spawn(async move {
+            service.unregister_call(&registration_id).await;
+        }));
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ActiveNetworkApproval {
-    registration_id: Option<String>,
+    registration: Option<Arc<NetworkApprovalRegistration>>,
     mode: NetworkApprovalMode,
     cancellation_token: CancellationToken,
     execution_proxy: NetworkProxy,
@@ -121,20 +151,18 @@ impl ActiveNetworkApproval {
 
     pub(crate) fn into_deferred(self) -> Option<DeferredNetworkApproval> {
         let ActiveNetworkApproval {
-            registration_id,
+            registration,
             mode,
             cancellation_token,
             execution_proxy,
         } = self;
-        match (mode, registration_id) {
-            (NetworkApprovalMode::Deferred, Some(registration_id)) => {
-                Some(DeferredNetworkApproval {
-                    registration_id,
-                    cancellation_token,
-                    finish_outcome: Arc::new(OnceCell::new()),
-                    _execution_proxy: Some(execution_proxy),
-                })
-            }
+        match (mode, registration) {
+            (NetworkApprovalMode::Deferred, Some(registration)) => Some(DeferredNetworkApproval {
+                registration,
+                cancellation_token,
+                finish_outcome: Arc::new(OnceCell::new()),
+                _execution_proxy: Some(execution_proxy),
+            }),
             _ => None,
         }
     }
@@ -1117,6 +1145,11 @@ pub(crate) async fn begin_network_approval(
             )))
         })?;
     let cancellation_token = CancellationToken::new();
+    let registration = Arc::new(NetworkApprovalRegistration {
+        registration_id: registration_id.clone(),
+        service: Arc::clone(&session.services.network_approval),
+        runtime_handle: session.services.runtime_handle.clone(),
+    });
     session
         .services
         .network_approval
@@ -1132,7 +1165,7 @@ pub(crate) async fn begin_network_approval(
         .await;
 
     Ok(Some(ActiveNetworkApproval {
-        registration_id: Some(registration_id),
+        registration: Some(registration),
         mode,
         cancellation_token,
         execution_proxy,
@@ -1143,14 +1176,14 @@ pub(crate) async fn finish_immediate_network_approval(
     session: &Session,
     active: ActiveNetworkApproval,
 ) -> Result<(), ToolError> {
-    let Some(registration_id) = active.registration_id.as_deref() else {
+    let Some(registration) = active.registration.as_ref() else {
         return Ok(());
     };
 
     session
         .services
         .network_approval
-        .finish_call(registration_id, &active.cancellation_token)
+        .finish_call(&registration.registration_id, &active.cancellation_token)
         .await
 }
 

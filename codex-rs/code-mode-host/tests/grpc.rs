@@ -25,6 +25,7 @@ use codex_code_mode_protocol::grpc;
 use codex_code_mode_protocol::grpc::code_mode_host_client::CodeModeHostClient;
 use codex_protocol::ToolName;
 use futures::FutureExt;
+use futures::StreamExt;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use tokio::sync::Semaphore;
@@ -226,6 +227,138 @@ async fn tcp_session_persists_values_and_forwards_tools_notifications_and_closur
             .unwrap_or_else(PoisonError::into_inner),
         vec![cell_id("1"), cell_id("2")]
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn nested_tool_delivery_precedes_grpc_cell_closure() -> Result<()> {
+    let host = HostHarness::start("grpc://127.0.0.1:0").await?;
+    let mut client = CodeModeHostClient::connect(host.endpoint)
+        .await
+        .context("connect raw gRPC client")?;
+    let mut session_events = client
+        .open_session(grpc::OpenSessionRequest {
+            cell_execution_limits: None,
+        })
+        .await
+        .context("open raw gRPC session")?
+        .into_inner();
+    let opened = session_events
+        .next()
+        .await
+        .context("raw gRPC session ended before opening")??;
+    let Some(grpc::session_event::Event::Opened(opened)) = opened.event else {
+        anyhow::bail!("raw gRPC session did not start with an opening event");
+    };
+    let mut tool_calls = client
+        .subscribe_to_tool_calls(grpc::SubscribeToToolCallsRequest {
+            session_id: opened.session_id.clone(),
+            tool_names: vec![grpc::ToolName {
+                name: "echo".to_string(),
+                namespace: None,
+            }],
+        })
+        .await
+        .context("subscribe to raw gRPC tool calls")?
+        .into_inner();
+    let mut execution = client
+        .execute(grpc::ExecuteRequest {
+            session_id: opened.session_id.clone(),
+            execution_id: "execution-delivery".to_string(),
+            tool_call_id: "outer-call".to_string(),
+            source: r#"
+const result = await tools.echo({ value: "input" });
+text(result.value);
+"#
+            .to_string(),
+            enabled_tools: vec![grpc::ToolDefinition {
+                name: "echo".to_string(),
+                tool_name: Some(grpc::ToolName {
+                    name: "echo".to_string(),
+                    namespace: None,
+                }),
+                description: String::new(),
+                kind: grpc::ToolKind::Function as i32,
+                input_schema_json: None,
+                output_schema_json: None,
+            }],
+            yield_time_ms: Some(5_000),
+            max_output_tokens: Some(1_000),
+        })
+        .await
+        .context("execute raw gRPC cell")?
+        .into_inner();
+    let started = execution
+        .next()
+        .await
+        .context("raw gRPC execution ended before admission")??;
+    let Some(grpc::execute_event::Event::Started(started)) = started.event else {
+        anyhow::bail!("raw gRPC execution did not start with an admission event");
+    };
+    let invocation = tool_calls
+        .next()
+        .await
+        .context("raw gRPC tool subscription ended before invocation")??;
+    assert_eq!(invocation.cell_id, started.cell_id);
+    assert_eq!(invocation.runtime_tool_call_id, "tool-1");
+    client
+        .complete_tool_call(grpc::CompleteToolCallRequest {
+            session_id: opened.session_id.clone(),
+            invocation_id: invocation.invocation_id,
+            outcome: Some(grpc::complete_tool_call_request::Outcome::Succeeded(
+                grpc::ToolCallSucceeded {
+                    output_json: serde_json::to_vec(&json!({ "value": "output" }))?,
+                },
+            )),
+        })
+        .await
+        .context("complete raw gRPC tool call")?;
+    let outcome = execution
+        .next()
+        .await
+        .context("raw gRPC execution ended before outcome")??;
+    assert!(matches!(
+        outcome.event,
+        Some(grpc::execute_event::Event::Outcome(
+            grpc::ExecutionOutcome {
+                outcome: Some(grpc::execution_outcome::Outcome::Completed(_)),
+                ..
+            }
+        ))
+    ));
+
+    let delivery = session_events
+        .next()
+        .await
+        .context("raw gRPC session ended before tool-result delivery")??;
+    assert_eq!(
+        delivery.event,
+        Some(grpc::session_event::Event::ToolResultDelivered(
+            grpc::ToolResultDelivered {
+                cell_id: started.cell_id.clone(),
+                runtime_tool_call_id: "tool-1".to_string(),
+                delivered: true,
+            }
+        ))
+    );
+    let closed = session_events
+        .next()
+        .await
+        .context("raw gRPC session ended before cell closure")??;
+    assert!(matches!(
+        closed.event,
+        Some(grpc::session_event::Event::CellClosed(grpc::CellClosed {
+            cell_id,
+            ..
+        })) if cell_id == started.cell_id
+    ));
+
+    client
+        .close_session(grpc::CloseSessionRequest {
+            session_id: opened.session_id,
+        })
+        .await
+        .context("close raw gRPC session")?;
     Ok(())
 }
 

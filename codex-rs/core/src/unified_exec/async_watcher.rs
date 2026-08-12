@@ -189,7 +189,7 @@ pub(crate) fn spawn_exit_watcher(
     started_at: Instant,
     network_denial_monitor: Option<tokio::task::JoinHandle<()>>,
     completion_notification: Option<YieldedExecCompletionContext>,
-) {
+) -> tokio::task::JoinHandle<()> {
     let exit_token = process.cancellation_token();
     let output_drained = process.output_drained_notify();
     let interaction_lock = process.interaction_lock();
@@ -242,7 +242,7 @@ pub(crate) fn spawn_exit_watcher(
         };
 
         if let Some(completion_notification) = completion_notification
-            && completion_notification
+            && let Some(output_may_be_available) = completion_notification
                 .initial_exec_command_state
                 .claim_terminal_notification()
                 .await
@@ -253,15 +253,13 @@ pub(crate) fn spawn_exit_watcher(
                         session_id: process_id,
                         command: completion_notification.command,
                         completion,
-                        output_may_be_available: completion_notification
-                            .initial_exec_command_state
-                            .terminal_result_available(),
+                        output_may_be_available,
                     },
                     turn_ref.as_ref(),
                 )
                 .await;
         }
-    });
+    })
 }
 
 async fn process_chunk(

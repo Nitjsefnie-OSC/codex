@@ -1,7 +1,10 @@
+use super::head_tail_buffer::HeadTailBuffer;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_utils_path_uri::PathUri;
 use std::num::NonZeroUsize;
 use thiserror::Error;
+
+const PROCESS_FAILED_OUTPUT_MAX_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Error)]
 pub(crate) enum UnifiedExecError {
@@ -41,16 +44,20 @@ impl UnifiedExecError {
     }
 
     /// Preserve output drained by `write_stdin` when a stored process reports
-    /// a deferred failure. The error remains model-visible, so include the
-    /// bounded output that would otherwise be discarded with the process.
+    /// a deferred failure. This error bypasses normal tool-output truncation,
+    /// so cap the model-visible output here.
     pub(crate) fn with_collected_process_output(self, output: &[u8]) -> Self {
         match self {
-            Self::ProcessFailed { message } if !output.is_empty() => Self::ProcessFailed {
-                message: format!(
-                    "{message}\n\nFinal output:\n{}",
-                    String::from_utf8_lossy(output)
-                ),
-            },
+            Self::ProcessFailed { message } if !output.is_empty() => {
+                let mut bounded_output = HeadTailBuffer::new(PROCESS_FAILED_OUTPUT_MAX_BYTES);
+                bounded_output.push_chunk(output.to_vec());
+                Self::ProcessFailed {
+                    message: format!(
+                        "{message}\n\nFinal output:\n{}",
+                        String::from_utf8_lossy(&bounded_output.to_bytes_with_omission_marker())
+                    ),
+                }
+            }
             other => other,
         }
     }
@@ -82,3 +89,7 @@ impl UnifiedExecError {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "errors_tests.rs"]
+mod tests;

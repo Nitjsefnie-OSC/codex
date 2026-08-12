@@ -197,8 +197,12 @@ async fn start(
 
     let manager = &session.services.unified_exec_manager;
     let process_id = manager.allocate_process_id().await;
-    let context =
-        UnifiedExecContext::new(Arc::clone(&session), Arc::clone(&step_context), call_id.clone());
+    let context = UnifiedExecContext::new(
+        Arc::clone(&session),
+        Arc::clone(&step_context),
+        call_id.clone(),
+        crate::unified_exec::InitialExecCommandOutputDestination::Untracked,
+    );
     let request = ExecCommandRequest {
         command: resolved.command,
         shell_type: resolved.shell_type,

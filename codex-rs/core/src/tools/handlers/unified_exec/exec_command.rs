@@ -7,6 +7,7 @@ use crate::session::turn_context::TurnContext;
 use crate::skills::record_skill_activation;
 use crate::skills::retain_pending_skill_activation;
 use crate::tools::context::ExecCommandToolOutput;
+use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
@@ -26,6 +27,7 @@ use crate::tools::registry::PostToolUsePayload;
 use crate::tools::registry::PreToolUsePayload;
 use crate::tools::registry::ToolExecutor;
 use crate::unified_exec::ExecCommandRequest;
+use crate::unified_exec::InitialExecCommandOutputDestination;
 use crate::unified_exec::UnifiedExecContext;
 use crate::unified_exec::UnifiedExecError;
 use crate::unified_exec::UnifiedExecProcessManager;
@@ -118,6 +120,7 @@ impl ExecCommandHandler {
             step_context,
             tracker,
             call_id,
+            source,
             payload,
             ..
         } = invocation;
@@ -132,8 +135,18 @@ impl ExecCommandHandler {
         };
 
         let manager: &UnifiedExecProcessManager = &session.services.unified_exec_manager;
-        let context =
-            UnifiedExecContext::new(session.clone(), step_context.clone(), call_id.clone());
+        let initial_output_destination = match source {
+            ToolCallSource::Direct | ToolCallSource::DirectPlaintextMessage => {
+                InitialExecCommandOutputDestination::Rollout
+            }
+            ToolCallSource::CodeMode { .. } => InitialExecCommandOutputDestination::CodeMode,
+        };
+        let context = UnifiedExecContext::new(
+            session.clone(),
+            step_context.clone(),
+            call_id.clone(),
+            initial_output_destination,
+        );
         let environment_args: ExecCommandEnvironmentArgs = parse_arguments(&arguments)?;
         let Some(turn_environment) = resolve_tool_environment(
             &step_context.environments,
@@ -232,7 +245,6 @@ impl ExecCommandHandler {
                 )));
             }
         }
-        let process_id = manager.allocate_process_id().await;
         let resolved_command = get_command(
             &args,
             shell,
@@ -284,7 +296,6 @@ impl ExecCommandHandler {
             )
         {
             let approval_policy = context.step_context.turn.approval_policy();
-            manager.release_process_id(process_id).await;
             return Err(FunctionCallError::RespondToModel(format!(
                 "approval policy is {approval_policy:?}; reject command — you cannot ask for escalated permissions if the approval policy is {approval_policy:?}"
             )));
@@ -309,10 +320,7 @@ impl ExecCommandHandler {
             |permissions| Ok(Some(permissions)),
         ) {
             Ok(normalized) => normalized,
-            Err(err) => {
-                manager.release_process_id(process_id).await;
-                return Err(FunctionCallError::RespondToModel(err));
-            }
+            Err(err) => return Err(FunctionCallError::RespondToModel(err)),
         };
 
         let intercepted_patch = intercept_apply_patch(
@@ -327,13 +335,7 @@ impl ExecCommandHandler {
             "exec_command",
         )
         .await;
-        // Keep the reservation when interception returns `Ok(None)`: the normal command below
-        // still needs this process ID.
-        if intercepted_patch.is_err() {
-            manager.release_process_id(process_id).await;
-        }
         if let Some(output) = intercepted_patch? {
-            manager.release_process_id(process_id).await;
             return Ok(boxed_tool_output(ExecCommandToolOutput {
                 event_call_id: String::new(),
                 chunk_id: String::new(),
@@ -349,6 +351,7 @@ impl ExecCommandHandler {
             }));
         }
 
+        let process_id = manager.allocate_process_id().await;
         emit_unified_exec_tty_metric(&turn.session_telemetry, tty);
         let result = manager
             .exec_command(

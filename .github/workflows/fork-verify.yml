@@ -48,20 +48,51 @@ jobs:
       - name: Yielded exec completion wake regression
         working-directory: codex-rs
         run: |
-          cargo test -p codex-core --test all \
+          run_exact() {
+            set +e
+            output=$("$@" 2>&1)
+            status=$?
+            set -e
+            printf '%s\n' "$output"
+            if [ "$status" -ne 0 ] || ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+              return 1
+            fi
+          }
+          cargo check -p codex-code-mode-host -p codex-code-mode-runtime
+          cargo test -p codex-code-mode-host --lib
+          cargo test -p codex-code-mode --lib
+          run_exact cargo test -p codex-code-mode-host --test grpc \
+            nested_tool_delivery_precedes_grpc_cell_closure \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --test all \
             suite::unified_exec_idle_wake::yielded_exec_completion_wakes_idle_session_once_and_remains_pollable \
             -- --exact --nocapture --test-threads=1
-          cargo test -p codex-core --lib \
+          run_exact cargo test -p codex-core --test all \
+            suite::unified_exec_idle_wake::code_mode_nested_yield_survives_outer_turn_completion_and_wakes_idle_session \
+            -- --exact --nocapture --test-threads=1
+          run_exact cargo test -p codex-core --lib \
             unified_exec::tests::yielded_exec_terminal_notification_waits_for_result_and_is_claimed_once \
             -- --exact --nocapture
-          cargo test -p codex-core --lib \
+          run_exact cargo test -p codex-core --lib \
             unified_exec::tests::terminal_notification_is_not_claimed_when_exec_command_did_not_yield \
             -- --exact --nocapture
-          cargo test -p codex-core --lib \
+          run_exact cargo test -p codex-core --lib \
             unified_exec::tests::removing_terminal_result_does_not_suppress_notification \
             -- --exact --nocapture
-          cargo test -p codex-core --lib \
+          run_exact cargo test -p codex-core --lib \
+            unified_exec::tests::recorded_and_code_mode_outputs_resolve_duplicate_call_ids_by_process_id \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
             context::exec_command_completion_notification::tests::notification_fields_are_bounded_for_model_context \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            unified_exec::errors::tests::process_failure_bounds_collected_output \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            unified_exec::process_manager::tests::draining_process_store_coordinates_with_terminal_notification_claim \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            unified_exec::process_manager::tests::process_exit_ends_output_collection_while_elicitation_is_paused \
             -- --exact --nocapture
 
   check:

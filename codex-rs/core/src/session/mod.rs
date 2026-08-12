@@ -3047,7 +3047,28 @@ impl Session {
                     metadata: image,
                 });
         }
-        self.persist_rollout_response_items(items).await;
+        let function_call_outputs = items
+            .iter()
+            .filter_map(|item| match item {
+                ResponseItem::FunctionCallOutput {
+                    call_id, output, ..
+                } => output
+                    .text_content()
+                    .map(|output| (call_id.clone(), output.to_string())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if function_call_outputs.is_empty() {
+            self.persist_rollout_response_items(items).await;
+        } else {
+            let decision = self
+                .services
+                .unified_exec_manager
+                .prepare_initial_exec_command_output_persistence(&function_call_outputs)
+                .await;
+            self.persist_rollout_response_items_with_exec_decision(items, decision)
+                .await;
+        }
         self.send_raw_response_items(turn_context, items).await;
     }
 
@@ -3345,14 +3366,40 @@ impl Session {
         }
     }
 
-    async fn persist_rollout_response_items(&self, items: &[ResponseItem]) {
+    async fn persist_rollout_response_items(&self, items: &[ResponseItem]) -> bool {
         let rollout_items: Vec<RolloutItem> = items
             .iter()
             .cloned()
             .map(ResponseItemEnvelope::new)
             .map(RolloutItem::ResponseItem)
             .collect();
-        self.persist_rollout_items(&rollout_items).await;
+        self.try_persist_rollout_items(&rollout_items).await
+    }
+
+    async fn persist_rollout_response_items_with_exec_decision(
+        &self,
+        items: &[ResponseItem],
+        decision: crate::unified_exec::InitialExecOutputPersistenceDecision,
+    ) {
+        let Some(live_thread) = self.live_thread().cloned() else {
+            decision.commit();
+            return;
+        };
+        let rollout_items = items
+            .iter()
+            .cloned()
+            .map(RolloutItem::ResponseItem)
+            .collect::<Vec<_>>();
+        let persistence = tokio::spawn(async move {
+            live_thread
+                .append_items_with_post_commit(&rollout_items, || decision.commit())
+                .await
+        });
+        match persistence.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => error!("failed to record rollout items: {error:#}"),
+            Err(error) => error!("rollout persistence task failed: {error}"),
+        }
     }
 
     pub fn enabled(&self, feature: Feature) -> bool {
@@ -3658,11 +3705,18 @@ impl Session {
 
     #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
     pub(crate) async fn persist_rollout_items(&self, items: &[RolloutItem]) {
-        if let Some(live_thread) = self.live_thread()
-            && let Err(e) = live_thread.append_items(items).await
-        {
+        self.try_persist_rollout_items(items).await;
+    }
+
+    async fn try_persist_rollout_items(&self, items: &[RolloutItem]) -> bool {
+        let Some(live_thread) = self.live_thread() else {
+            return true;
+        };
+        if let Err(e) = live_thread.append_items(items).await {
             error!("failed to record rollout items: {e:#}");
+            return false;
         }
+        true
     }
 
     pub(crate) async fn clone_history(&self) -> ContextManager {
