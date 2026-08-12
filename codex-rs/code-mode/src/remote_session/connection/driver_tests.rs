@@ -725,7 +725,7 @@ async fn concurrent_large_delegate_results_do_not_disconnect_a_backpressured_bul
         command_rx,
         event_rx,
         event_tx.clone(),
-        outgoing_tx,
+        outgoing_tx.clone(),
         DriverLifecycle {
             alive: Arc::clone(&alive),
             failure: Arc::clone(&failure),
@@ -737,6 +737,7 @@ async fn concurrent_large_delegate_results_do_not_disconnect_a_backpressured_bul
         command_tx,
         event_tx,
         execute_claim_tx,
+        outgoing_tx,
         outgoing_rx,
         cancellation,
         alive,
