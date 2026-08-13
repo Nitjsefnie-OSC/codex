@@ -243,6 +243,50 @@ async fn output_lines_arrive_as_separate_sequenced_notifications() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn stderr_is_retained_without_generating_live_notifications() {
+    let harness = harness().await;
+    let started = call(
+        &harness,
+        "monitor-stderr",
+        serde_json::json!({
+            "kind": "watcher",
+            "command": sh("printf 'stderr-only\\n' >&2; sleep 30"),
+        }),
+    )
+    .await;
+    let process_id = process_id_of(&started);
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let delivered_while_running = notifications(&harness, process_id).await;
+    let output = call(
+        &harness,
+        "monitor-stderr-read",
+        serde_json::json!({ "action": "read", "process_id": process_id }),
+    )
+    .await;
+
+    call(
+        &harness,
+        "monitor-stderr-stop",
+        serde_json::json!({ "action": "stop", "process_id": process_id }),
+    )
+    .await;
+    await_terminal(&harness, process_id).await;
+
+    assert_eq!(
+        delivered_while_running,
+        Vec::<serde_json::Value>::new(),
+        "stderr must not produce nonterminal monitor notifications"
+    );
+    assert_eq!(
+        output["output"].as_str(),
+        Some("stderr-only\n"),
+        "stderr remains available through monitor read"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn a_successful_job_always_delivers_exactly_one_terminal_notification() {
     let harness = harness().await;
     let started = call(
