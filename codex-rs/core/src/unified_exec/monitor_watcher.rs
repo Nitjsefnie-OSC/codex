@@ -3,15 +3,14 @@
 //! [`super::async_watcher`] streams a unified-exec process's output to the
 //! *client* as `ExecCommandOutputDelta` events and emits one `ExecCommandEnd`
 //! item. The model sees none of that. This watcher runs beside it on the same
-//! process, batching **complete lines** into bounded, sequenced notifications
-//! injected into the active turn, and delivering exactly one terminal
+//! process's stdout, batching **complete lines** into bounded, sequenced
+//! notifications injected into the active turn, and delivering exactly one terminal
 //! notification whatever the outcome — clean exit, non-zero exit, failure,
 //! stop, or timeout.
 //!
-//! It reuses the process's own broadcast output channel and cancellation token,
-//! so it adds no polling and no second copy of the output: the retained bytes
-//! stay in unified exec's bounded transcript buffer, readable afterwards
-//! through `monitor` `read`.
+//! It reuses the process's stdout-only monitor channel and cancellation token,
+//! so it adds no polling. Unified exec's combined stdout/stderr transcript
+//! remains readable afterwards through `monitor` `read`.
 
 use std::sync::Arc;
 

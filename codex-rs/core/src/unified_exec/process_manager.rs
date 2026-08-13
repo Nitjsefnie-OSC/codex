@@ -768,7 +768,10 @@ impl UnifiedExecProcessManager {
                 self.attach_monitor_locked(&request, context, &process, &transcript, attachment)
                     .await
             }
-            None => Vec::new(),
+            None => {
+                process.monitor_output_buffer().lock().await.take();
+                Vec::new()
+            }
         };
         start_streaming_output(&process, context, Arc::clone(&transcript));
         if process_started_alive {
@@ -2027,19 +2030,22 @@ impl UnifiedExecProcessManager {
         transcript: &Arc<tokio::sync::Mutex<HeadTailBuffer>>,
         attachment: MonitorAttachment,
     ) -> Vec<u8> {
-        let (seed, receiver) = {
+        let (transcript_seed, notification_seed, receiver) = {
             let mut output_buffer = process.output_handles().output_buffer.lock().await;
-            let seed = output_buffer.drain();
+            let mut monitor_output_buffer = process.monitor_output_buffer().lock().await;
+            let transcript_seed = output_buffer.drain();
+            let notification_seed = monitor_output_buffer.take().unwrap_or_default();
             (
-                seed.to_bytes_with_omission_marker(),
-                process.output_receiver(),
+                transcript_seed.to_bytes_with_omission_marker(),
+                notification_seed.to_bytes_with_omission_marker(),
+                process.monitor_output_receiver(),
             )
         };
 
-        // The transcript backs `monitor` `read`, so it has to start from the
-        // same first byte the notifications do.
-        if !seed.is_empty() {
-            transcript.lock().await.push_chunk(seed.clone());
+        // The transcript backs `monitor` `read`, so it retains both stdout and
+        // stderr even though only the stdout seed is sent to the model.
+        if !transcript_seed.is_empty() {
+            transcript.lock().await.push_chunk(transcript_seed.clone());
         }
 
         let handle = Arc::new(MonitorHandle::new(
@@ -2060,11 +2066,11 @@ impl UnifiedExecProcessManager {
             Arc::clone(&context.session),
             Arc::clone(&context.step_context.turn),
             attachment.timeout,
-            seed.clone(),
+            notification_seed,
             receiver,
         );
         monitor_watcher_tasks.push(watcher);
-        seed
+        transcript_seed
     }
 
     async fn join_exec_watchers_locked(&self) {
@@ -2081,10 +2087,10 @@ impl UnifiedExecProcessManager {
     async fn join_monitor_watchers_locked(&self) {
         let watchers = std::mem::take(&mut *self.monitor_watcher_tasks.lock().await);
         for watcher in watchers {
-            if let Err(err) = watcher.await {
-                if !err.is_cancelled() {
-                    tracing::warn!("monitor watcher task failed during shutdown: {err}");
-                }
+            if let Err(err) = watcher.await
+                && !err.is_cancelled()
+            {
+                tracing::warn!("monitor watcher task failed during shutdown: {err}");
             }
         }
     }
