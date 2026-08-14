@@ -10791,8 +10791,9 @@ async fn abort_cleanup_history_is_durable_before_turn_aborted() {
         Arc::get_mut(&mut sess).expect("session should be uniquely owned"),
     )
     .await;
+    let cleanup_item_id = ResponseItemId::with_suffix("msg", "cleanup-item");
     let cleanup_item = ResponseItem::Message {
-        id: Some(ResponseItemId::with_suffix("msg", "cleanup-item")),
+        id: Some(cleanup_item_id.clone()),
         role: "assistant".to_string(),
         content: vec![ContentItem::OutputText {
             text: "cleanup persisted before abort".to_string(),
@@ -10812,14 +10813,18 @@ async fn abort_cleanup_history_is_durable_before_turn_aborted() {
     sess.abort_all_tasks(TurnAbortReason::Replaced).await;
 
     let mut cleanup_event_seen = false;
+    let mut prepared_cleanup_item = None;
     loop {
         let event = timeout(Duration::from_secs(2), rx.recv())
             .await
             .expect("turn abort event should be delivered")
             .expect("event channel should remain open");
         match &event.msg {
-            EventMsg::RawResponseItem(RawResponseItemEvent { item }) if item == &cleanup_item => {
-                cleanup_event_seen = true
+            EventMsg::RawResponseItem(RawResponseItemEvent { item })
+                if item.id() == Some(&cleanup_item_id) =>
+            {
+                cleanup_event_seen = true;
+                prepared_cleanup_item = Some(item.clone());
             }
             EventMsg::TurnAborted(_) => break,
             _ => {}
@@ -10827,15 +10832,18 @@ async fn abort_cleanup_history_is_durable_before_turn_aborted() {
     }
 
     assert!(cleanup_event_seen);
+    let prepared_cleanup_item = prepared_cleanup_item.expect(
+        "the cleanup item with the stable id must be prepared and emitted before TurnAborted",
+    );
     let durable_history = sess
         .live_thread()
         .expect("test should have persisted thread")
         .load_history(/*include_archived*/ true)
         .await
         .expect("durable history should be readable at TurnAborted");
-    let cleanup_index = durable_history.items.iter().position(
-        |item| matches!(item, RolloutItem::ResponseItem(envelope) if envelope.item == cleanup_item),
-    );
+    let cleanup_index = durable_history.items.iter().position(|item| {
+        matches!(item, RolloutItem::ResponseItem(envelope) if envelope.item == prepared_cleanup_item)
+    });
     let terminal_index = durable_history
         .items
         .iter()
