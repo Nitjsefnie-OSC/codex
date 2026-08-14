@@ -45,6 +45,7 @@ async fn yielded_exec_completion_after_compaction_wakes_idle_session_once_and_re
             .features
             .enable(Feature::UnifiedExec)
             .expect("test config should allow feature update");
+        let _ = config.features.disable(Feature::RemoteCompactionV2);
         config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());
     });
     let test = builder.build_with_auto_env(&server).await?;
