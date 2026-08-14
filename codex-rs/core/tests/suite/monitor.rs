@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use anyhow::Result;
+use codex_core::TurnInputRequest;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
@@ -192,16 +193,10 @@ async fn monitor_output_waits_behind_standalone_shell_and_wakes_once() -> Result
     })
     .await;
     test.codex
-        .steer_input(
-            vec![UserInput::Text {
-                text: "steer while the shell is running".to_string(),
-                text_elements: Vec::new(),
-            }],
-            Default::default(),
-            None,
-            None,
-            None,
-        )
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "steer while the shell is running".to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .map_err(|err| anyhow::anyhow!("steering input unexpectedly failed: {err:?}"))?;
 

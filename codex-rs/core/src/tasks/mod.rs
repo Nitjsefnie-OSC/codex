@@ -644,18 +644,19 @@ impl Session {
             aborted_turn = task.is_some();
             turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
             if let Some(task) = task {
+                let task_turn_context = Arc::clone(&task.turn_context);
                 let (items, parent_turn) = self
                     .input_queue
                     .take_pending_background_inputs_for_turn_state(active_turn.turn_state.as_ref())
                     .await;
+                self.handle_task_abort(task, reason.clone()).await;
                 self.persist_background_input_batch(
-                    Arc::clone(&task.turn_context),
+                    task_turn_context,
                     items,
                     parent_turn,
                     delivery_guard,
                 )
                 .await;
-                self.handle_task_abort(task, reason.clone()).await;
                 self.services
                     .unified_exec_manager
                     .discard_unrecorded_initial_exec_command_outputs()
@@ -762,18 +763,19 @@ impl Session {
         let task = active_turn.task.take();
         let turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
         if let Some(task) = task {
+            let task_turn_context = Arc::clone(&task.turn_context);
             let (items, parent_turn) = self
                 .input_queue
                 .take_pending_background_inputs_for_turn_state(active_turn.turn_state.as_ref())
                 .await;
+            self.handle_task_abort(task, reason.clone()).await;
             self.persist_background_input_batch(
-                Arc::clone(&task.turn_context),
+                task_turn_context,
                 items,
                 parent_turn,
                 delivery_guard,
             )
             .await;
-            self.handle_task_abort(task, reason.clone()).await;
             self.services
                 .unified_exec_manager
                 .discard_unrecorded_initial_exec_command_outputs()

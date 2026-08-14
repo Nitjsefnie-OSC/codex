@@ -673,6 +673,7 @@ async fn draining_process_store_coordinates_with_terminal_notification_claim() {
             process_id,
             ProcessEntry {
                 process: Arc::clone(&process),
+                plugin_metrics_sidecar: None,
                 call_id: format!("call-{process_id}"),
                 process_id,
                 cwd: PathUri::parse("file:///tmp").expect("test cwd should be valid"),

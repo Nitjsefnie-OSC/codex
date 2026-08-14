@@ -200,9 +200,10 @@ impl Session {
 
     /// Persist one monitor notification and request one coalesced idle wake.
     ///
-    /// Active regular turns receive the item directly. At every other turn
-    /// boundary the item is recorded first, so interruption, shutdown, and a
-    /// competing user submission cannot erase it before the next model request.
+    /// Active regular turns receive the item directly, while compaction queues
+    /// it for the regular successor. At every other turn boundary the item is
+    /// recorded first, so interruption, shutdown, and a competing user
+    /// submission cannot erase it before the next model request.
     pub(crate) async fn deliver_monitor_notification(
         self: &Arc<Self>,
         notification: MonitorNotification,
@@ -261,9 +262,10 @@ impl Session {
 
     /// Persist one background notification and request one coalesced idle wake.
     ///
-    /// Active regular turns receive the item directly. At every other turn
-    /// boundary the item is recorded first, so interruption, shutdown, and a
-    /// competing user submission cannot erase it before the next model request.
+    /// Active regular turns receive the item directly, while compaction queues
+    /// it for the regular successor. At every other turn boundary the item is
+    /// recorded first, so interruption, shutdown, and a competing user
+    /// submission cannot erase it before the next model request.
     async fn deliver_background_input(
         self: &Arc<Self>,
         input: TurnInput,
