@@ -84,6 +84,19 @@ fn request_contains_monitor_sequence(request: &[u8], sequence: usize) -> Result<
         .any(|payload| payload.get("seq").and_then(Value::as_u64) == Some(sequence as u64)))
 }
 
+fn monitor_notification_sequences(payloads: &[Value], context: &str) -> Result<Vec<u64>> {
+    payloads
+        .iter()
+        .enumerate()
+        .map(|(index, payload)| {
+            payload
+                .get("seq")
+                .and_then(Value::as_u64)
+                .with_context(|| format!("{context} payload {index} should have a numeric seq"))
+        })
+        .collect()
+}
+
 const COMPLETION_GATE: &str = "yielded-exec-completion.ready";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -492,24 +505,28 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
         let seq = index + 1;
         let monitor_notifications = monitor_notification_payloads(request)
             .with_context(|| format!("failed to decode pre-compaction batch {seq} request"))?;
+        let actual_sequences = monitor_notification_sequences(
+            &monitor_notifications,
+            &format!("pre-compaction batch {seq}"),
+        )?;
         assert_eq!(
-            1,
-            monitor_notifications.len(),
-            "pre-compaction batch {seq} should not be coalesced with another notification"
-        );
-        assert!(
-            request_contains_monitor_sequence(request, seq)
-                .with_context(|| format!("failed to parse pre-compaction batch {seq} request"))?,
-            "pre-compaction request should contain monitor notification sequence {seq}"
+            (1..=seq)
+                .map(|sequence| sequence as u64)
+                .collect::<Vec<_>>(),
+            actual_sequences,
+            "pre-compaction batch {seq} should retain the monitor history frontier"
         );
         let expected_lines = Value::Array(
             (0..LINES_PER_NOTIFICATION)
                 .map(|index| Value::String(format!("monitor-before-{seq}-{index}")))
                 .collect(),
         );
+        let newest_monitor_notification = monitor_notifications
+            .last()
+            .with_context(|| format!("pre-compaction batch {seq} monitor payloads are empty"))?;
         assert_eq!(
             Some(&expected_lines),
-            monitor_notifications[0].get("lines"),
+            newest_monitor_notification.get("lines"),
             "pre-compaction batch {seq} should contain the expected monitor lines"
         );
     }
@@ -567,12 +584,16 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
         post_compaction_requests.len(),
         "the post-compaction monitor batch should wake exactly one successor"
     );
-    let (post_compaction_request, post_compaction_payloads) = post_compaction_requests[0];
+    let (_, post_compaction_payloads) = post_compaction_requests[0];
     assert_eq!(1, post_compaction_payloads.len());
-    assert!(
-        request_contains_monitor_sequence(post_compaction_request, 21)
-            .context("failed to parse post-compaction monitor request")?,
-        "post-compaction request should contain monitor notification sequence 21"
+    let actual_sequences = monitor_notification_sequences(
+        post_compaction_payloads,
+        "post-compaction monitor request",
+    )?;
+    assert_eq!(
+        vec![21_u64],
+        actual_sequences,
+        "post-compaction request should contain only the successor monitor notification"
     );
     assert_eq!(
         Some(&expected_after_lines),
