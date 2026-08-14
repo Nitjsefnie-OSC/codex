@@ -20,6 +20,7 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelsResponse;
+use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HookEventName;
@@ -835,6 +836,182 @@ async fn native_agent_completion_during_manual_compact_reaches_regular_successor
     let input = request.body_json()["input"].to_string();
     assert_eq!(input.matches("Message Type: FINAL_ANSWER").count(), 1);
     assert!(input.contains("completion during manual compact"));
+
+    compact_stream.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_agent_completion_during_manual_compact_reaches_regular_successor() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    const AGENT_REFERENCE: &str = "worker/legacy";
+    const COMPLETION_STATUS: &str = "legacy completion during manual compact";
+    const COMPLETION_TURN_ID: &str = "legacy-completion-turn";
+
+    let server = start_mock_server().await;
+    let (compact_gate_tx, compact_gate_rx) = oneshot::channel();
+    let (compact_stream, _compact_completions) = start_streaming_sse_server(vec![vec![
+        StreamingSseChunk {
+            gate: None,
+            body: sse(vec![ev_response_created("resp-compact-legacy")]),
+        },
+        StreamingSseChunk {
+            gate: Some(compact_gate_rx),
+            body: sse(vec![
+                ev_assistant_message("msg-compact-legacy", SUMMARY_TEXT),
+                ev_completed("resp-compact-legacy"),
+            ]),
+        },
+    ]])
+    .await;
+    mount_response_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            std::str::from_utf8(&req.body)
+                .is_ok_and(|body| body_contains_text(body, SUMMARIZATION_PROMPT))
+        },
+        wiremock::ResponseTemplate::new(307)
+            .insert_header("location", format!("{}/v1/responses", compact_stream.uri())),
+    )
+    .await;
+    let successor_request = mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            let body = std::str::from_utf8(&req.body).unwrap_or("");
+            body.contains(SUMMARY_TEXT) && body.contains("<subagent_notification>")
+        },
+        sse(vec![
+            ev_response_created("resp-successor-legacy"),
+            ev_assistant_message(
+                "msg-successor-legacy",
+                "successor observed legacy completion",
+            ),
+            ev_completed("resp-successor-legacy"),
+        ]),
+    )
+    .await;
+
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        config
+            .features
+            .enable(Feature::Collab)
+            .expect("test config should allow feature update");
+        config
+            .features
+            .enable(Feature::MultiAgentV2)
+            .expect("test config should allow feature update");
+        set_test_compact_prompt(config);
+        config.model_provider.request_max_retries = Some(0);
+        config.model_provider.stream_max_retries = Some(0);
+        config.model_provider.supports_websockets = false;
+    });
+    let test = builder.build(&server).await?;
+    test.codex.submit(Op::Compact).await?;
+    let compact_turn_id = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::TurnStarted(event) => Some(event.turn_id.clone()),
+        _ => None,
+    })
+    .await;
+    wait_for_event(&test.codex, |event| {
+        matches!(
+            event,
+            EventMsg::ItemStarted(ItemStartedEvent {
+                item: TurnItem::ContextCompaction(_),
+                ..
+            })
+        )
+    })
+    .await;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        compact_stream.wait_for_request_count(1),
+    )
+    .await
+    .map_err(|_| anyhow!("manual compact request did not reach its gate"))?;
+
+    test.codex
+        .submit(Op::SubagentCompletion {
+            agent_reference: AGENT_REFERENCE.to_string(),
+            status: AgentStatus::Completed(Some(COMPLETION_STATUS.to_string())),
+            turn_id: COMPLETION_TURN_ID.to_string(),
+        })
+        .await?;
+
+    // This reply-bearing FIFO operation is handled after the completion
+    // submission, proving the notification was admitted before compaction is
+    // released. It cannot start a competing turn while Compact is active.
+    let completion_barrier = test
+        .codex
+        .start_turn_if_idle(TurnInputRequest::user_input(Vec::new()))
+        .await?;
+    assert!(
+        matches!(
+            completion_barrier,
+            codex_core::StartIfIdleSubmission::NotSubmitted {
+                reason: codex_core::NotSubmittedReason::NotIdle
+            }
+        ),
+        "completion barrier must observe the active compact turn",
+    );
+
+    compact_gate_tx
+        .send(())
+        .map_err(|_| anyhow!("manual compact response gate closed unexpectedly"))?;
+
+    wait_for_event(
+        &test.codex,
+        |event| matches!(event, EventMsg::TurnComplete(event) if event.turn_id == compact_turn_id),
+    )
+    .await;
+    let successor_turn_id = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::TurnStarted(event) => Some(event.turn_id.clone()),
+        _ => None,
+    })
+    .await;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(event) if event.turn_id == successor_turn_id)
+    })
+    .await;
+
+    let request = successor_request.single_request();
+    let expected_notification = format!(
+        "<subagent_notification>\n{{\"agent_path\":\"{AGENT_REFERENCE}\",\"status\":{{\"completed\":\"{COMPLETION_STATUS}\"}}}}\n</subagent_notification>"
+    );
+    assert_eq!(
+        request
+            .message_input_texts("user")
+            .into_iter()
+            .filter(|text| text.contains("<subagent_notification>"))
+            .collect::<Vec<_>>(),
+        vec![expected_notification]
+    );
+
+    let body = request.body_json();
+    let notification_items = body["input"]
+        .as_array()
+        .expect("successor request input array")
+        .iter()
+        .filter(|item| {
+            item["type"] == "message"
+                && item["role"] == "user"
+                && item["content"].as_array().is_some_and(|content| {
+                    content.iter().any(|span| {
+                        span["type"] == "input_text"
+                            && span["text"]
+                                .as_str()
+                                .is_some_and(|text| text.contains("<subagent_notification>"))
+                    })
+                })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(notification_items.len(), 1);
+    assert_eq!(
+        notification_items[0]["internal_chat_message_metadata_passthrough"]["turn_id"],
+        COMPLETION_TURN_ID
+    );
 
     compact_stream.shutdown().await;
     Ok(())
