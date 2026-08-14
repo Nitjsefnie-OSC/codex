@@ -5,6 +5,7 @@ use super::session::Session;
 use super::turn_context::TurnContext;
 use crate::context::ContextualUserFragment;
 use crate::context::ExecCommandCompletionNotification;
+#[cfg(test)]
 use crate::context::MonitorNotification;
 use crate::context::SubagentNotification;
 use codex_features::Feature;
