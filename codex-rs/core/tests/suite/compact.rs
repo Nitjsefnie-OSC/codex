@@ -740,7 +740,9 @@ async fn native_agent_completion_during_manual_compact_reaches_regular_successor
     )
     .await;
 
-    let mut builder = test_codex().with_config(|config| {
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
         config
             .features
             .enable(Feature::Collab)
