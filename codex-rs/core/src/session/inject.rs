@@ -1,4 +1,5 @@
 use super::TurnInput;
+use super::input_queue::InputQueue;
 use super::input_queue::PendingInput;
 use super::session::Session;
 use super::turn_context::TurnContext;
@@ -27,32 +28,43 @@ impl Session {
         provenance: crate::session::input_queue::PendingTurnProvenance,
         delivery_guard: tokio::sync::OwnedMutexGuard<()>,
     ) {
-        if items.is_empty() {
-            return;
-        }
-        let session = Arc::clone(self);
-        let persistence = tokio::spawn(async move {
-            let _delivery_guard = delivery_guard;
-            let publishes_agent_completion_activity = items.iter().any(|item| {
-                matches!(item, TurnInput::AgentCompletion(_))
-                    || matches!(item, TurnInput::ResponseItem(item) if SubagentNotification::is_response_item(&item.item))
-            });
-            let requests_background_wake = items.iter().any(|item| {
-                matches!(item, TurnInput::AgentCompletion(_))
-                    || matches!(item, TurnInput::InterAgentCommunication(communication) if communication.trigger_turn)
-                    || matches!(item, TurnInput::ResponseItem(item) if crate::context::is_background_notification(&item.item))
-            });
+        let persisted = self
+            .persist_background_input_batch_without_wake(
+                turn_context,
+                items,
+                provenance,
+                &delivery_guard,
+            )
+            .await;
+        persisted.publish(&self.input_queue);
+    }
+
+    pub(crate) async fn persist_background_input_batch_without_wake(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        items: Vec<TurnInput>,
+        provenance: crate::session::input_queue::PendingTurnProvenance,
+        _delivery_guard: &tokio::sync::OwnedMutexGuard<()>,
+    ) -> PersistedBackgroundInputBatch {
+        let publishes_agent_completion_activity = items.iter().any(|item| {
+            matches!(item, TurnInput::AgentCompletion(_))
+                || matches!(item, TurnInput::ResponseItem(item) if SubagentNotification::is_response_item(&item.item))
+        });
+        let requests_background_wake = items.iter().any(|item| {
+            matches!(item, TurnInput::AgentCompletion(_))
+                || matches!(item, TurnInput::InterAgentCommunication(communication) if communication.trigger_turn)
+                || matches!(item, TurnInput::ResponseItem(item) if crate::context::is_background_notification(&item.item))
+        });
+        if !items.is_empty() {
             for input in items {
                 match input {
                     TurnInput::ResponseItem(item) => {
-                        session
-                            .record_annotated_conversation_items(turn_context.as_ref(), vec![item])
+                        self.record_annotated_conversation_items(turn_context.as_ref(), vec![item])
                             .await;
                     }
                     TurnInput::InterAgentCommunication(communication)
                     | TurnInput::AgentCompletion(communication) => {
-                        session
-                            .record_inter_agent_communication(turn_context.as_ref(), communication)
+                        self.record_inter_agent_communication(turn_context.as_ref(), communication)
                             .await;
                     }
                     TurnInput::UserInput { .. } => {
@@ -60,23 +72,14 @@ impl Session {
                     }
                 }
             }
-            if requests_background_wake {
-                session
-                    .input_queue
-                    .request_background_wake(provenance, publishes_agent_completion_activity);
-            }
-            if let Err(err) = session.flush_rollout().await {
+            if let Err(err) = self.flush_rollout().await {
                 tracing::warn!("failed to flush background notification before wake: {err}");
             }
-            if requests_background_wake && publishes_agent_completion_activity {
-                session.input_queue.request_agent_completion_activity();
-            }
-            if requests_background_wake {
-                session.input_queue.notify_background_wake();
-            }
-        });
-        if let Err(error) = persistence.await {
-            tracing::error!("background input persistence task failed: {error}");
+        }
+        PersistedBackgroundInputBatch {
+            provenance,
+            requests_background_wake,
+            publishes_agent_completion_activity,
         }
     }
 
@@ -422,5 +425,29 @@ impl Session {
             }
             self.input_queue.notify_background_wake();
         }
+    }
+}
+
+pub(crate) struct PersistedBackgroundInputBatch {
+    provenance: crate::session::input_queue::PendingTurnProvenance,
+    requests_background_wake: bool,
+    publishes_agent_completion_activity: bool,
+}
+
+impl PersistedBackgroundInputBatch {
+    pub(crate) fn publish(self, input_queue: &InputQueue) {
+        let Self {
+            provenance,
+            requests_background_wake,
+            publishes_agent_completion_activity,
+        } = self;
+        if !requests_background_wake {
+            return;
+        }
+        input_queue.request_background_wake(provenance, publishes_agent_completion_activity);
+        if publishes_agent_completion_activity {
+            input_queue.request_agent_completion_activity();
+        }
+        input_queue.notify_background_wake();
     }
 }
