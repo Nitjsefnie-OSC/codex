@@ -465,11 +465,11 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
         .await?;
     timeout(
         Duration::from_secs(10),
-        streaming_server.wait_for_request_count(3 + PRE_COMPACTION_NOTIFICATION_COUNT),
+        streaming_server.wait_for_request_count(4 + PRE_COMPACTION_NOTIFICATION_COUNT),
     )
     .await?;
     let requests = streaming_server.requests().await;
-    assert_eq!(3 + PRE_COMPACTION_NOTIFICATION_COUNT, requests.len());
+    assert_eq!(4 + PRE_COMPACTION_NOTIFICATION_COUNT, requests.len());
     let post_compaction_requests = requests
         .iter()
         .filter(|request| String::from_utf8_lossy(request).contains("monitor-after"))
@@ -499,7 +499,7 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
     assert!(completion_receivers.is_empty());
     test.codex.shutdown_and_wait().await?;
     assert_eq!(
-        3 + PRE_COMPACTION_NOTIFICATION_COUNT,
+        4 + PRE_COMPACTION_NOTIFICATION_COUNT,
         streaming_server.requests().await.len()
     );
     streaming_server.shutdown().await;
