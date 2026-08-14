@@ -22,6 +22,7 @@ use core_test_support::streaming_sse::start_streaming_sse_server;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_target_os;
 use core_test_support::wait_for_event;
+use core_test_support::wait_for_event_match;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
@@ -228,11 +229,17 @@ async fn yielded_exec_completion_after_compaction_wakes_idle_session_once_and_re
     })
     .await?;
 
-    let notification = completion_requests[0]
-        .message_input_texts("developer")
-        .into_iter()
-        .find(|text| text.contains("<exec_command_completion>"))
-        .context("idle wake request did not contain an exec completion notification")?;
+    let completion_notifications = completion_requests
+        .iter()
+        .flat_map(|request| request.message_input_texts("developer"))
+        .filter(|text| text.contains("<exec_command_completion>"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        1,
+        completion_notifications.len(),
+        "after-compaction successor should receive one yielded exec completion notification"
+    );
+    let notification = &completion_notifications[0];
     assert!(
         notification.contains(&format!(r#""session_id":{session_id}"#)),
         "completion notification should identify the yielded session: {notification}"
@@ -265,6 +272,240 @@ async fn yielded_exec_completion_after_compaction_wakes_idle_session_once_and_re
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn yielded_exec_completion_during_compaction_wakes_successor_once() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    const EXPECTED_SESSION_ID: i32 = 1000;
+
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+        config.model_provider.name = "Non-OpenAI Model provider".to_string();
+        config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());
+    });
+    let (shell, command) = match test_target_os() {
+        TestTargetOs::Linux | TestTargetOs::MacOs => (
+            "bash",
+            format!(
+                "while [ ! -f {COMPLETION_GATE} ]; do sleep 0.05; done; printf yielded-exec-during-compaction-complete"
+            ),
+        ),
+        TestTargetOs::Windows => (
+            "powershell",
+            format!(
+                "while (-not (Test-Path -LiteralPath '{COMPLETION_GATE}')) {{ Start-Sleep -Milliseconds 50 }}; [Console]::Out.Write('yielded-exec-during-compaction-complete')"
+            ),
+        ),
+    };
+
+    let (compact_release_tx, compact_release_rx) = tokio::sync::oneshot::channel();
+    let response_streams = vec![
+        vec![StreamingSseChunk {
+            gate: None,
+            body: sse(vec![
+                ev_response_created("yielded-exec-during-start"),
+                ev_function_call(
+                    "yielded-exec-during-call",
+                    "exec_command",
+                    &serde_json::to_string(&json!({
+                        "cmd": command,
+                        "shell": shell,
+                        "login": false,
+                        "yield_time_ms": 250,
+                    }))?,
+                ),
+                ev_completed("yielded-exec-during-start"),
+            ]),
+        }],
+        vec![StreamingSseChunk {
+            gate: None,
+            body: sse(vec![
+                ev_assistant_message("yielded-exec-during-waiting", "waiting for completion"),
+                ev_completed("yielded-exec-during-followup"),
+            ]),
+        }],
+        vec![
+            StreamingSseChunk {
+                gate: None,
+                body: sse(vec![ev_response_created("yielded-exec-during-compact")]),
+            },
+            StreamingSseChunk {
+                gate: Some(compact_release_rx),
+                body: sse(vec![
+                    ev_assistant_message(
+                        "yielded-exec-during-compact-summary",
+                        "compacted exec context",
+                    ),
+                    ev_completed("yielded-exec-during-compact"),
+                ]),
+            },
+        ],
+        vec![StreamingSseChunk {
+            gate: None,
+            body: sse(vec![
+                ev_response_created("yielded-exec-during-idle-wake"),
+                ev_function_call(
+                    "yielded-exec-during-poll",
+                    "write_stdin",
+                    &serde_json::to_string(&json!({
+                        "session_id": EXPECTED_SESSION_ID,
+                        "yield_time_ms": 5000,
+                    }))?,
+                ),
+                ev_completed("yielded-exec-during-idle-wake"),
+            ]),
+        }],
+        vec![StreamingSseChunk {
+            gate: None,
+            body: sse(vec![
+                ev_assistant_message("yielded-exec-during-observed", "completion observed"),
+                ev_completed("yielded-exec-during-observed-response"),
+            ]),
+        }],
+    ];
+    let (streaming_server, mut completion_receivers) =
+        start_streaming_sse_server(response_streams).await;
+    let test = builder
+        .build_with_streaming_server(&streaming_server)
+        .await?;
+    let completion_gate = test
+        .executor_environment()
+        .selection()
+        .cwd
+        .join(COMPLETION_GATE)?;
+
+    test.submit_turn("start a command that will complete during compaction")
+        .await?;
+    completion_receivers
+        .remove(0)
+        .await
+        .with_context(|| "initial yielded exec response stage did not complete")?;
+    completion_receivers
+        .remove(0)
+        .await
+        .with_context(|| "yielded exec follow-up response stage did not complete")?;
+    let initial_requests = streaming_server.requests().await;
+    assert_eq!(2, initial_requests.len());
+    let initial_output = initial_requests[1]
+        .function_call_output_text("yielded-exec-during-call")
+        .context("missing yielded exec_command output")?;
+    let session_id = yielded_session_id(&initial_output)?;
+    assert_eq!(EXPECTED_SESSION_ID, session_id);
+
+    test.codex.submit(Op::Compact).await?;
+    let compact_turn_id = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::TurnStarted(event) => Some(event.turn_id.clone()),
+        _ => None,
+    })
+    .await;
+    timeout(
+        Duration::from_secs(10),
+        streaming_server.wait_for_request_count(3),
+    )
+    .await
+    .with_context(|| "timed out waiting for the blocked compact request")?;
+
+    let (_admission_guard, completion_admitted) =
+        codex_core::test_support::install_background_input_admission_hook(compact_turn_id.clone());
+    let completion_admission = completion_admitted.notified();
+    tokio::pin!(completion_admission);
+    test.fs()
+        .write_file(&completion_gate, b"ready".to_vec(), /*sandbox*/ None)
+        .await?;
+    timeout(Duration::from_secs(30), &mut completion_admission)
+        .await
+        .with_context(|| "timed out waiting for yielded exec admission into compact turn")?;
+    compact_release_tx
+        .send(())
+        .map_err(|_| anyhow::anyhow!("compaction response was dropped before release"))?;
+
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::ContextCompacted(_))
+    })
+    .await;
+    wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::TurnComplete(event) if event.turn_id == compact_turn_id => Some(()),
+        _ => None,
+    })
+    .await;
+    completion_receivers
+        .remove(0)
+        .await
+        .with_context(|| "local compaction response stage did not complete")?;
+
+    timeout(
+        Duration::from_secs(10),
+        streaming_server.wait_for_request_count(4),
+    )
+    .await
+    .with_context(|| "timed out waiting for the compact successor wake")?;
+    let successor_response = completion_receivers.remove(0);
+    successor_response
+        .await
+        .with_context(|| "successor write_stdin response stage did not complete")?;
+    timeout(
+        Duration::from_secs(10),
+        streaming_server.wait_for_request_count(5),
+    )
+    .await
+    .with_context(|| "timed out waiting for the write_stdin follow-up")?;
+    completion_receivers
+        .remove(0)
+        .await
+        .with_context(|| "successor follow-up response stage did not complete")?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let requests = streaming_server.requests().await;
+    let successor_requests = &requests[3..];
+    let completion_notifications = successor_requests
+        .iter()
+        .flat_map(|request| request.message_input_texts("developer"))
+        .filter(|text| text.contains("<exec_command_completion>"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        1,
+        completion_notifications.len(),
+        "compact successor should receive one yielded exec completion notification"
+    );
+    let notification = &completion_notifications[0];
+    assert!(
+        notification.contains(&format!(r#""session_id":{session_id}"#)),
+        "completion notification should identify the yielded session: {notification}"
+    );
+    assert!(
+        notification.contains(r#""exit_code":0"#),
+        "completion notification should report the exit code: {notification}"
+    );
+    assert!(
+        notification.contains(r#""output_may_be_available":true"#),
+        "completion notification should preserve write_stdin retrieval: {notification}"
+    );
+    let poll_output = requests[4]
+        .function_call_output_text("yielded-exec-during-poll")
+        .context("missing write_stdin output after compact successor wake")?;
+    assert!(
+        poll_output.contains("Process exited with code 0"),
+        "write_stdin should return the terminal result: {poll_output}"
+    );
+    assert!(
+        poll_output.ends_with("yielded-exec-during-compaction-complete"),
+        "write_stdin should return retained output: {poll_output}"
+    );
+
+    test.codex.shutdown_and_wait().await?;
+    assert_eq!(5, streaming_server.requests().await.len());
+    streaming_server.shutdown().await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_session_once()
 -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -274,7 +515,8 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
     const DURING_COMPACTION_GATE: &str = "monitor-compaction-during.ready";
     const BATCH_READY_PREFIX: &str = "monitor-compaction-batch-";
     const BATCH_ACK_PREFIX: &str = "monitor-compaction-batch-ack-";
-    const PRE_COMPACTION_NOTIFICATION_COUNT: usize = 20;
+    const PRE_COMPACTION_NOTIFICATION_COUNT: usize =
+        codex_core::test_support::MONITOR_NOTIFICATION_WINDOW_LIMIT;
     const LINES_PER_NOTIFICATION: usize = 40;
 
     let monitor_command = match test_target_os() {
@@ -379,8 +621,6 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
     let test = builder
         .build_with_streaming_server(&streaming_server)
         .await?;
-    let (_monitor_admission_guard, monitor_admitted) =
-        codex_core::test_support::install_monitor_draft_admission_hook();
     let start_gate = test
         .executor_environment()
         .selection()
@@ -427,8 +667,6 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
         .remove(0)
         .await
         .with_context(|| "monitor follow-up response stage did not complete")?;
-    let monitor_draft_admitted = monitor_admitted.notified();
-    tokio::pin!(monitor_draft_admitted);
     test.fs()
         .write_file(&start_gate, b"ready".to_vec(), /*sandbox*/ None)
         .await?;
@@ -544,6 +782,15 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
     }
 
     test.codex.submit(Op::Compact).await?;
+    let compact_turn_id = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::TurnStarted(event) => Some(event.turn_id.clone()),
+        _ => None,
+    })
+    .await;
+    let (_monitor_admission_guard, monitor_admitted) =
+        codex_core::test_support::install_background_input_admission_hook(compact_turn_id);
+    let monitor_draft_admitted = monitor_admitted.notified();
+    tokio::pin!(monitor_draft_admitted);
     timeout(
         Duration::from_secs(10),
         streaming_server.wait_for_request_count(3 + PRE_COMPACTION_NOTIFICATION_COUNT),
