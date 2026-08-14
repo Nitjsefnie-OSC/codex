@@ -55,10 +55,11 @@ fn developer_input_texts(request: &[u8]) -> Result<Vec<String>> {
         .collect())
 }
 
-fn request_contains_monitor_sequence(request: &[u8], sequence: usize) -> Result<bool> {
+fn monitor_notification_payloads(request: &[u8]) -> Result<Vec<Value>> {
     const OPEN_TAG: &str = "<monitor_notification>";
     const CLOSE_TAG: &str = "</monitor_notification>";
 
+    let mut payloads = Vec::new();
     for text in developer_input_texts(request)? {
         let mut remaining = text.as_str();
         while let Some(open_offset) = remaining.find(OPEN_TAG) {
@@ -69,14 +70,18 @@ fn request_contains_monitor_sequence(request: &[u8], sequence: usize) -> Result<
             let payload_end = payload_start + close_offset;
             let payload: Value = serde_json::from_str(&remaining[payload_start..payload_end])
                 .context("monitor notification payload should be valid JSON")?;
-            if payload.get("seq").and_then(Value::as_u64) == Some(sequence as u64) {
-                return Ok(true);
-            }
+            payloads.push(payload);
             remaining = &remaining[payload_end + CLOSE_TAG.len()..];
         }
     }
 
-    Ok(false)
+    Ok(payloads)
+}
+
+fn request_contains_monitor_sequence(request: &[u8], sequence: usize) -> Result<bool> {
+    Ok(monitor_notification_payloads(request)?
+        .iter()
+        .any(|payload| payload.get("seq").and_then(Value::as_u64) == Some(sequence as u64)))
 }
 
 const COMPLETION_GATE: &str = "yielded-exec-completion.ready";
@@ -485,12 +490,8 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
     );
     for (index, request) in requests[2..].iter().enumerate() {
         let seq = index + 1;
-        let pre_compaction_request = developer_input_texts(request)
+        let monitor_notifications = monitor_notification_payloads(request)
             .with_context(|| format!("failed to decode pre-compaction batch {seq} request"))?;
-        let monitor_notifications = pre_compaction_request
-            .iter()
-            .filter(|text| text.contains("<monitor_notification>"))
-            .collect::<Vec<_>>();
         assert_eq!(
             1,
             monitor_notifications.len(),
@@ -501,10 +502,15 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
                 .with_context(|| format!("failed to parse pre-compaction batch {seq} request"))?,
             "pre-compaction request should contain monitor notification sequence {seq}"
         );
-        assert!(
-            !pre_compaction_request
-                .iter()
-                .any(|text| text.contains("monitor-after"))
+        let expected_lines = Value::Array(
+            (0..LINES_PER_NOTIFICATION)
+                .map(|index| Value::String(format!("monitor-before-{seq}-{index}")))
+                .collect(),
+        );
+        assert_eq!(
+            Some(&expected_lines),
+            monitor_notifications[0].get("lines"),
+            "pre-compaction batch {seq} should contain the expected monitor lines"
         );
     }
 
@@ -537,31 +543,41 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
     .with_context(|| "timed out waiting for the post-compaction monitor request")?;
     let requests = streaming_server.requests().await;
     assert_eq!(4 + PRE_COMPACTION_NOTIFICATION_COUNT, requests.len());
-    let decoded_requests = requests
+    let decoded_payloads = requests
         .iter()
-        .map(|request| developer_input_texts(request))
+        .map(|request| monitor_notification_payloads(request))
         .collect::<Result<Vec<_>>>()
         .context("failed to decode post-compaction request bodies")?;
+    let expected_after_lines = Value::Array(
+        (0..LINES_PER_NOTIFICATION)
+            .map(|index| Value::String(format!("monitor-after-{index}")))
+            .collect(),
+    );
     let post_compaction_requests = requests
         .iter()
-        .zip(&decoded_requests)
-        .filter(|(_, request)| request.iter().any(|text| text.contains("monitor-after")))
+        .zip(&decoded_payloads)
+        .filter(|(_, payloads)| {
+            payloads
+                .iter()
+                .any(|payload| payload.get("lines") == Some(&expected_after_lines))
+        })
         .collect::<Vec<_>>();
     assert_eq!(
         1,
         post_compaction_requests.len(),
         "the post-compaction monitor batch should wake exactly one successor"
     );
-    let (post_compaction_request, post_compaction_request_texts) = post_compaction_requests[0];
-    let monitor_notifications = post_compaction_request_texts
-        .iter()
-        .filter(|text| text.contains("<monitor_notification>"))
-        .collect::<Vec<_>>();
-    assert_eq!(1, monitor_notifications.len());
+    let (post_compaction_request, post_compaction_payloads) = post_compaction_requests[0];
+    assert_eq!(1, post_compaction_payloads.len());
     assert!(
         request_contains_monitor_sequence(post_compaction_request, 21)
             .context("failed to parse post-compaction monitor request")?,
         "post-compaction request should contain monitor notification sequence 21"
+    );
+    assert_eq!(
+        Some(&expected_after_lines),
+        post_compaction_payloads[0].get("lines"),
+        "post-compaction monitor notification should contain the expected lines"
     );
 
     wait_for_event(&test.codex, |event| {
