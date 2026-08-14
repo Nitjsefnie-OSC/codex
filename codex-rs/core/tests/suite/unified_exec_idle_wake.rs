@@ -26,7 +26,6 @@ use core_test_support::test_target_os;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use serde_json::json;
-use tokio::sync::oneshot;
 use tokio::time::timeout;
 
 fn yielded_session_id(output: &str) -> Result<i32> {
@@ -51,7 +50,9 @@ async fn yielded_exec_completion_after_compaction_wakes_idle_session_once_and_re
             .features
             .enable(Feature::UnifiedExec)
             .expect("test config should allow feature update");
-        let _ = config.features.disable(Feature::RemoteCompactionV2);
+        // A non-OpenAI provider advertises Unsupported remote compaction, so this
+        // test exercises the local compaction path rather than legacy remote compaction.
+        config.model_provider.name = "Non-OpenAI Model provider".to_string();
         config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());
     });
     let test = builder.build_with_auto_env(&server).await?;
@@ -210,19 +211,21 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
 
     const BEFORE_COMPACTION_GATE: &str = "monitor-compaction-before.ready";
     const AFTER_COMPACTION_GATE: &str = "monitor-compaction-after.ready";
+    const BATCH_READY_PREFIX: &str = "monitor-compaction-batch-";
+    const BATCH_ACK_PREFIX: &str = "monitor-compaction-batch-ack-";
     const PRE_COMPACTION_NOTIFICATION_COUNT: usize = 20;
     const LINES_PER_NOTIFICATION: usize = 40;
 
     let monitor_command = match test_target_os() {
         TestTargetOs::Linux | TestTargetOs::MacOs => {
             let command = format!(
-                "i=1; while [ \"$i\" -le {PRE_COMPACTION_NOTIFICATION_COUNT} ]; do j=0; while [ \"$j\" -lt {LINES_PER_NOTIFICATION} ]; do printf 'monitor-before-%s-%s\\n' \"$i\" \"$j\"; j=$((j + 1)); done; sleep 0.75; i=$((i + 1)); done; sleep 0.5; touch {BEFORE_COMPACTION_GATE}; while [ ! -f {AFTER_COMPACTION_GATE} ]; do sleep 0.05; done; j=0; while [ \"$j\" -lt {LINES_PER_NOTIFICATION} ]; do printf 'monitor-after-%s\\n' \"$j\"; j=$((j + 1)); done; sleep 30"
+                "i=1; while [ \"$i\" -le {PRE_COMPACTION_NOTIFICATION_COUNT} ]; do j=0; while [ \"$j\" -lt {LINES_PER_NOTIFICATION} ]; do printf 'monitor-before-%s-%s\\n' \"$i\" \"$j\"; j=$((j + 1)); done; touch {BATCH_READY_PREFIX}$i.ready; while [ ! -f {BATCH_ACK_PREFIX}$i ]; do sleep 0.05; done; i=$((i + 1)); done; touch {BEFORE_COMPACTION_GATE}; while [ ! -f {AFTER_COMPACTION_GATE} ]; do sleep 0.05; done; j=0; while [ \"$j\" -lt {LINES_PER_NOTIFICATION} ]; do printf 'monitor-after-%s\\n' \"$j\"; j=$((j + 1)); done; sleep 30"
             );
             vec!["bash".to_string(), "-c".to_string(), command]
         }
         TestTargetOs::Windows => {
             let command = format!(
-                "$i=1; while ($i -le {PRE_COMPACTION_NOTIFICATION_COUNT}) {{ for ($j=0; $j -lt {LINES_PER_NOTIFICATION}; $j++) {{ [Console]::Out.WriteLine(\"monitor-before-$i-$j\") }}; Start-Sleep -Milliseconds 750; $i++ }}; Start-Sleep -Milliseconds 500; New-Item -ItemType File -Force -Path '{BEFORE_COMPACTION_GATE}' | Out-Null; while (-not (Test-Path -LiteralPath '{AFTER_COMPACTION_GATE}')) {{ Start-Sleep -Milliseconds 50 }}; for ($j=0; $j -lt {LINES_PER_NOTIFICATION}; $j++) {{ [Console]::Out.WriteLine(\"monitor-after-$j\") }}; Start-Sleep -Seconds 30"
+                "$i=1; while ($i -le {PRE_COMPACTION_NOTIFICATION_COUNT}) {{ for ($j=0; $j -lt {LINES_PER_NOTIFICATION}; $j++) {{ [Console]::Out.WriteLine(\"monitor-before-$i-$j\") }}; New-Item -ItemType File -Force -Path \"{BATCH_READY_PREFIX}$i.ready\" | Out-Null; while (-not (Test-Path -LiteralPath \"{BATCH_ACK_PREFIX}$i\")) {{ Start-Sleep -Milliseconds 50 }}; $i++ }}; New-Item -ItemType File -Force -Path '{BEFORE_COMPACTION_GATE}' | Out-Null; while (-not (Test-Path -LiteralPath '{AFTER_COMPACTION_GATE}')) {{ Start-Sleep -Milliseconds 50 }}; for ($j=0; $j -lt {LINES_PER_NOTIFICATION}; $j++) {{ [Console]::Out.WriteLine(\"monitor-after-$j\") }}; Start-Sleep -Seconds 30"
             );
             vec![
                 "powershell".to_string(),
@@ -237,8 +240,7 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
         "kind": "watcher",
     }))?;
 
-    let (release_followup_tx, release_followup_rx) = oneshot::channel();
-    let (streaming_server, _completions) = start_streaming_sse_server(vec![
+    let mut response_streams = vec![
         vec![StreamingSseChunk {
             gate: None,
             body: sse(vec![
@@ -247,30 +249,29 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
                 ev_completed("monitor-compaction-start"),
             ]),
         }],
-        vec![
-            StreamingSseChunk {
-                gate: None,
-                body: sse(vec![ev_response_created("monitor-compaction-followup")]),
-            },
-            StreamingSseChunk {
-                gate: Some(release_followup_rx),
-                body: sse(vec![
-                    ev_assistant_message("monitor-compaction-followup-message", "monitor started"),
-                    ev_completed("monitor-compaction-followup"),
-                ]),
-            },
-        ],
         vec![StreamingSseChunk {
             gate: None,
             body: sse(vec![
-                ev_response_created("monitor-compaction-before-response"),
-                ev_assistant_message(
-                    "monitor-compaction-before-message",
-                    "received all pre-compaction monitor notifications",
-                ),
-                ev_completed("monitor-compaction-before-response"),
+                ev_response_created("monitor-compaction-followup"),
+                ev_assistant_message("monitor-compaction-followup-message", "monitor started"),
+                ev_completed("monitor-compaction-followup"),
             ]),
         }],
+    ];
+    for seq in 1..=PRE_COMPACTION_NOTIFICATION_COUNT {
+        response_streams.push(vec![StreamingSseChunk {
+            gate: None,
+            body: sse(vec![
+                ev_response_created(&format!("monitor-compaction-before-response-{seq}")),
+                ev_assistant_message(
+                    &format!("monitor-compaction-before-message-{seq}"),
+                    "received one pre-compaction monitor notification",
+                ),
+                ev_completed(&format!("monitor-compaction-before-response-{seq}")),
+            ]),
+        }]);
+    }
+    response_streams.extend([
         vec![StreamingSseChunk {
             gate: None,
             body: sse(vec![
@@ -293,15 +294,16 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
                 ev_completed("monitor-compaction-after-response"),
             ]),
         }],
-    ])
-    .await;
+    ]);
+    let (streaming_server, mut completion_receivers) =
+        start_streaming_sse_server(response_streams).await;
 
     let mut builder = test_codex().with_model("gpt-5.4").with_config(|config| {
         config
             .features
             .enable(Feature::UnifiedExec)
             .expect("test config should allow feature update");
-        let _ = config.features.disable(Feature::RemoteCompactionV2);
+        config.model_provider.name = "Non-OpenAI Model provider".to_string();
         config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());
         config.model_provider.supports_websockets = false;
     });
@@ -318,6 +320,22 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
         .selection()
         .cwd
         .join(AFTER_COMPACTION_GATE)?;
+    let batch_ready_gates = (1..=PRE_COMPACTION_NOTIFICATION_COUNT)
+        .map(|seq| {
+            test.executor_environment()
+                .selection()
+                .cwd
+                .join(format!("{BATCH_READY_PREFIX}{seq}.ready"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let batch_ack_gates = (1..=PRE_COMPACTION_NOTIFICATION_COUNT)
+        .map(|seq| {
+            test.executor_environment()
+                .selection()
+                .cwd
+                .join(format!("{BATCH_ACK_PREFIX}{seq}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     test.codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
@@ -325,6 +343,61 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
             text_elements: Vec::new(),
         }]))
         .await?;
+    completion_receivers
+        .remove(0)
+        .await
+        .context("initial monitor response did not complete")?;
+    completion_receivers
+        .remove(0)
+        .await
+        .context("monitor follow-up response did not complete")?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    for (index, (ready_gate, ack_gate)) in
+        batch_ready_gates.iter().zip(&batch_ack_gates).enumerate()
+    {
+        let seq = index + 1;
+        timeout(Duration::from_secs(30), async {
+            loop {
+                if test
+                    .fs()
+                    .read_file(ready_gate, /*sandbox*/ None)
+                    .await
+                    .is_ok()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await?;
+        timeout(Duration::from_secs(30), async {
+            loop {
+                let requests = streaming_server.requests().await;
+                if requests.iter().any(|request| {
+                    String::from_utf8_lossy(request).contains(&format!(r#""seq":{seq}"#))
+                }) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await?;
+        completion_receivers
+            .remove(0)
+            .await
+            .with_context(|| format!("monitor batch {seq} response did not complete"))?;
+        wait_for_event(&test.codex, |event| {
+            matches!(event, EventMsg::TurnComplete(_))
+        })
+        .await;
+        test.fs()
+            .write_file(ack_gate, b"ready".to_vec(), /*sandbox*/ None)
+            .await?;
+    }
 
     timeout(Duration::from_secs(30), async {
         loop {
@@ -341,35 +414,34 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
     })
     .await?;
 
-    release_followup_tx
-        .send(())
-        .map_err(|_| anyhow::anyhow!("monitor follow-up response gate closed unexpectedly"))?;
     timeout(
         Duration::from_secs(10),
-        streaming_server.wait_for_request_count(3),
+        streaming_server.wait_for_request_count(2 + PRE_COMPACTION_NOTIFICATION_COUNT),
     )
     .await?;
     let requests = streaming_server.requests().await;
-    let pre_compaction_request = String::from_utf8_lossy(&requests[2]);
     assert_eq!(
-        PRE_COMPACTION_NOTIFICATION_COUNT,
-        pre_compaction_request
-            .matches("<monitor_notification>")
-            .count(),
-        "the live monitor should exhaust its twenty nonterminal notification slots"
+        2 + PRE_COMPACTION_NOTIFICATION_COUNT,
+        requests.len(),
+        "each pre-compaction batch should wake one successor request"
     );
-    for seq in 1..=PRE_COMPACTION_NOTIFICATION_COUNT {
+    for (index, request) in requests[2..].iter().enumerate() {
+        let seq = index + 1;
+        let pre_compaction_request = String::from_utf8_lossy(request);
+        assert_eq!(
+            1,
+            pre_compaction_request
+                .matches("<monitor_notification>")
+                .count(),
+            "pre-compaction batch {seq} should not be coalesced with another notification"
+        );
         assert!(
             pre_compaction_request.contains(&format!(r#""seq":{seq}"#)),
             "pre-compaction request should contain monitor notification sequence {seq}"
         );
+        assert!(!pre_compaction_request.contains("monitor-after"));
     }
-    assert!(!pre_compaction_request.contains("monitor-after"));
 
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
-    .await;
     test.codex.submit(Op::Compact).await?;
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::ContextCompacted(_))
@@ -379,6 +451,10 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
         matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
+    completion_receivers
+        .remove(0)
+        .await
+        .context("compaction response did not complete")?;
 
     test.fs()
         .write_file(
@@ -389,11 +465,11 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
         .await?;
     timeout(
         Duration::from_secs(10),
-        streaming_server.wait_for_request_count(5),
+        streaming_server.wait_for_request_count(3 + PRE_COMPACTION_NOTIFICATION_COUNT),
     )
     .await?;
     let requests = streaming_server.requests().await;
-    assert_eq!(5, requests.len());
+    assert_eq!(3 + PRE_COMPACTION_NOTIFICATION_COUNT, requests.len());
     let post_compaction_requests = requests
         .iter()
         .filter(|request| String::from_utf8_lossy(request).contains("monitor-after"))
@@ -416,8 +492,16 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
         matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
+    completion_receivers
+        .remove(0)
+        .await
+        .context("post-compaction response did not complete")?;
+    assert!(completion_receivers.is_empty());
     test.codex.shutdown_and_wait().await?;
-    assert_eq!(5, streaming_server.requests().await.len());
+    assert_eq!(
+        3 + PRE_COMPACTION_NOTIFICATION_COUNT,
+        streaming_server.requests().await.len()
+    );
     streaming_server.shutdown().await;
 
     Ok(())
