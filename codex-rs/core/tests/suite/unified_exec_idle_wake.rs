@@ -322,18 +322,22 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
         .join(AFTER_COMPACTION_GATE)?;
     let batch_ready_gates = (1..=PRE_COMPACTION_NOTIFICATION_COUNT)
         .map(|seq| {
+            let path = format!("{BATCH_READY_PREFIX}{seq}.ready");
             test.executor_environment()
                 .selection()
                 .cwd
-                .join(format!("{BATCH_READY_PREFIX}{seq}.ready"))
+                .join(&path)
+                .map_err(anyhow::Error::from)
         })
         .collect::<Result<Vec<_>>>()?;
     let batch_ack_gates = (1..=PRE_COMPACTION_NOTIFICATION_COUNT)
         .map(|seq| {
+            let path = format!("{BATCH_ACK_PREFIX}{seq}");
             test.executor_environment()
                 .selection()
                 .cwd
-                .join(format!("{BATCH_ACK_PREFIX}{seq}"))
+                .join(&path)
+                .map_err(anyhow::Error::from)
         })
         .collect::<Result<Vec<_>>>()?;
 
