@@ -77,6 +77,9 @@ jobs:
             suite::unified_exec_idle_wake::yielded_exec_completion_after_compaction_wakes_idle_session_once_and_remains_pollable \
             -- --exact --nocapture --test-threads=1
           run_exact cargo test -p codex-core --test all \
+            suite::unified_exec_idle_wake::monitor_notification_window_resets_after_compaction_and_wakes_idle_session_once \
+            -- --exact --nocapture --test-threads=1
+          run_exact cargo test -p codex-core --test all \
             suite::unified_exec_idle_wake::code_mode_nested_yield_survives_outer_turn_completion_and_wakes_idle_session \
             -- --exact --nocapture --test-threads=1
           run_exact cargo test -p codex-core --test all \
