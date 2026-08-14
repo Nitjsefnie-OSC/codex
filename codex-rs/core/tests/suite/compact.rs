@@ -55,6 +55,7 @@ use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_completed_with_tokens;
 use core_test_support::responses::ev_function_call;
+use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_compact_json_once;
 use core_test_support::responses::mount_compact_response_sequence;
 use core_test_support::responses::mount_response_once_match;
@@ -780,7 +781,7 @@ async fn native_agent_completion_during_manual_compact_reaches_regular_successor
     test.codex
         .submit(Op::InterAgentCompletion {
             communication: InterAgentCommunication::new(
-                AgentPath::try_from("/root/worker")?,
+                AgentPath::try_from("/root/worker").map_err(anyhow::Error::msg)?,
                 AgentPath::root(),
                 Vec::new(),
                 "Message Type: FINAL_ANSWER\nTask name: worker\nSender: /root/worker\nPayload:\ncompletion during manual compact".to_string(),
