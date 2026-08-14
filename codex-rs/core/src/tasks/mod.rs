@@ -702,6 +702,9 @@ impl Session {
                 }
                 drop(delivery_guard);
             } else {
+                self.input_queue
+                    .materialize_monitor_drafts_for_turn_state(active_turn.turn_state.as_ref())
+                    .await;
                 drop(delivery_guard);
             }
             if aborted_turn {
@@ -853,6 +856,9 @@ impl Session {
         let Some(turn_state) = turn_state else {
             return;
         };
+        self.input_queue
+            .materialize_monitor_drafts_for_turn_state(turn_state.as_ref())
+            .await;
         drop(background_delivery_guard);
         self.services
             .unified_exec_manager
