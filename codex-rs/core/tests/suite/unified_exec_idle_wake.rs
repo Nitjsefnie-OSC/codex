@@ -2,19 +2,24 @@ use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::Result;
+use codex_core::compact::SUMMARIZATION_PROMPT;
 use codex_features::Feature;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::Op;
 use core_test_support::TestTargetOs;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_custom_tool_call;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
+use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_target_os;
+use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
@@ -30,7 +35,8 @@ fn yielded_session_id(output: &str) -> Result<i32> {
 const COMPLETION_GATE: &str = "yielded-exec-completion.ready";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn yielded_exec_completion_wakes_idle_session_once_and_remains_pollable() -> Result<()> {
+async fn yielded_exec_completion_after_compaction_wakes_idle_session_once_and_remains_pollable()
+-> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -39,6 +45,7 @@ async fn yielded_exec_completion_wakes_idle_session_once_and_remains_pollable() 
             .features
             .enable(Feature::UnifiedExec)
             .expect("test config should allow feature update");
+        config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());
     });
     let test = builder.build_with_auto_env(&server).await?;
     let completion_gate = test
@@ -95,6 +102,25 @@ async fn yielded_exec_completion_wakes_idle_session_once_and_remains_pollable() 
         .function_call_output_text("yielded-exec-call")
         .context("missing yielded exec_command output")?;
     let session_id = yielded_session_id(&initial_output)?;
+
+    mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("yielded-exec-compact"),
+            ev_assistant_message("yielded-exec-compact-summary", "compacted exec context"),
+            ev_completed("yielded-exec-compact"),
+        ]),
+    )
+    .await;
+    test.codex.submit(Op::Compact).await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::ContextCompacted(_))
+    })
+    .await;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
 
     let completion_responses = mount_sse_sequence(
         &server,

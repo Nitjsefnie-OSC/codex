@@ -10084,6 +10084,44 @@ struct NeverEndingTask {
     listen_to_cancellation_token: bool,
 }
 
+#[derive(Clone, Copy)]
+struct HistoryReplacingAbortTask;
+
+impl SessionTask for HistoryReplacingAbortTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Compact
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.history_replacing_abort"
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        session: Arc<Session>,
+        _ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        cancellation_token: CancellationToken,
+    ) -> SessionTaskResult {
+        cancellation_token.cancelled().await;
+        session
+            .replace_history(
+                vec![ResponseItem::Message {
+                    id: None,
+                    role: "assistant".to_string(),
+                    content: vec![ContentItem::OutputText {
+                        text: "history replaced during abort".to_string(),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                }],
+                /*reference_context_item*/ None,
+            )
+            .await;
+        Ok(None)
+    }
+}
+
 impl SessionTask for NeverEndingTask {
     fn kind(&self) -> TaskKind {
         self.kind
@@ -11341,6 +11379,48 @@ async fn compact_task_queues_background_notifications_until_it_finishes() {
         }),
         _ => false,
     }));
+}
+
+#[tokio::test]
+async fn compact_abort_persists_queued_notifications_after_history_replacement() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    sess.spawn_task(Arc::clone(&tc), Vec::new(), HistoryReplacingAbortTask)
+        .await;
+    sess.deliver_monitor_notification(
+        MonitorNotification {
+            process_id: 17,
+            seq: 1,
+            command: "watch".to_string(),
+            kind: "watcher",
+            terminal_state: None,
+            lines: vec!["line before replacement".to_string()],
+            omitted_lines: 0,
+            suppressed_notifications: 0,
+            note: None,
+        },
+        tc.as_ref(),
+    )
+    .await;
+
+    sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+
+    let history = sess.clone_history().await;
+    assert!(history.raw_items().any(|item| match item {
+        ResponseItem::Message { role, content, .. } if role == "assistant" => {
+            content.iter().any(|content| {
+                matches!(content, ContentItem::OutputText { text } if text == "history replaced during abort")
+            })
+        }
+        _ => false,
+    }));
+    assert_eq!(
+        1,
+        history
+            .raw_items()
+            .filter(|item| MonitorNotification::is_response_item(item))
+            .count(),
+        "queued monitor delivery must be persisted after the compaction replacement"
+    );
 }
 
 #[tokio::test]

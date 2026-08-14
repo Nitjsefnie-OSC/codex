@@ -11,6 +11,7 @@ use codex_login::CodexAuth;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::built_in_model_providers;
 use codex_models_manager::bundled_models_response;
+use codex_protocol::AgentPath;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
@@ -23,6 +24,7 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HookEventName;
 use codex_protocol::protocol::HookRunStatus;
+use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ItemStartedEvent;
 use codex_protocol::protocol::Op;
@@ -55,6 +57,7 @@ use core_test_support::responses::ev_completed_with_tokens;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::mount_compact_json_once;
 use core_test_support::responses::mount_compact_response_sequence;
+use core_test_support::responses::mount_response_once_match;
 use core_test_support::responses::mount_response_sequence;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_once_match;
@@ -63,13 +66,17 @@ use core_test_support::responses::sse;
 use core_test_support::responses::sse_failed;
 use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
+use core_test_support::streaming_sse::StreamingSseChunk;
+use core_test_support::streaming_sse::start_streaming_sse_server;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use tempfile::TempDir;
+use tokio::sync::oneshot;
 use wiremock::MockServer;
 // --- Test helpers -----------------------------------------------------------
 
@@ -686,6 +693,127 @@ async fn summarize_context_three_requests_and_instructions() {
         saw_compacted_summary,
         "expected a Compacted entry containing the summarizer output"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_agent_completion_during_manual_compact_reaches_regular_successor() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let (compact_gate_tx, compact_gate_rx) = oneshot::channel();
+    let (compact_stream, _compact_completions) = start_streaming_sse_server(vec![vec![
+        StreamingSseChunk {
+            gate: None,
+            body: sse(vec![ev_response_created("resp-compact")]),
+        },
+        StreamingSseChunk {
+            gate: Some(compact_gate_rx),
+            body: sse(vec![
+                ev_assistant_message("msg-compact", SUMMARY_TEXT),
+                ev_completed("resp-compact"),
+            ]),
+        },
+    ]])
+    .await;
+    mount_response_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            std::str::from_utf8(&req.body)
+                .is_ok_and(|body| body_contains_text(body, SUMMARIZATION_PROMPT))
+        },
+        wiremock::ResponseTemplate::new(307)
+            .insert_header("location", format!("{}/v1/responses", compact_stream.uri())),
+    )
+    .await;
+    let successor_request = mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            let body = std::str::from_utf8(&req.body).unwrap_or("");
+            body.contains(SUMMARY_TEXT)
+        },
+        sse(vec![
+            ev_response_created("resp-successor"),
+            ev_assistant_message("msg-successor", "successor observed completion"),
+            ev_completed("resp-successor"),
+        ]),
+    )
+    .await;
+
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::Collab)
+            .expect("test config should allow feature update");
+        config
+            .features
+            .enable(Feature::MultiAgentV2)
+            .expect("test config should allow feature update");
+        set_test_compact_prompt(config);
+        config.model_provider.request_max_retries = Some(0);
+        config.model_provider.stream_max_retries = Some(0);
+        config.model_provider.supports_websockets = false;
+    });
+    let test = builder.build(&server).await?;
+    test.codex.submit(Op::Compact).await?;
+    let compact_turn_id = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::TurnStarted(event) => Some(event.turn_id.clone()),
+        _ => None,
+    })
+    .await;
+    wait_for_event(&test.codex, |event| {
+        matches!(
+            event,
+            EventMsg::ItemStarted(ItemStartedEvent {
+                item: TurnItem::ContextCompaction(_),
+                ..
+            })
+        )
+    })
+    .await;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        compact_stream.wait_for_request_count(1),
+    )
+    .await
+    .map_err(|_| anyhow!("manual compact request did not reach its gate"))?;
+
+    test.codex
+        .submit(Op::InterAgentCompletion {
+            communication: InterAgentCommunication::new(
+                AgentPath::try_from("/root/worker")?,
+                AgentPath::root(),
+                Vec::new(),
+                "Message Type: FINAL_ANSWER\nTask name: worker\nSender: /root/worker\nPayload:\ncompletion during manual compact".to_string(),
+                /*trigger_turn*/ false,
+            ),
+        })
+        .await?;
+    compact_gate_tx
+        .send(())
+        .map_err(|_| anyhow!("manual compact response gate closed unexpectedly"))?;
+
+    wait_for_event(
+        &test.codex,
+        |event| matches!(event, EventMsg::TurnComplete(event) if event.turn_id == compact_turn_id),
+    )
+    .await;
+    let successor_turn_id = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::TurnStarted(event) => Some(event.turn_id.clone()),
+        _ => None,
+    })
+    .await;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(event) if event.turn_id == successor_turn_id)
+    })
+    .await;
+
+    let request = successor_request.single_request();
+    let input = request.body_json()["input"].to_string();
+    assert_eq!(input.matches("Message Type: FINAL_ANSWER").count(), 1);
+    assert!(input.contains("completion during manual compact"));
+
+    compact_stream.shutdown().await;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

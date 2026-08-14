@@ -1,8 +1,8 @@
 use anyhow::Result;
+use codex_core::TurnInputRequest;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
-use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -26,33 +26,28 @@ use serde_json::Value;
 const REQUESTED_MODEL: &str = "gpt-5.4";
 const SERVER_MODEL: &str = "gpt-5.2";
 
-fn user_turn(test: &TestCodex) -> Op {
+fn user_turn(test: &TestCodex) -> TurnInputRequest {
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(PermissionProfile::Disabled, test.cwd_path());
-    Op::UserInput {
-        items: vec![UserInput::Text {
-            text: "identify the model serving this response".to_string(),
-            text_elements: Vec::new(),
-        }],
-        final_output_json_schema: None,
-        responsesapi_client_metadata: None,
-        additional_context: Default::default(),
-        thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
-            environments: Some(local_selections(test.config.cwd.clone())),
-            approval_policy: Some(AskForApproval::Never),
-            sandbox_policy: Some(sandbox_policy),
-            permission_profile,
-            collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
-                mode: ModeKind::Default,
-                settings: codex_protocol::config_types::Settings {
-                    model: test.session_configured.model.clone(),
-                    reasoning_effort: test.config.model_reasoning_effort.clone(),
-                    developer_instructions: None,
-                },
-            }),
-            ..Default::default()
-        },
-    }
+    TurnInputRequest::user_input(vec![UserInput::Text {
+        text: "identify the model serving this response".to_string(),
+        text_elements: Vec::new(),
+    }])
+    .with_thread_settings(codex_protocol::protocol::ThreadSettingsOverrides {
+        environments: Some(local_selections(test.config.cwd.clone())),
+        approval_policy: Some(AskForApproval::Never),
+        sandbox_policy: Some(sandbox_policy),
+        permission_profile,
+        collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
+            mode: ModeKind::Default,
+            settings: codex_protocol::config_types::Settings {
+                model: test.session_configured.model.clone(),
+                reasoning_effort: test.config.model_reasoning_effort.clone(),
+                developer_instructions: None,
+            },
+        }),
+        ..Default::default()
+    })
 }
 
 fn whoami_response_with_model(
@@ -87,7 +82,7 @@ async fn submit_and_read_call(
     response_mock: &core_test_support::responses::ResponseMock,
     call_id: &str,
 ) -> Result<Value> {
-    test.codex.submit(user_turn(test)).await?;
+    test.codex.start_or_steer_turn(user_turn(test)).await?;
     wait_for_event(&test.codex, |event| {
         matches!(event, codex_protocol::protocol::EventMsg::TurnComplete(_))
     })
