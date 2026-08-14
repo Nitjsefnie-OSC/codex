@@ -56,10 +56,27 @@ fn developer_input_texts(request: &[u8]) -> Result<Vec<String>> {
 }
 
 fn request_contains_monitor_sequence(request: &[u8], sequence: usize) -> Result<bool> {
-    let sequence_marker = format!(r#""seq":{sequence},"#);
-    Ok(developer_input_texts(request)?
-        .into_iter()
-        .any(|text| text.contains("<monitor_notification>") && text.contains(&sequence_marker)))
+    const OPEN_TAG: &str = "<monitor_notification>";
+    const CLOSE_TAG: &str = "</monitor_notification>";
+
+    for text in developer_input_texts(request)? {
+        let mut remaining = text.as_str();
+        while let Some(open_offset) = remaining.find(OPEN_TAG) {
+            let payload_start = open_offset + OPEN_TAG.len();
+            let Some(close_offset) = remaining[payload_start..].find(CLOSE_TAG) else {
+                break;
+            };
+            let payload_end = payload_start + close_offset;
+            let payload: Value = serde_json::from_str(&remaining[payload_start..payload_end])
+                .context("monitor notification payload should be valid JSON")?;
+            if payload.get("seq").and_then(Value::as_u64) == Some(sequence as u64) {
+                return Ok(true);
+            }
+            remaining = &remaining[payload_end + CLOSE_TAG.len()..];
+        }
+    }
+
+    Ok(false)
 }
 
 const COMPLETION_GATE: &str = "yielded-exec-completion.ready";
@@ -480,7 +497,8 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
             "pre-compaction batch {seq} should not be coalesced with another notification"
         );
         assert!(
-            monitor_notifications[0].contains(&format!(r#""seq":{seq},"#)),
+            request_contains_monitor_sequence(request, seq)
+                .with_context(|| format!("failed to parse pre-compaction batch {seq} request"))?,
             "pre-compaction request should contain monitor notification sequence {seq}"
         );
         assert!(
@@ -524,22 +542,27 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
         .map(|request| developer_input_texts(request))
         .collect::<Result<Vec<_>>>()
         .context("failed to decode post-compaction request bodies")?;
-    let post_compaction_requests = decoded_requests
+    let post_compaction_requests = requests
         .iter()
-        .filter(|request| request.iter().any(|text| text.contains("monitor-after")))
+        .zip(&decoded_requests)
+        .filter(|(_, request)| request.iter().any(|text| text.contains("monitor-after")))
         .collect::<Vec<_>>();
     assert_eq!(
         1,
         post_compaction_requests.len(),
         "the post-compaction monitor batch should wake exactly one successor"
     );
-    let post_compaction_request = post_compaction_requests[0];
-    let monitor_notifications = post_compaction_request
+    let (post_compaction_request, post_compaction_request_texts) = post_compaction_requests[0];
+    let monitor_notifications = post_compaction_request_texts
         .iter()
         .filter(|text| text.contains("<monitor_notification>"))
         .collect::<Vec<_>>();
     assert_eq!(1, monitor_notifications.len());
-    assert!(monitor_notifications[0].contains(r#""seq":21,"#));
+    assert!(
+        request_contains_monitor_sequence(post_compaction_request, 21)
+            .context("failed to parse post-compaction monitor request")?,
+        "post-compaction request should contain monitor notification sequence 21"
+    );
 
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
