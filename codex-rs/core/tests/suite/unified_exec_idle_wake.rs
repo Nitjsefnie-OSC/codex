@@ -25,6 +25,7 @@ use core_test_support::test_codex::test_codex;
 use core_test_support::test_target_os;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
+use serde_json::Value;
 use serde_json::json;
 use tokio::time::timeout;
 
@@ -35,6 +36,32 @@ fn yielded_session_id(output: &str) -> Result<i32> {
         .context("exec_command did not return a running session id")?
         .parse()
         .context("exec_command returned an invalid session id")
+}
+
+fn developer_input_texts(request: &[u8]) -> Result<Vec<String>> {
+    let body: Value = serde_json::from_slice(request)
+        .context("streaming Responses request body should be valid JSON")?;
+    Ok(body
+        .get("input")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| {
+            item.get("type").and_then(Value::as_str) == Some("message")
+                && item.get("role").and_then(Value::as_str) == Some("developer")
+        })
+        .filter_map(|item| item.get("content").and_then(Value::as_array).cloned())
+        .flatten()
+        .filter(|span| span.get("type").and_then(Value::as_str) == Some("input_text"))
+        .filter_map(|span| span.get("text").and_then(Value::as_str).map(str::to_owned))
+        .collect())
+}
+
+fn request_contains_monitor_sequence(request: &[u8], sequence: usize) -> Result<bool> {
+    let sequence_marker = format!(r#""seq":{sequence},"#);
+    Ok(developer_input_texts(request)?
+        .into_iter()
+        .any(|text| text.contains("<monitor_notification>") && text.contains(&sequence_marker)))
 }
 
 const COMPLETION_GATE: &str = "yielded-exec-completion.ready";
@@ -209,6 +236,7 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
 -> Result<()> {
     skip_if_no_network!(Ok(()));
 
+    const START_GATE: &str = "monitor-compaction-start.ready";
     const BEFORE_COMPACTION_GATE: &str = "monitor-compaction-before.ready";
     const AFTER_COMPACTION_GATE: &str = "monitor-compaction-after.ready";
     const BATCH_READY_PREFIX: &str = "monitor-compaction-batch-";
@@ -219,13 +247,13 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
     let monitor_command = match test_target_os() {
         TestTargetOs::Linux | TestTargetOs::MacOs => {
             let command = format!(
-                "i=1; while [ \"$i\" -le {PRE_COMPACTION_NOTIFICATION_COUNT} ]; do j=0; while [ \"$j\" -lt {LINES_PER_NOTIFICATION} ]; do printf 'monitor-before-%s-%s\\n' \"$i\" \"$j\"; j=$((j + 1)); done; touch {BATCH_READY_PREFIX}$i.ready; while [ ! -f {BATCH_ACK_PREFIX}$i ]; do sleep 0.05; done; i=$((i + 1)); done; touch {BEFORE_COMPACTION_GATE}; while [ ! -f {AFTER_COMPACTION_GATE} ]; do sleep 0.05; done; j=0; while [ \"$j\" -lt {LINES_PER_NOTIFICATION} ]; do printf 'monitor-after-%s\\n' \"$j\"; j=$((j + 1)); done; sleep 30"
+                "while [ ! -f {START_GATE} ]; do sleep 0.05; done; i=1; while [ \"$i\" -le {PRE_COMPACTION_NOTIFICATION_COUNT} ]; do j=0; while [ \"$j\" -lt {LINES_PER_NOTIFICATION} ]; do printf 'monitor-before-%s-%s\\n' \"$i\" \"$j\"; j=$((j + 1)); done; touch {BATCH_READY_PREFIX}$i.ready; while [ ! -f {BATCH_ACK_PREFIX}$i ]; do sleep 0.05; done; i=$((i + 1)); done; touch {BEFORE_COMPACTION_GATE}; while [ ! -f {AFTER_COMPACTION_GATE} ]; do sleep 0.05; done; j=0; while [ \"$j\" -lt {LINES_PER_NOTIFICATION} ]; do printf 'monitor-after-%s\\n' \"$j\"; j=$((j + 1)); done; sleep 30"
             );
             vec!["bash".to_string(), "-c".to_string(), command]
         }
         TestTargetOs::Windows => {
             let command = format!(
-                "$i=1; while ($i -le {PRE_COMPACTION_NOTIFICATION_COUNT}) {{ for ($j=0; $j -lt {LINES_PER_NOTIFICATION}; $j++) {{ [Console]::Out.WriteLine(\"monitor-before-$i-$j\") }}; New-Item -ItemType File -Force -Path \"{BATCH_READY_PREFIX}$i.ready\" | Out-Null; while (-not (Test-Path -LiteralPath \"{BATCH_ACK_PREFIX}$i\")) {{ Start-Sleep -Milliseconds 50 }}; $i++ }}; New-Item -ItemType File -Force -Path '{BEFORE_COMPACTION_GATE}' | Out-Null; while (-not (Test-Path -LiteralPath '{AFTER_COMPACTION_GATE}')) {{ Start-Sleep -Milliseconds 50 }}; for ($j=0; $j -lt {LINES_PER_NOTIFICATION}; $j++) {{ [Console]::Out.WriteLine(\"monitor-after-$j\") }}; Start-Sleep -Seconds 30"
+                "while (-not (Test-Path -LiteralPath '{START_GATE}')) {{ Start-Sleep -Milliseconds 50 }}; $i=1; while ($i -le {PRE_COMPACTION_NOTIFICATION_COUNT}) {{ for ($j=0; $j -lt {LINES_PER_NOTIFICATION}; $j++) {{ [Console]::Out.WriteLine(\"monitor-before-$i-$j\") }}; New-Item -ItemType File -Force -Path \"{BATCH_READY_PREFIX}$i.ready\" | Out-Null; while (-not (Test-Path -LiteralPath \"{BATCH_ACK_PREFIX}$i\")) {{ Start-Sleep -Milliseconds 50 }}; $i++ }}; New-Item -ItemType File -Force -Path '{BEFORE_COMPACTION_GATE}' | Out-Null; while (-not (Test-Path -LiteralPath '{AFTER_COMPACTION_GATE}')) {{ Start-Sleep -Milliseconds 50 }}; for ($j=0; $j -lt {LINES_PER_NOTIFICATION}; $j++) {{ [Console]::Out.WriteLine(\"monitor-after-$j\") }}; Start-Sleep -Seconds 30"
             );
             vec![
                 "powershell".to_string(),
@@ -310,6 +338,11 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
     let test = builder
         .build_with_streaming_server(&streaming_server)
         .await?;
+    let start_gate = test
+        .executor_environment()
+        .selection()
+        .cwd
+        .join(START_GATE)?;
     let before_compaction_gate = test
         .executor_environment()
         .selection()
@@ -350,15 +383,18 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
     completion_receivers
         .remove(0)
         .await
-        .context("initial monitor response did not complete")?;
+        .with_context(|| "initial monitor response stage did not complete")?;
     completion_receivers
         .remove(0)
         .await
-        .context("monitor follow-up response did not complete")?;
+        .with_context(|| "monitor follow-up response stage did not complete")?;
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
+    test.fs()
+        .write_file(&start_gate, b"ready".to_vec(), /*sandbox*/ None)
+        .await?;
 
     for (index, (ready_gate, ack_gate)) in
         batch_ready_gates.iter().zip(&batch_ack_gates).enumerate()
@@ -377,23 +413,32 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
         })
-        .await?;
+        .await
+        .with_context(|| format!("timed out waiting for monitor batch {seq} ready gate"))?;
         timeout(Duration::from_secs(30), async {
             loop {
                 let requests = streaming_server.requests().await;
-                if requests.iter().any(|request| {
-                    String::from_utf8_lossy(request).contains(&format!(r#""seq":{seq}"#))
-                }) {
-                    return;
+                let has_sequence = requests
+                    .iter()
+                    .map(|request| request_contains_monitor_sequence(request, seq))
+                    .collect::<Result<Vec<_>>>()
+                    .with_context(|| {
+                        format!("failed to inspect monitor batch {seq} request bodies")
+                    })?
+                    .into_iter()
+                    .any(|contains_sequence| contains_sequence);
+                if has_sequence {
+                    return Ok::<_, anyhow::Error>(());
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
         })
-        .await?;
+        .await
+        .with_context(|| format!("timed out waiting for monitor batch {seq} request"))??;
         completion_receivers
             .remove(0)
             .await
-            .with_context(|| format!("monitor batch {seq} response did not complete"))?;
+            .with_context(|| format!("monitor batch {seq} response stage did not complete"))?;
         wait_for_event(&test.codex, |event| {
             matches!(event, EventMsg::TurnComplete(_))
         })
@@ -416,13 +461,15 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
-    .await?;
+    .await
+    .with_context(|| "timed out waiting for all pre-compaction monitor batches")?;
 
     timeout(
         Duration::from_secs(10),
         streaming_server.wait_for_request_count(2 + PRE_COMPACTION_NOTIFICATION_COUNT),
     )
-    .await?;
+    .await
+    .with_context(|| "timed out waiting for pre-compaction monitor requests")?;
     let requests = streaming_server.requests().await;
     assert_eq!(
         2 + PRE_COMPACTION_NOTIFICATION_COUNT,
@@ -431,19 +478,26 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
     );
     for (index, request) in requests[2..].iter().enumerate() {
         let seq = index + 1;
-        let pre_compaction_request = String::from_utf8_lossy(request);
+        let pre_compaction_request = developer_input_texts(request)
+            .with_context(|| format!("failed to decode pre-compaction batch {seq} request"))?;
+        let monitor_notifications = pre_compaction_request
+            .iter()
+            .filter(|text| text.contains("<monitor_notification>"))
+            .collect::<Vec<_>>();
         assert_eq!(
             1,
-            pre_compaction_request
-                .matches("<monitor_notification>")
-                .count(),
+            monitor_notifications.len(),
             "pre-compaction batch {seq} should not be coalesced with another notification"
         );
         assert!(
-            pre_compaction_request.contains(&format!(r#""seq":{seq}"#)),
+            monitor_notifications[0].contains(&format!(r#""seq":{seq},"#)),
             "pre-compaction request should contain monitor notification sequence {seq}"
         );
-        assert!(!pre_compaction_request.contains("monitor-after"));
+        assert!(
+            !pre_compaction_request
+                .iter()
+                .any(|text| text.contains("monitor-after"))
+        );
     }
 
     test.codex.submit(Op::Compact).await?;
@@ -458,7 +512,7 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
     completion_receivers
         .remove(0)
         .await
-        .context("compaction response did not complete")?;
+        .with_context(|| "local compaction response stage did not complete")?;
 
     test.fs()
         .write_file(
@@ -471,26 +525,31 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
         Duration::from_secs(10),
         streaming_server.wait_for_request_count(4 + PRE_COMPACTION_NOTIFICATION_COUNT),
     )
-    .await?;
+    .await
+    .with_context(|| "timed out waiting for the post-compaction monitor request")?;
     let requests = streaming_server.requests().await;
     assert_eq!(4 + PRE_COMPACTION_NOTIFICATION_COUNT, requests.len());
-    let post_compaction_requests = requests
+    let decoded_requests = requests
         .iter()
-        .filter(|request| String::from_utf8_lossy(request).contains("monitor-after"))
+        .map(|request| developer_input_texts(request))
+        .collect::<Result<Vec<_>>>()
+        .context("failed to decode post-compaction request bodies")?;
+    let post_compaction_requests = decoded_requests
+        .iter()
+        .filter(|request| request.iter().any(|text| text.contains("monitor-after")))
         .collect::<Vec<_>>();
     assert_eq!(
         1,
         post_compaction_requests.len(),
         "the post-compaction monitor batch should wake exactly one successor"
     );
-    let post_compaction_request = String::from_utf8_lossy(post_compaction_requests[0]);
-    assert_eq!(
-        1,
-        post_compaction_request
-            .matches("<monitor_notification>")
-            .count()
-    );
-    assert!(post_compaction_request.contains(r#""seq":21"#));
+    let post_compaction_request = post_compaction_requests[0];
+    let monitor_notifications = post_compaction_request
+        .iter()
+        .filter(|text| text.contains("<monitor_notification>"))
+        .collect::<Vec<_>>();
+    assert_eq!(1, monitor_notifications.len());
+    assert!(monitor_notifications[0].contains(r#""seq":21,"#));
 
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
@@ -499,7 +558,7 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
     completion_receivers
         .remove(0)
         .await
-        .context("post-compaction response did not complete")?;
+        .with_context(|| "post-compaction response stage did not complete")?;
     assert!(completion_receivers.is_empty());
     test.codex.shutdown_and_wait().await?;
     assert_eq!(
