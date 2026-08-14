@@ -208,8 +208,8 @@ impl MonitorCounters {
         self.advance(false)
     }
 
-    /// Start a new model-visible notification window after compaction has
-    /// successfully replaced the in-memory history.
+    /// Start a new model-visible notification window while compaction publishes
+    /// its replacement history.
     fn begin_notification_window(&mut self) {
         self.delivered_in_window = 0;
     }

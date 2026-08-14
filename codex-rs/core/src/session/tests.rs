@@ -15,6 +15,7 @@ use crate::environment_selection::ThreadEnvironments;
 use crate::environment_selection::TurnEnvironmentState;
 use crate::function_tool::FunctionCallError;
 use crate::plugins::plugins_manager_for_config;
+use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::session::step_context::StepContext;
 use crate::shell::default_user_shell;
 use crate::shell_snapshot::ShellSnapshot;
@@ -10094,24 +10095,14 @@ struct HistoryReplacingAbortTask;
 struct ForcedAbortTask {
     started: Arc<Notify>,
     dropped: Arc<AtomicBool>,
-    background_wake_seen_before_drop: Arc<AtomicBool>,
 }
 
 struct TaskDropSignal {
-    session: Arc<Session>,
     dropped: Arc<AtomicBool>,
-    background_wake_seen_before_drop: Arc<AtomicBool>,
 }
 
 impl Drop for TaskDropSignal {
     fn drop(&mut self) {
-        // A durable background delivery sets this flag before it notifies an idle
-        // successor. Observing it here makes persistence-before-task-drop fail
-        // at the causal boundary instead of merely comparing both states later.
-        if self.session.input_queue.background_wake_requested() {
-            self.background_wake_seen_before_drop
-                .store(true, Ordering::Release);
-        }
         self.dropped.store(true, Ordering::Release);
     }
 }
@@ -10127,18 +10118,36 @@ impl SessionTask for ForcedAbortTask {
 
     async fn run(
         self: Arc<Self>,
-        session: Arc<Session>,
+        _session: Arc<Session>,
         _ctx: Arc<TurnContext>,
         _input: Vec<TurnInput>,
         _cancellation_token: CancellationToken,
     ) -> SessionTaskResult {
         let _drop_signal = TaskDropSignal {
-            session,
             dropped: Arc::clone(&self.dropped),
-            background_wake_seen_before_drop: Arc::clone(&self.background_wake_seen_before_drop),
         };
         self.started.notify_one();
         std::future::pending().await
+    }
+
+    async fn abort(&self, session: Arc<Session>, _ctx: Arc<TurnContext>) {
+        // This is the first history-recording boundary after the task future
+        // is dropped. If queued background persistence moves before abort
+        // handling, it is overwritten here and the test loses that delivery.
+        session
+            .replace_history(
+                vec![ResponseItem::Message {
+                    id: None,
+                    role: "assistant".to_string(),
+                    content: vec![ContentItem::OutputText {
+                        text: "forced abort history boundary".to_string(),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                }],
+                /*reference_context_item*/ None,
+            )
+            .await;
     }
 }
 
@@ -11423,10 +11432,10 @@ async fn compact_task_queues_background_notifications_until_it_finishes() {
         .as_ref()
         .map(|turn| Arc::clone(&turn.turn_state))
         .expect("active turn state");
-    let (pending_inputs, parent_turn, root_turn) =
-        sess.input_queue.get_pending_input(&sess.active_turn).await;
-    assert_eq!(parent_turn.as_deref(), Some("parent-turn"));
-    assert_eq!(root_turn.as_deref(), Some("root-turn"));
+    let (pending_inputs, pending_provenance) = sess
+        .input_queue
+        .take_pending_input_batch_for_turn_state(turn_state.as_ref())
+        .await;
     assert!(pending_inputs.iter().any(|input| {
         matches!(
             input,
@@ -11434,7 +11443,11 @@ async fn compact_task_queues_background_notifications_until_it_finishes() {
         )
     }));
     sess.input_queue
-        .extend_pending_input_for_turn_state(turn_state.as_ref(), pending_inputs)
+        .extend_pending_input_batch_for_turn_state(
+            turn_state.as_ref(),
+            pending_inputs,
+            pending_provenance,
+        )
         .await;
 
     let history_before_abort = sess.clone_history().await;
@@ -11492,6 +11505,33 @@ async fn compact_task_queues_background_notifications_until_it_finishes() {
         ),
         _ => false,
     }));
+
+    // Mirror the metadata application performed by the successor's sampling
+    // request. The provenance must survive the pending-input batch round trip
+    // and the durable wake persistence boundary.
+    let background_wake_receipt = sess.input_queue.snapshot_background_wake();
+    let successor_context = sess
+        .new_default_turn_with_sub_id("successor-turn".to_string())
+        .await;
+    successor_context
+        .turn_metadata_state
+        .set_attribute_background_parent_turn(true);
+    background_wake_receipt
+        .apply_to_attributed_turn(successor_context.turn_metadata_state.as_ref());
+    let mut successor_metadata = successor_context.turn_metadata_state.to_responses_metadata(
+        "installation".to_string(),
+        "successor-window".to_string(),
+        CodexResponsesRequestKind::Turn,
+    );
+    background_wake_receipt.apply_parent_turn(&mut successor_metadata);
+    assert_eq!(
+        successor_metadata.parent_turn_id.as_deref(),
+        Some("parent-turn")
+    );
+    assert_eq!(
+        successor_metadata.root_turn_id.as_deref(),
+        Some("root-turn")
+    );
 }
 
 #[tokio::test]
@@ -11542,14 +11582,12 @@ async fn forced_compact_abort_drops_task_before_persisting_queued_notifications(
     let started = Arc::new(Notify::new());
     let started_wait = started.notified();
     let dropped = Arc::new(AtomicBool::new(false));
-    let background_wake_seen_before_drop = Arc::new(AtomicBool::new(false));
     sess.spawn_task(
         Arc::clone(&tc),
         Vec::new(),
         ForcedAbortTask {
             started: Arc::clone(&started),
             dropped: Arc::clone(&dropped),
-            background_wake_seen_before_drop: Arc::clone(&background_wake_seen_before_drop),
         },
     )
     .await;
@@ -11581,10 +11619,6 @@ async fn forced_compact_abort_drops_task_before_persisting_queued_notifications(
         "abort_all_tasks should wait for the forced-abort task future to drop"
     );
     assert!(
-        !background_wake_seen_before_drop.load(Ordering::Acquire),
-        "background notification persistence must not become visible before the aborted task drops"
-    );
-    assert!(
         sess.input_queue.background_wake_requested(),
         "queued monitor delivery should request a background wake after task drop"
     );
@@ -11597,6 +11631,18 @@ async fn forced_compact_abort_drops_task_before_persisting_queued_notifications(
             .count(),
         "queued monitor delivery must be persisted after the forced abort"
     );
+    assert!(history.raw_items().any(|item| match item {
+        ResponseItem::Message { role, content, .. } if role == "assistant" => {
+            content.iter().any(|content| {
+                matches!(
+                    content,
+                    ContentItem::OutputText { text }
+                        if text == "forced abort history boundary"
+                )
+            })
+        }
+        _ => false,
+    }));
 }
 
 #[tokio::test]
