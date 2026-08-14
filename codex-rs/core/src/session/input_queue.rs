@@ -296,9 +296,9 @@ impl InputQueue {
         self.activity_tx.send_replace(InputQueueActivity::Mailbox);
     }
 
-    /// Add a background notification to an active regular turn only while that
-    /// turn still accepts same-turn work. The active-turn lock and turn-state
-    /// lock make this decision atomic with task finalization.
+    /// Add a background notification to an active regular turn, or queue it on
+    /// compaction for the regular successor. The active-turn lock and turn-
+    /// state lock make this decision atomic with task finalization.
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "active turn and turn state must be checked and updated atomically"
@@ -314,10 +314,15 @@ impl InputQueue {
         let Some(active_turn) = active.as_mut() else {
             return Err((inputs, provenance));
         };
-        if let Some(task) = active_turn.task.as_ref()
-            && (task.kind != TaskKind::Regular || !task.task.accepts_background_notifications())
-        {
-            return Err((inputs, provenance));
+        if let Some(task) = active_turn.task.as_ref() {
+            let accepts_background_notifications = match task.kind {
+                TaskKind::Regular => task.task.accepts_background_notifications(),
+                TaskKind::Compact => true,
+                TaskKind::Review => false,
+            };
+            if !accepts_background_notifications {
+                return Err((inputs, provenance));
+            }
         }
         let mut turn_state = active_turn.turn_state.lock().await;
         if !turn_state.accepts_mailbox_delivery_for_current_turn() {
@@ -588,7 +593,6 @@ impl InputQueue {
             .accept_mailbox_delivery_for_current_turn();
     }
 
-    #[cfg(test)]
     pub(super) async fn extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
         &self,
         turn_state: &Mutex<TurnState>,

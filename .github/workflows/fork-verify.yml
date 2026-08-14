@@ -155,6 +155,12 @@ jobs:
             session::tests::active_exec_completion_does_not_publish_agent_mailbox_activity \
             -- --exact --nocapture
           run_exact cargo test -p codex-core --lib \
+            session::tests::compact_task_queues_background_notifications_until_it_finishes \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            unified_exec::monitors::tests::compaction_starts_a_new_notification_window_without_resetting_lifetime_stats \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
             session::tests::aborted_active_turn_persists_ordered_mail_and_completion \
             -- --exact --nocapture
           run_exact cargo test -p codex-core --lib \

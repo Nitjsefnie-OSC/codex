@@ -11257,6 +11257,93 @@ async fn active_exec_completion_does_not_publish_agent_mailbox_activity() {
 }
 
 #[tokio::test]
+async fn compact_task_queues_background_notifications_until_it_finishes() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        NeverEndingTask {
+            kind: TaskKind::Compact,
+            listen_to_cancellation_token: true,
+        },
+    )
+    .await;
+
+    sess.deliver_monitor_notification(
+        MonitorNotification {
+            process_id: 17,
+            seq: 1,
+            command: "watch".to_string(),
+            kind: "watcher",
+            terminal_state: None,
+            lines: vec!["line during compaction".to_string()],
+            omitted_lines: 0,
+            suppressed_notifications: 0,
+            note: None,
+        },
+        tc.as_ref(),
+    )
+    .await;
+    sess.deliver_exec_command_completion_notification(
+        ExecCommandCompletionNotification {
+            session_id: 23,
+            command: "build".to_string(),
+            completion: ExecCommandCompletion::Exited { exit_code: 0 },
+            output_may_be_available: true,
+        },
+        tc.as_ref(),
+    )
+    .await;
+    sess.deliver_inter_agent_completion(InterAgentCommunication::new(
+        AgentPath::try_from("/root/worker").expect("worker path should parse"),
+        AgentPath::root(),
+        Vec::new(),
+        "completion during compaction".to_string(),
+        /*trigger_turn*/ false,
+    ))
+    .await;
+
+    let history_before_abort = sess.clone_history().await;
+    assert_eq!(
+        0,
+        history_before_abort
+            .raw_items()
+            .filter(|item| {
+                MonitorNotification::is_response_item(item)
+                    || ExecCommandCompletionNotification::is_response_item(item)
+            })
+            .count(),
+        "compaction must queue background notifications instead of persisting them immediately"
+    );
+    assert!(sess.input_queue.has_pending_input(&sess.active_turn).await);
+    assert!(!sess.input_queue.background_wake_requested());
+
+    sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+
+    let history_after_abort = sess.clone_history().await;
+    assert_eq!(
+        1,
+        history_after_abort
+            .raw_items()
+            .filter(|item| MonitorNotification::is_response_item(item))
+            .count()
+    );
+    assert_eq!(
+        1,
+        history_after_abort
+            .raw_items()
+            .filter(|item| ExecCommandCompletionNotification::is_response_item(item))
+            .count()
+    );
+    assert!(history_after_abort.raw_items().any(|item| match item {
+        ResponseItem::AgentMessage { content, .. } => content.iter().any(|content| {
+            matches!(content, AgentMessageInputContent::InputText { text } if text.contains("completion during compaction"))
+        }),
+        _ => false,
+    }));
+}
+
+#[tokio::test]
 async fn aborted_active_turn_persists_ordered_mail_and_completion() {
     let (sess, tc, _rx) = make_session_and_context_with_rx().await;
     let worker = AgentPath::try_from("/root/worker").expect("worker path should parse");

@@ -587,6 +587,12 @@ impl UnifiedExecProcessManager {
         self.shutdown_started.store(true, Ordering::Release);
     }
 
+    /// Reset each monitor's model-visible notification budget after compaction
+    /// has installed a new in-memory history window.
+    pub(crate) async fn begin_notification_window(&self) {
+        self.monitor_store.lock().await.begin_notification_window();
+    }
+
     pub(crate) async fn allocate_process_id(&self) -> i32 {
         loop {
             let mut store = self.process_store.lock().await;
