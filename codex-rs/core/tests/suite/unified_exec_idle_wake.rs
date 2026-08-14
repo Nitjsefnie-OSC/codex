@@ -480,6 +480,7 @@ async fn yielded_exec_completion_during_compaction_wakes_successor_once() -> Res
     let successor_requests = &requests[3..];
     let completion_notifications = successor_requests
         .iter()
+        .map(Vec::as_slice)
         .map(developer_input_texts)
         .collect::<Result<Vec<_>>>()?
         .into_iter()
