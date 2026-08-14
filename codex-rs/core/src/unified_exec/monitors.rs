@@ -32,9 +32,10 @@ use super::process::UnifiedExecProcess;
 /// evicted first so a long session cannot accumulate transcripts without bound.
 pub(crate) const MAX_RETAINED_MONITORS: usize = 64;
 
-/// Non-terminal notifications a single monitor may deliver to the model. Past
-/// this, batches are counted and dropped; the retained output still has them,
-/// and the terminal notification reports how many were suppressed.
+/// Non-terminal notifications a single monitor may deliver to the model per
+/// context window. Past this, batches are counted and dropped; the retained
+/// output still has them, and the terminal notification reports how many were
+/// suppressed.
 pub(crate) const MAX_MONITOR_NOTIFICATIONS: u64 = 20;
 
 /// Complete lines carried by one notification. A firehose batch is truncated to

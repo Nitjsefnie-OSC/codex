@@ -63,7 +63,6 @@ pub(crate) fn set_deterministic_process_ids_for_tests(enabled: bool) {
 }
 
 pub(crate) use errors::UnifiedExecError;
-#[cfg(test)]
 pub(crate) use monitors::MAX_MONITOR_NOTIFICATIONS;
 pub use monitors::MonitorAcknowledgement;
 pub(crate) use monitors::MonitorAttachment;

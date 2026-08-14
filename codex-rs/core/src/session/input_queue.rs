@@ -1,4 +1,5 @@
 use crate::context::ContextualUserFragment;
+use crate::context::ExecCommandCompletionNotification;
 use crate::context::SubagentNotification;
 use crate::context::is_background_notification;
 use crate::state::ActiveTurn;
@@ -401,10 +402,18 @@ impl InputQueue {
             provenance
                 .mark_root_ambiguity_for_existing(task.turn_context.turn_metadata_state.as_ref());
         }
-        let has_monitor_draft = defer_monitor_drafts
-            && inputs
-                .iter()
-                .any(|input| matches!(input, PendingInput::MonitorNotification(_)));
+        let compact_turn_id = active_turn.task.as_ref().and_then(|task| {
+            matches!(task.kind, TaskKind::Compact).then_some(task.turn_context.sub_id.as_str())
+        });
+        let has_compact_background_input = compact_turn_id.is_some()
+            && inputs.iter().any(|input| {
+                matches!(input, PendingInput::MonitorNotification(_))
+                    || matches!(
+                        input,
+                        PendingInput::Turn(TurnInput::ResponseItem(item))
+                            if ExecCommandCompletionNotification::is_response_item(&item.item)
+                    )
+            });
         let inputs = if defer_monitor_drafts {
             inputs
         } else {
@@ -416,8 +425,8 @@ impl InputQueue {
         };
         let has_inputs = !inputs.is_empty();
         turn_state.pending_input.extend_pending(inputs, provenance);
-        if has_monitor_draft {
-            crate::test_support::notify_monitor_draft_admission();
+        if has_compact_background_input && let Some(compact_turn_id) = compact_turn_id {
+            crate::test_support::notify_background_input_admission(compact_turn_id);
         }
         if has_inputs && let Some(activity) = activity {
             self.activity_tx.send_replace(activity);
