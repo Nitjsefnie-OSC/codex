@@ -10274,7 +10274,17 @@ impl SessionTask for BlockingStartTask {
         input: Vec<TurnInput>,
         cancellation_token: CancellationToken,
     ) -> SessionTaskResult {
-        assert_eq!(input.len(), 1, "the pending start input must be preserved");
+        assert_eq!(
+            input,
+            vec![TurnInput::UserInput {
+                content: vec![UserInput::Text {
+                    text: "preserve this start".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                client_id: None,
+            }],
+            "the pending start input must be preserved exactly",
+        );
         self.run_count.fetch_add(1, Ordering::AcqRel);
         self.started.notify_one();
         cancellation_token.cancelled().await;
