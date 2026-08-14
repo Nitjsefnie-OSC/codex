@@ -11821,7 +11821,10 @@ async fn compact_task_queues_background_notifications_until_it_finishes() {
             .count(),
         "compaction must queue background notifications instead of persisting them immediately"
     );
-    assert!(sess.input_queue.has_pending_input(&sess.active_turn).await);
+    assert!(
+        !sess.input_queue.has_pending_input(&sess.active_turn).await,
+        "successor-only background input must not be actionable while compaction is active"
+    );
     assert!(!sess.input_queue.background_wake_requested());
 
     sess.abort_all_tasks(TurnAbortReason::Replaced).await;
