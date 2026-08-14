@@ -379,12 +379,12 @@ impl InputQueue {
         let Some(active_turn) = active.as_mut() else {
             return Err((inputs, provenance));
         };
-        let mut compact = false;
+        let mut defer_monitor_drafts = active_turn.aborting;
         if let Some(task) = active_turn.task.as_ref() {
             let accepts_background_notifications = match task.kind {
                 TaskKind::Regular => task.task.accepts_background_notifications(),
                 TaskKind::Compact => {
-                    compact = true;
+                    defer_monitor_drafts = true;
                     true
                 }
                 TaskKind::Review => false,
@@ -394,18 +394,18 @@ impl InputQueue {
             }
         }
         let mut turn_state = active_turn.turn_state.lock().await;
-        if !turn_state.accepts_mailbox_delivery_for_current_turn() {
+        if !active_turn.aborting && !turn_state.accepts_mailbox_delivery_for_current_turn() {
             return Err((inputs, provenance));
         }
         if let Some(task) = active_turn.task.as_ref() {
             provenance
                 .mark_root_ambiguity_for_existing(task.turn_context.turn_metadata_state.as_ref());
         }
-        let has_monitor_draft = compact
+        let has_monitor_draft = defer_monitor_drafts
             && inputs
                 .iter()
                 .any(|input| matches!(input, PendingInput::MonitorNotification(_)));
-        let inputs = if compact {
+        let inputs = if defer_monitor_drafts {
             inputs
         } else {
             inputs
@@ -857,18 +857,19 @@ impl InputQueue {
             let mut active = active_turn.lock().await;
             match active.as_mut() {
                 Some(active_turn) => {
-                    let compact = active_turn
-                        .task
-                        .as_ref()
-                        .is_some_and(|task| task.kind == TaskKind::Compact);
+                    let defer_monitor_drafts = active_turn.aborting
+                        || active_turn
+                            .task
+                            .as_ref()
+                            .is_some_and(|task| task.kind == TaskKind::Compact);
                     let active_turn_metadata = active_turn
                         .task
                         .as_ref()
                         .map(|task| Arc::clone(&task.turn_context.turn_metadata_state));
                     let mut turn_state = active_turn.turn_state.lock().await;
-                    let accepts_mailbox_delivery =
-                        !compact && turn_state.accepts_mailbox_delivery_for_current_turn();
-                    if !compact {
+                    let accepts_mailbox_delivery = !defer_monitor_drafts
+                        && turn_state.accepts_mailbox_delivery_for_current_turn();
+                    if !defer_monitor_drafts {
                         turn_state.pending_input.materialize_monitor_drafts();
                     }
                     let (pending_input, provenance) = if accepts_mailbox_delivery
@@ -984,17 +985,19 @@ impl InputQueue {
             let active = active_turn.lock().await;
             match active.as_ref() {
                 Some(active_turn) => {
-                    let compact = active_turn
-                        .task
-                        .as_ref()
-                        .is_some_and(|task| task.kind == TaskKind::Compact);
+                    let defer_monitor_drafts = active_turn.aborting
+                        || active_turn
+                            .task
+                            .as_ref()
+                            .is_some_and(|task| task.kind == TaskKind::Compact);
                     let mut turn_state = active_turn.turn_state.lock().await;
-                    if !compact {
+                    if !defer_monitor_drafts {
                         turn_state.pending_input.materialize_monitor_drafts();
                     }
                     (
                         !turn_state.pending_input.items.is_empty(),
-                        turn_state.accepts_mailbox_delivery_for_current_turn(),
+                        !defer_monitor_drafts
+                            && turn_state.accepts_mailbox_delivery_for_current_turn(),
                     )
                 }
                 None => (false, true),

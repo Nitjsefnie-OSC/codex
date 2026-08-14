@@ -34,6 +34,9 @@ pub(crate) struct ActiveTurn {
     pub(crate) task: Option<RunningTask>,
     pub(crate) turn_state: Arc<Mutex<TurnState>>,
     pub(crate) finishing: Option<FinishingTurn>,
+    /// Keeps background delivery deferred while an aborted task is being
+    /// cancelled and its cleanup is persisted.
+    pub(crate) aborting: bool,
 }
 
 #[derive(Clone)]
@@ -69,6 +72,7 @@ impl Default for ActiveTurn {
             task: None,
             turn_state: Arc::new(Mutex::new(TurnState::default())),
             finishing: None,
+            aborting: false,
         }
     }
 }

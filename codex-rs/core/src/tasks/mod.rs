@@ -630,38 +630,98 @@ impl Session {
         .await;
     }
 
-    pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {
+    async fn abort_active_task_in_transaction(
+        self: &Arc<Self>,
+        reason: TurnAbortReason,
+        turn_id: Option<&str>,
+    ) -> Option<Arc<TurnContext>> {
         let delivery_guard = self
             .input_queue
             .lock_background_notification_delivery()
             .await;
-        let mut aborted_turn = false;
-        let mut publish_background_wake = false;
-        let mut active_turn_to_clear = None;
-        let mut turn_context = None;
-        if let Some(mut active_turn) = self.take_active_turn(&reason).await {
-            let task = active_turn.task.take();
-            aborted_turn = task.is_some();
-            turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
-            if let Some(task) = task {
-                let task_turn_context = Arc::clone(&task.turn_context);
-                let (items, parent_turn) = self
-                    .input_queue
-                    .take_pending_background_inputs_for_turn_state(active_turn.turn_state.as_ref())
-                    .await;
-                self.handle_task_abort(task, reason.clone()).await;
-                self.persist_background_input_batch(
-                    task_turn_context,
-                    items,
-                    parent_turn,
-                    delivery_guard,
-                )
+        let detached = {
+            let mut active = self.active_turn.lock().await;
+            let active_turn = active.as_mut()?;
+            let task = active_turn.task.as_ref()?;
+            if turn_id.is_some_and(|turn_id| task.turn_context.sub_id != turn_id) {
+                return None;
+            }
+            if matches!(
+                reason,
+                TurnAbortReason::Interrupted | TurnAbortReason::BudgetLimited
+            ) {
+                self.mark_interrupted();
+            }
+            let task = active_turn.task.take().expect("active task was checked");
+            active_turn.aborting = true;
+            (task, Arc::clone(&active_turn.turn_state))
+        };
+        drop(delivery_guard);
+
+        let (task, turn_state) = detached;
+        let turn_context = self.cancel_task_for_abort(task, reason.clone()).await;
+
+        let delivery_guard = self
+            .input_queue
+            .lock_background_notification_delivery()
+            .await;
+        let (pending_input, pending_parent_turn) = self
+            .input_queue
+            .take_pending_background_inputs_for_turn_state(turn_state.as_ref())
+            .await;
+        let persisted = self
+            .persist_background_input_batch_without_wake(
+                Arc::clone(&turn_context),
+                pending_input,
+                pending_parent_turn,
+                &delivery_guard,
+            )
+            .await;
+        self.emit_aborted_turn(&turn_context, reason).await;
+
+        let active_turn = {
+            let mut active = self.active_turn.lock().await;
+            if active.as_ref().is_some_and(|active_turn| {
+                active_turn.aborting && Arc::ptr_eq(&active_turn.turn_state, &turn_state)
+            }) {
+                active.take()
+            } else {
+                None
+            }
+        };
+        if let Some(active_turn) = active_turn {
+            self.input_queue.clear_pending(&active_turn).await;
+        }
+        drop(delivery_guard);
+        persisted.publish(&self.input_queue);
+        Some(turn_context)
+    }
+
+    pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {
+        if let Some(turn_context) = self
+            .abort_active_task_in_transaction(reason.clone(), None)
+            .await
+        {
+            self.services
+                .unified_exec_manager
+                .discard_unrecorded_initial_exec_command_outputs()
                 .await;
-                self.services
-                    .unified_exec_manager
-                    .discard_unrecorded_initial_exec_command_outputs()
-                    .await;
-            } else if let Some(finishing) = active_turn.finishing.as_ref() {
+            self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
+                .await;
+            if reason == TurnAbortReason::Interrupted {
+                self.maybe_start_turn_for_pending_work().await;
+                self.input_queue.notify_background_wake();
+            }
+            return;
+        }
+
+        let delivery_guard = self
+            .input_queue
+            .lock_background_notification_delivery()
+            .await;
+        let mut publish_background_wake = false;
+        if let Some(mut active_turn) = self.take_active_turn(&reason).await {
+            if let Some(finishing) = active_turn.finishing.as_ref() {
                 let mut terminal_persisted = finishing.terminal_persisted.clone();
                 let terminal_is_persisted = *terminal_persisted.borrow();
                 if !terminal_is_persisted && terminal_persisted.changed().await.is_err() {
@@ -707,26 +767,11 @@ impl Session {
                     .await;
                 drop(delivery_guard);
             }
-            if aborted_turn {
-                active_turn_to_clear = Some(active_turn);
-            }
         } else {
             drop(delivery_guard);
         }
 
-        if let Some(turn_context) = turn_context.as_deref() {
-            self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
-                .await;
-        }
-        if let Some(active_turn) = active_turn_to_clear {
-            // Let interrupted tasks observe cancellation before dropping pending approvals, or an
-            // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
-            self.input_queue.clear_pending(&active_turn).await;
-        }
-        if reason == TurnAbortReason::Interrupted && aborted_turn {
-            self.maybe_start_turn_for_pending_work().await;
-            self.input_queue.notify_background_wake();
-        } else if reason == TurnAbortReason::Interrupted && publish_background_wake {
+        if reason == TurnAbortReason::Interrupted && publish_background_wake {
             self.input_queue.notify_background_wake();
         }
     }
@@ -736,63 +781,19 @@ impl Session {
         turn_id: &str,
         reason: TurnAbortReason,
     ) -> bool {
-        let delivery_guard = self
-            .input_queue
-            .lock_background_notification_delivery()
-            .await;
-        let active_turn = {
-            let mut active = self.active_turn.lock().await;
-            if active
-                .as_ref()
-                .and_then(|active_turn| active_turn.task.as_ref())
-                .is_some_and(|task| task.turn_context.sub_id == turn_id)
-            {
-                if matches!(
-                    reason,
-                    TurnAbortReason::Interrupted | TurnAbortReason::BudgetLimited
-                ) {
-                    self.mark_interrupted();
-                }
-                active.take()
-            } else {
-                None
-            }
-        };
-        let Some(mut active_turn) = active_turn else {
-            drop(delivery_guard);
+        let Some(turn_context) = self
+            .abort_active_task_in_transaction(reason.clone(), Some(turn_id))
+            .await
+        else {
             return false;
         };
 
-        let task = active_turn.task.take();
-        let turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
-        if let Some(task) = task {
-            let task_turn_context = Arc::clone(&task.turn_context);
-            let (items, parent_turn) = self
-                .input_queue
-                .take_pending_background_inputs_for_turn_state(active_turn.turn_state.as_ref())
-                .await;
-            self.handle_task_abort(task, reason.clone()).await;
-            self.persist_background_input_batch(
-                task_turn_context,
-                items,
-                parent_turn,
-                delivery_guard,
-            )
+        self.services
+            .unified_exec_manager
+            .discard_unrecorded_initial_exec_command_outputs()
             .await;
-            self.services
-                .unified_exec_manager
-                .discard_unrecorded_initial_exec_command_outputs()
-                .await;
-        } else {
-            drop(delivery_guard);
-        }
-        if let Some(turn_context) = turn_context.as_deref() {
-            self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
-                .await;
-        }
-        // Let interrupted tasks observe cancellation before dropping pending approvals, or an
-        // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
-        self.input_queue.clear_pending(&active_turn).await;
+        self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
+            .await;
 
         if reason == TurnAbortReason::Interrupted {
             self.maybe_start_turn_for_pending_work().await;
@@ -1160,6 +1161,12 @@ impl Session {
 
     async fn take_active_turn(&self, reason: &TurnAbortReason) -> Option<ActiveTurn> {
         let mut active = self.active_turn.lock().await;
+        if active
+            .as_ref()
+            .is_some_and(|active_turn| active_turn.aborting)
+        {
+            return None;
+        }
         if matches!(
             reason,
             TurnAbortReason::Interrupted | TurnAbortReason::BudgetLimited
@@ -1236,11 +1243,66 @@ impl Session {
             .await
     }
 
-    async fn handle_task_abort(self: &Arc<Self>, task: RunningTask, reason: TurnAbortReason) {
-        let sub_id = task.turn_context.sub_id.clone();
-        if task.cancellation_token.is_cancelled() {
-            return;
+    async fn emit_aborted_turn(
+        self: &Arc<Self>,
+        turn_context: &Arc<TurnContext>,
+        reason: TurnAbortReason,
+    ) {
+        if reason == TurnAbortReason::Interrupted
+            && let Some(marker) = interrupted_turn_history_marker(
+                InterruptedTurnHistoryMarker::from_config_and_version(
+                    turn_context.config.as_ref(),
+                    turn_context.multi_agent_version,
+                ),
+            )
+        {
+            self.record_conversation_items(turn_context.as_ref(), std::slice::from_ref(&marker))
+                .await;
+            // Ensure the marker is durably visible before emitting TurnAborted: some clients
+            // synchronously re-read the rollout on receipt of the abort event.
+            if let Err(err) = self.flush_rollout().await {
+                warn!("failed to flush interrupted-turn marker before emitting TurnAborted: {err}");
+            }
         }
+
+        let started_at = turn_context.turn_timing_state.started_at_unix_secs().await;
+        let (completed_at, duration_ms, profile) = turn_context
+            .turn_timing_state
+            .complete_profile_and_duration_ms()
+            .await;
+        self.services
+            .analytics_events_client
+            .track_turn_profile(TurnProfileFact {
+                turn_id: turn_context.sub_id.clone(),
+                profile,
+            });
+        let event = EventMsg::TurnAborted(TurnAbortedEvent {
+            turn_id: Some(turn_context.sub_id.clone()),
+            reason,
+            started_at,
+            completed_at,
+            duration_ms,
+        });
+        self.send_event(turn_context.as_ref(), event).await;
+        self.services
+            .guardian_rejection_circuit_breaker
+            .lock()
+            .await
+            .clear_turn(&turn_context.sub_id);
+        // Regular items were flushed before this terminal event was appended; buffering
+        // thread writers may not flush it without another explicit barrier.
+        if let Err(err) = self.flush_rollout().await {
+            warn!("failed to flush rollout after emitting terminal turn event: {err}");
+        }
+    }
+
+    async fn cancel_task_for_abort(
+        self: &Arc<Self>,
+        task: RunningTask,
+        reason: TurnAbortReason,
+    ) -> Arc<TurnContext> {
+        let sub_id = task.turn_context.sub_id.clone();
+        let turn_context = Arc::clone(&task.turn_context);
 
         trace!(task_kind = ?task.kind, sub_id, "aborting running task");
         task.cancellation_token.cancel();
@@ -1279,61 +1341,7 @@ impl Session {
         session_task
             .abort(Arc::clone(self), Arc::clone(&task.turn_context))
             .await;
-
-        if reason == TurnAbortReason::Interrupted
-            && let Some(marker) = interrupted_turn_history_marker(
-                InterruptedTurnHistoryMarker::from_config_and_version(
-                    task.turn_context.config.as_ref(),
-                    task.turn_context.multi_agent_version,
-                ),
-            )
-        {
-            self.record_conversation_items(
-                task.turn_context.as_ref(),
-                std::slice::from_ref(&marker),
-            )
-            .await;
-            // Ensure the marker is durably visible before emitting TurnAborted: some clients
-            // synchronously re-read the rollout on receipt of the abort event.
-            if let Err(err) = self.flush_rollout().await {
-                warn!("failed to flush interrupted-turn marker before emitting TurnAborted: {err}");
-            }
-        }
-
-        let started_at = task
-            .turn_context
-            .turn_timing_state
-            .started_at_unix_secs()
-            .await;
-        let (completed_at, duration_ms, profile) = task
-            .turn_context
-            .turn_timing_state
-            .complete_profile_and_duration_ms()
-            .await;
-        self.services
-            .analytics_events_client
-            .track_turn_profile(TurnProfileFact {
-                turn_id: task.turn_context.sub_id.clone(),
-                profile,
-            });
-        let event = EventMsg::TurnAborted(TurnAbortedEvent {
-            turn_id: Some(task.turn_context.sub_id.clone()),
-            reason,
-            started_at,
-            completed_at,
-            duration_ms,
-        });
-        self.send_event(task.turn_context.as_ref(), event).await;
-        self.services
-            .guardian_rejection_circuit_breaker
-            .lock()
-            .await
-            .clear_turn(&task.turn_context.sub_id);
-        // Regular items were flushed before this terminal event was appended; buffering
-        // thread writers may not flush it without another explicit barrier.
-        if let Err(err) = self.flush_rollout().await {
-            warn!("failed to flush rollout after emitting terminal turn event: {err}");
-        }
+        turn_context
     }
 }
 

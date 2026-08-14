@@ -10097,6 +10097,10 @@ struct ForcedAbortTask {
     dropped: Arc<AtomicBool>,
 }
 
+struct DeliverOnAbortTask {
+    notification: MonitorNotification,
+}
+
 struct TaskDropSignal {
     dropped: Arc<AtomicBool>,
 }
@@ -10183,6 +10187,33 @@ impl SessionTask for HistoryReplacingAbortTask {
             )
             .await;
         Ok(None)
+    }
+}
+
+impl SessionTask for DeliverOnAbortTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.deliver_on_abort"
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        _session: Arc<Session>,
+        _ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        cancellation_token: CancellationToken,
+    ) -> SessionTaskResult {
+        cancellation_token.cancelled().await;
+        Ok(None)
+    }
+
+    async fn abort(&self, session: Arc<Session>, ctx: Arc<TurnContext>) {
+        session
+            .deliver_monitor_notification(self.notification.clone(), ctx.as_ref())
+            .await;
     }
 }
 
@@ -10491,6 +10522,71 @@ async fn abort_gracefully_emits_marker_before_turn_aborted() {
     }
     // No extra events should be emitted after an abort.
     assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abort_cleanup_delivery_is_persisted_before_turn_aborted() {
+    let (sess, tc, rx) = make_session_and_context_with_rx().await;
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        DeliverOnAbortTask {
+            notification: MonitorNotification {
+                process_id: 17,
+                seq: 1,
+                command: "watch".to_string(),
+                kind: "watcher",
+                terminal_state: None,
+                lines: vec!["cleanup delivery".to_string()],
+                omitted_lines: 0,
+                suppressed_notifications: 0,
+                note: None,
+            },
+        },
+    )
+    .await;
+
+    timeout(
+        Duration::from_secs(2),
+        sess.abort_all_tasks(TurnAbortReason::Replaced),
+    )
+    .await
+    .expect("abort cleanup should not deadlock on background delivery");
+
+    let mut observed = Vec::new();
+    let history_at_abort = loop {
+        let event = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("turn abort event should be delivered")
+            .expect("event channel should remain open");
+        let is_terminal = matches!(&event.msg, EventMsg::TurnAborted(_));
+        observed.push(event.msg);
+        if is_terminal {
+            break sess.clone_history().await;
+        }
+    };
+
+    let monitor_index = observed
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                EventMsg::RawResponseItem(RawResponseItemEvent { item })
+                    if MonitorNotification::is_response_item(item)
+            )
+        })
+        .expect("abort cleanup notification should produce a raw response item");
+    let terminal_index = observed.len() - 1;
+    assert!(monitor_index < terminal_index);
+    assert_eq!(
+        1,
+        history_at_abort
+            .raw_items()
+            .filter(|item| MonitorNotification::is_response_item(item))
+            .count(),
+        "history reread at TurnAborted must include exactly one cleanup notification"
+    );
+    assert!(rx.try_recv().is_err(), "no event may follow TurnAborted");
 }
 
 async fn submit_steer_only(
