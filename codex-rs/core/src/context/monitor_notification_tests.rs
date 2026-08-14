@@ -73,3 +73,45 @@ fn response_item_classifier_recognizes_only_monitor_fragments() {
     assert!(MonitorNotification::is_response_item(&monitor_item));
     assert!(!MonitorNotification::is_response_item(&ordinary_item));
 }
+
+#[test]
+fn oversized_escaped_command_stays_bounded_and_valid_json() {
+    let mut fragment = notification();
+    fragment.command = format!("printf 'prefix' {}", "\\\"\\\\\u{0}é🚀".repeat(10_000));
+    fragment.lines = vec!["\\\"\\\\\u{0}é🚀".repeat(4_000); 100];
+    fragment.terminal_state = Some("failed: ".to_string() + &"x".repeat(10_000));
+    fragment.note = Some("note: ".to_string() + &"y".repeat(10_000));
+
+    let rendered = fragment.render();
+    assert!(
+        rendered.len() <= approx_bytes_for_tokens(MAX_NOTIFICATION_TOKENS),
+        "rendered monitor fragment was {} bytes",
+        rendered.len()
+    );
+
+    let (start_marker, end_marker) = MonitorNotification::type_markers();
+    let body = rendered
+        .strip_prefix(start_marker)
+        .and_then(|body| body.strip_suffix(end_marker))
+        .expect("rendered fragment should retain its markers");
+    let payload: serde_json::Value = serde_json::from_str(body.trim()).expect("valid JSON");
+
+    assert_eq!(payload["seq"], serde_json::json!(2));
+    assert_eq!(payload["final"], serde_json::json!(true));
+    assert!(payload["command"]
+        .as_str()
+        .unwrap()
+        .starts_with("printf 'prefix'"));
+    assert!(payload["command"]
+        .as_str()
+        .unwrap()
+        .ends_with(TRUNCATION_SUFFIX));
+    assert!(payload["state"]
+        .as_str()
+        .unwrap()
+        .ends_with(TRUNCATION_SUFFIX));
+    assert!(payload["note"]
+        .as_str()
+        .unwrap()
+        .ends_with(TRUNCATION_SUFFIX));
+}
