@@ -277,7 +277,6 @@ async fn yielded_exec_completion_during_compaction_wakes_successor_once() -> Res
 
     const EXPECTED_SESSION_ID: i32 = 1000;
 
-    let server = start_mock_server().await;
     let mut builder = test_codex().with_config(|config| {
         config
             .features
