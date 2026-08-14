@@ -3372,21 +3372,23 @@ impl Session {
                 .map(|id| id.to_string()),
             window_id: Some(metadata.window_ids.window_id.to_string()),
         };
-        // Compaction starts a new history window, so its WorldState baseline must be full.
+        // Resetting background notification budgets and installing replacement history form
+        // one publication critical section. Holding the state guard while awaiting the reset
+        // means cancellation leaves the old history in place; once the reset completes, the
+        // replacement and baseline update have no intervening await.
         let mut world_state_item = None;
-        {
-            let mut state = self.state.lock().await;
-            state.replace_annotated_history(items, reference_context_item.clone());
-            if let Some(world_state) = world_state_baseline {
-                let snapshot = world_state.snapshot();
-                world_state_item = Some(WorldStateItem::full(snapshot.clone().into_object()));
-                state.history.set_world_state_baseline(snapshot);
-            }
-        }
+        let mut state = self.state.lock().await;
         self.services
             .unified_exec_manager
             .begin_notification_window()
             .await;
+        state.replace_annotated_history(items, reference_context_item.clone());
+        if let Some(world_state) = world_state_baseline {
+            let snapshot = world_state.snapshot();
+            world_state_item = Some(WorldStateItem::full(snapshot.clone().into_object()));
+            state.history.set_world_state_baseline(snapshot);
+        }
+        drop(state);
 
         self.persist_rollout_items(&[RolloutItem::Compacted(compacted_item)])
             .await;
