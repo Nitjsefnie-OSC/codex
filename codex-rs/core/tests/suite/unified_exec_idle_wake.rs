@@ -56,6 +56,23 @@ fn developer_input_texts(request: &[u8]) -> Result<Vec<String>> {
         .collect())
 }
 
+fn function_call_output_text(request: &[u8], call_id: &str) -> Result<String> {
+    let body: Value = serde_json::from_slice(request)
+        .context("streaming Responses request body should be valid JSON")?;
+    body.get("input")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|item| {
+            item.get("type").and_then(Value::as_str) == Some("function_call_output")
+                && item.get("call_id").and_then(Value::as_str) == Some(call_id)
+        })
+        .and_then(|item| item.get("output"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .with_context(|| format!("missing function_call_output for {call_id}"))
+}
+
 fn monitor_notification_payloads(request: &[u8]) -> Result<Vec<Value>> {
     const OPEN_TAG: &str = "<monitor_notification>";
     const CLOSE_TAG: &str = "</monitor_notification>";
@@ -388,9 +405,8 @@ async fn yielded_exec_completion_during_compaction_wakes_successor_once() -> Res
         .with_context(|| "yielded exec follow-up response stage did not complete")?;
     let initial_requests = streaming_server.requests().await;
     assert_eq!(2, initial_requests.len());
-    let initial_output = initial_requests[1]
-        .function_call_output_text("yielded-exec-during-call")
-        .context("missing yielded exec_command output")?;
+    let initial_output =
+        function_call_output_text(&initial_requests[1], "yielded-exec-during-call")?;
     let session_id = yielded_session_id(&initial_output)?;
     assert_eq!(EXPECTED_SESSION_ID, session_id);
 
@@ -464,7 +480,10 @@ async fn yielded_exec_completion_during_compaction_wakes_successor_once() -> Res
     let successor_requests = &requests[3..];
     let completion_notifications = successor_requests
         .iter()
-        .flat_map(|request| request.message_input_texts("developer"))
+        .map(developer_input_texts)
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
         .filter(|text| text.contains("<exec_command_completion>"))
         .collect::<Vec<_>>();
     assert_eq!(
@@ -485,9 +504,7 @@ async fn yielded_exec_completion_during_compaction_wakes_successor_once() -> Res
         notification.contains(r#""output_may_be_available":true"#),
         "completion notification should preserve write_stdin retrieval: {notification}"
     );
-    let poll_output = requests[4]
-        .function_call_output_text("yielded-exec-during-poll")
-        .context("missing write_stdin output after compact successor wake")?;
+    let poll_output = function_call_output_text(&requests[4], "yielded-exec-during-poll")?;
     assert!(
         poll_output.contains("Process exited with code 0"),
         "write_stdin should return the terminal result: {poll_output}"
