@@ -17,7 +17,9 @@ use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
 use codex_protocol::items::TurnItem;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::protocol::AgentStatus;
@@ -29,6 +31,7 @@ use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ItemStartedEvent;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::RawResponseItemEvent;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
@@ -971,15 +974,35 @@ async fn legacy_agent_completion_during_manual_compact_reaches_regular_successor
         _ => None,
     })
     .await;
+    let expected_notification = format!(
+        "<subagent_notification>\n{{\"agent_path\":\"{AGENT_REFERENCE}\",\"status\":{{\"completed\":\"{COMPLETION_STATUS}\"}}}}\n</subagent_notification>"
+    );
+    let prepared_notification = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::RawResponseItem(RawResponseItemEvent { item })
+            if matches!(
+                item,
+                ResponseItem::Message { role, content, .. }
+                    if role == "user"
+                        && content.iter().any(|content| {
+                            matches!(
+                                content,
+                                ContentItem::InputText { text } if text == &expected_notification
+                            )
+                        })
+            ) =>
+        {
+            Some(item.clone())
+        }
+        _ => None,
+    })
+    .await;
+    assert_eq!(prepared_notification.turn_id(), Some(COMPLETION_TURN_ID));
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(event) if event.turn_id == successor_turn_id)
     })
     .await;
 
     let request = successor_request.single_request();
-    let expected_notification = format!(
-        "<subagent_notification>\n{{\"agent_path\":\"{AGENT_REFERENCE}\",\"status\":{{\"completed\":\"{COMPLETION_STATUS}\"}}}}\n</subagent_notification>"
-    );
     assert_eq!(
         request
             .message_input_texts("user")
@@ -987,30 +1010,6 @@ async fn legacy_agent_completion_during_manual_compact_reaches_regular_successor
             .filter(|text| text.contains("<subagent_notification>"))
             .collect::<Vec<_>>(),
         vec![expected_notification]
-    );
-
-    let body = request.body_json();
-    let notification_items = body["input"]
-        .as_array()
-        .expect("successor request input array")
-        .iter()
-        .filter(|item| {
-            item["type"] == "message"
-                && item["role"] == "user"
-                && item["content"].as_array().is_some_and(|content| {
-                    content.iter().any(|span| {
-                        span["type"] == "input_text"
-                            && span["text"]
-                                .as_str()
-                                .is_some_and(|text| text.contains("<subagent_notification>"))
-                    })
-                })
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(notification_items.len(), 1);
-    assert_eq!(
-        notification_items[0]["internal_chat_message_metadata_passthrough"]["turn_id"],
-        COMPLETION_TURN_ID
     );
 
     compact_stream.shutdown().await;
