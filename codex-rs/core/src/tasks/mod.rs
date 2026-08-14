@@ -1264,6 +1264,11 @@ impl Session {
         }
 
         task.handle.abort();
+        if let Err(err) = task.handle.await
+            && !err.is_cancelled()
+        {
+            warn!(%err, sub_id, "session task failed while aborting");
+        }
 
         session_task
             .abort(Arc::clone(self), Arc::clone(&task.turn_context))

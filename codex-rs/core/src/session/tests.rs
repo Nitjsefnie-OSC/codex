@@ -82,6 +82,7 @@ use codex_tools::ToolSpec;
 use codex_utils_path_uri::PathUri;
 use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use tracing::Span;
 
 use crate::connectors::AppInfo;
@@ -186,6 +187,7 @@ use opentelemetry_sdk::metrics::data::MetricData;
 use opentelemetry_sdk::metrics::data::ResourceMetrics;
 use std::path::Path;
 use std::time::Duration;
+use tokio::sync::Notify;
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
 use tokio::time::timeout;
@@ -10087,6 +10089,41 @@ struct NeverEndingTask {
 #[derive(Clone, Copy)]
 struct HistoryReplacingAbortTask;
 
+struct ForcedAbortTask {
+    started: Arc<Notify>,
+    dropped: Arc<AtomicBool>,
+}
+
+struct TaskDropSignal(Arc<AtomicBool>);
+
+impl Drop for TaskDropSignal {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+impl SessionTask for ForcedAbortTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Compact
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.forced_abort"
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        _session: Arc<Session>,
+        _ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        _cancellation_token: CancellationToken,
+    ) -> SessionTaskResult {
+        let _drop_signal = TaskDropSignal(Arc::clone(&self.dropped));
+        self.started.notify_one();
+        std::future::pending().await
+    }
+}
+
 impl SessionTask for HistoryReplacingAbortTask {
     fn kind(&self) -> TaskKind {
         TaskKind::Compact
@@ -11420,6 +11457,59 @@ async fn compact_abort_persists_queued_notifications_after_history_replacement()
             .filter(|item| MonitorNotification::is_response_item(item))
             .count(),
         "queued monitor delivery must be persisted after the compaction replacement"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forced_compact_abort_drops_task_before_persisting_queued_notifications() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let started = Arc::new(Notify::new());
+    let started_wait = started.notified();
+    let dropped = Arc::new(AtomicBool::new(false));
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        ForcedAbortTask {
+            started: Arc::clone(&started),
+            dropped: Arc::clone(&dropped),
+        },
+    )
+    .await;
+    timeout(Duration::from_secs(2), started_wait)
+        .await
+        .expect("forced-abort task should start");
+
+    sess.deliver_monitor_notification(
+        MonitorNotification {
+            process_id: 17,
+            seq: 1,
+            command: "watch".to_string(),
+            kind: "watcher",
+            terminal_state: None,
+            lines: vec!["line during forced abort".to_string()],
+            omitted_lines: 0,
+            suppressed_notifications: 0,
+            note: None,
+        },
+        tc.as_ref(),
+    )
+    .await;
+    assert!(!dropped.load(Ordering::Acquire));
+
+    sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+
+    assert!(
+        dropped.load(Ordering::Acquire),
+        "abort_all_tasks should wait for the forced-abort task future to drop"
+    );
+    let history = sess.clone_history().await;
+    assert_eq!(
+        1,
+        history
+            .raw_items()
+            .filter(|item| MonitorNotification::is_response_item(item))
+            .count(),
+        "queued monitor delivery must be persisted after the forced abort"
     );
 }
 

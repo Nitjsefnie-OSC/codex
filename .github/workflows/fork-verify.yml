@@ -161,6 +161,9 @@ jobs:
             session::tests::compact_abort_persists_queued_notifications_after_history_replacement \
             -- --exact --nocapture
           run_exact cargo test -p codex-core --lib \
+            session::tests::forced_compact_abort_drops_task_before_persisting_queued_notifications \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
             unified_exec::monitors::tests::compaction_starts_a_new_notification_window_without_resetting_lifetime_stats \
             -- --exact --nocapture
           run_exact cargo test -p codex-core --test all \

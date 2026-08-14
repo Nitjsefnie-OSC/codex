@@ -208,7 +208,7 @@ async fn whoami_does_not_attest_websocket_handshake_model() -> Result<()> {
 
     let mut builder = test_codex().with_model(REQUESTED_MODEL);
     let test = builder.build_with_websocket_server(&server).await?;
-    test.codex.submit(user_turn(&test)).await?;
+    test.codex.start_or_steer_turn(user_turn(&test)).await?;
     let mut reroute_count = 0;
     let mut warning_count = 0;
     loop {
@@ -306,7 +306,7 @@ async fn whoami_retry_clears_stale_model_in_the_same_sampling_step() -> Result<(
     // fails after reporting a stale model, the retry re-enters
     // `try_run_sampling_request` and invokes whoami, and the tool continuation
     // completes. No test-only StepContext reset is involved.
-    test.codex.submit(user_turn(&test)).await?;
+    test.codex.start_or_steer_turn(user_turn(&test)).await?;
     wait_for_event(&test.codex, |event| {
         matches!(event, codex_protocol::protocol::EventMsg::TurnComplete(_))
     })
