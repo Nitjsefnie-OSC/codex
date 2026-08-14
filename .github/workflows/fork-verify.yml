@@ -166,6 +166,15 @@ jobs:
             session::tests::compact_task_queues_background_notifications_until_it_finishes \
             -- --exact --nocapture
           run_exact cargo test -p codex-core --lib \
+            session::tests::abort_cleanup_delivery_is_persisted_before_turn_aborted \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::tests::aborting_sentinel_blocks_direct_task_start_until_cleanup_finishes \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::tests::abort_cleanup_history_is_durable_before_turn_aborted \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
             session::tests::compact_abort_persists_queued_notifications_after_history_replacement \
             -- --exact --nocapture
           run_exact cargo test -p codex-core --lib \
@@ -176,6 +185,9 @@ jobs:
             -- --exact --nocapture
           run_exact cargo test -p codex-core --test all \
             suite::compact::native_agent_completion_during_manual_compact_reaches_regular_successor \
+            -- --exact --nocapture --test-threads=1
+          run_exact cargo test -p codex-core --test all \
+            suite::compact::legacy_agent_completion_during_manual_compact_reaches_regular_successor \
             -- --exact --nocapture --test-threads=1
           run_exact cargo test -p codex-core --lib \
             session::tests::aborted_active_turn_persists_ordered_mail_and_completion \
