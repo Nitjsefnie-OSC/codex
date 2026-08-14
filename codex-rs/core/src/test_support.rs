@@ -6,6 +6,8 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::Weak;
 
 use codex_exec_server::EnvironmentManager;
 use codex_extension_api::LoadUserInstructionsFuture;
@@ -30,6 +32,54 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::protocol::SessionSource;
 use once_cell::sync::Lazy;
+
+static MONITOR_DRAFT_ADMISSION_HOOKS: Lazy<Mutex<Vec<Weak<tokio::sync::Notify>>>> =
+    Lazy::new(|| Mutex::new(Vec::new()));
+
+/// Test-only guard for observing monitor draft admission into an active
+/// compaction turn.
+pub struct MonitorDraftAdmissionGuard {
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for MonitorDraftAdmissionGuard {
+    fn drop(&mut self) {
+        let mut hooks = MONITOR_DRAFT_ADMISSION_HOOKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        hooks.retain(|hook| {
+            hook.upgrade()
+                .is_some_and(|notify| !Arc::ptr_eq(&notify, &self.notify))
+        });
+    }
+}
+
+/// Install a test hook and return a notification future source. The hook is
+/// intentionally outside the model/session API; production code only emits a
+/// notification when a test has explicitly installed one.
+pub fn install_monitor_draft_admission_hook()
+-> (MonitorDraftAdmissionGuard, Arc<tokio::sync::Notify>) {
+    let notify = Arc::new(tokio::sync::Notify::new());
+    MONITOR_DRAFT_ADMISSION_HOOKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(Arc::downgrade(&notify));
+    (
+        MonitorDraftAdmissionGuard {
+            notify: Arc::clone(&notify),
+        },
+        notify,
+    )
+}
+
+pub(crate) fn notify_monitor_draft_admission() {
+    let hooks = MONITOR_DRAFT_ADMISSION_HOOKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for notify in hooks.iter().filter_map(Weak::upgrade) {
+        notify.notify_one();
+    }
+}
 
 use crate::ThreadManager;
 use crate::config::Config;

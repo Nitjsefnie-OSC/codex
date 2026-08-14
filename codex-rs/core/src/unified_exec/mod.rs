@@ -74,6 +74,10 @@ pub use monitors::MonitorOutput;
 pub use monitors::MonitorOwner;
 pub use monitors::MonitorState;
 pub use monitors::MonitorWaitOutcome;
+#[cfg(test)]
+pub(crate) use monitors::NotificationSlot;
+#[cfg(test)]
+pub(crate) use monitors::test_monitor_handle;
 pub(crate) use process::NoopSpawnLifecycle;
 #[cfg(unix)]
 pub(crate) use process::SpawnLifecycle;

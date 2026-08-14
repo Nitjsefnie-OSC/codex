@@ -514,6 +514,46 @@ impl MonitorHandle {
     }
 }
 
+#[cfg(test)]
+pub(crate) async fn test_monitor_handle() -> Arc<MonitorHandle> {
+    use super::process::NoopSpawnLifecycle;
+    use codex_sandboxing::SandboxType;
+
+    let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+    let (_stdout_tx, stdout_rx) = tokio::sync::broadcast::channel::<Vec<u8>>(8);
+    let (_exit_tx, exit_rx) = tokio::sync::oneshot::channel::<i32>();
+    let spawned = codex_utils_pty::spawn_from_driver(codex_utils_pty::ProcessDriver {
+        writer_tx,
+        stdout_rx,
+        stderr_rx: None,
+        exit_rx,
+        terminator: None,
+        writer_handle: None,
+        resizer: None,
+        #[cfg(windows)]
+        tty: false,
+    });
+    let process = Arc::new(
+        UnifiedExecProcess::from_spawned(spawned, SandboxType::None, Box::new(NoopSpawnLifecycle))
+            .await
+            .expect("test monitor process should be constructed"),
+    );
+    let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
+    Arc::new(MonitorHandle::new(
+        /*process_id*/ 1,
+        "test-monitor".to_string(),
+        ".".to_string(),
+        MonitorKind::Watcher,
+        MonitorOwner {
+            model_slug: "test".to_string(),
+            sub_id: "test".to_string(),
+            call_id: "test".to_string(),
+        },
+        process,
+        transcript,
+    ))
+}
+
 /// Monitor metadata keyed by the unified-exec process id that owns the process.
 #[derive(Default)]
 pub(crate) struct MonitorStore {

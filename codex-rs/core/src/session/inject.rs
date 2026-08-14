@@ -315,7 +315,6 @@ impl Session {
             matches!(input, TurnInput::AgentCompletion(_))
                 || matches!(input, TurnInput::ResponseItem(item) if SubagentNotification::is_response_item(&item.item))
         });
-        let requests_background_wake = !ordered_inputs.is_empty();
         if ordered_inputs.is_empty() {
             return;
         }
@@ -344,9 +343,6 @@ impl Session {
                     unreachable!("only mailbox and background input reach durable delivery")
                 }
             }
-        }
-        if !requests_background_wake {
-            return;
         }
         self.input_queue
             .request_background_wake(provenance, publishes_agent_completion_activity);

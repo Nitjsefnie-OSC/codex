@@ -401,6 +401,10 @@ impl InputQueue {
             provenance
                 .mark_root_ambiguity_for_existing(task.turn_context.turn_metadata_state.as_ref());
         }
+        let has_monitor_draft = compact
+            && inputs
+                .iter()
+                .any(|input| matches!(input, PendingInput::MonitorNotification(_)));
         let inputs = if compact {
             inputs
         } else {
@@ -412,6 +416,9 @@ impl InputQueue {
         };
         let has_inputs = !inputs.is_empty();
         turn_state.pending_input.extend_pending(inputs, provenance);
+        if has_monitor_draft {
+            crate::test_support::notify_monitor_draft_admission();
+        }
         if has_inputs && let Some(activity) = activity {
             self.activity_tx.send_replace(activity);
         }
@@ -735,6 +742,20 @@ impl InputQueue {
         let mut turn_state = turn_state.lock().await;
         turn_state.pending_input.materialize_monitor_drafts();
         turn_state.pending_input.take_all()
+    }
+
+    /// Materialize drafts while the caller still holds the background-delivery
+    /// lock. Task finalization uses this before publishing a taskless active
+    /// turn so a later watcher cannot reserve ahead of older queued drafts.
+    pub(crate) async fn materialize_monitor_drafts_for_turn_state(
+        &self,
+        turn_state: &Mutex<TurnState>,
+    ) {
+        turn_state
+            .lock()
+            .await
+            .pending_input
+            .materialize_monitor_drafts();
     }
 
     pub(crate) async fn pending_input_summary_for_turn_state(
@@ -1129,9 +1150,148 @@ mod tests {
     use crate::context::ExecCommandCompletionNotification;
     use crate::context::MonitorNotification;
     use codex_history::CodexHarnessMetadata;
+    use codex_history::ResponseItemEnvelope;
     use codex_protocol::AgentPath;
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::ResponseItem;
     use codex_protocol::user_input::UserInput;
     use pretty_assertions::assert_eq;
+    use serde_json::Value;
+
+    use crate::unified_exec::MAX_MONITOR_NOTIFICATIONS;
+
+    fn monitor_payload(input: &TurnInput) -> Value {
+        let TurnInput::ResponseItem(ResponseItemEnvelope {
+            item: ResponseItem::Message { content, .. },
+            ..
+        }) = input
+        else {
+            panic!("expected a monitor response item");
+        };
+        let Some(ContentItem::InputText { text }) = content.first() else {
+            panic!("expected monitor input text");
+        };
+        let (_, payload) = text
+            .split_once("<monitor_notification>")
+            .expect("expected monitor notification marker");
+        let payload = payload
+            .split_once("</monitor_notification>")
+            .expect("expected monitor notification end marker")
+            .0;
+        serde_json::from_str(payload.trim()).expect("monitor payload should be valid JSON")
+    }
+
+    #[tokio::test]
+    async fn queued_monitor_drafts_preserve_order_provenance_and_terminal_suppression() {
+        let handle = crate::unified_exec::test_monitor_handle().await;
+        for _ in 0..(MAX_MONITOR_NOTIFICATIONS - 1) {
+            assert!(matches!(
+                handle.reserve_notification(),
+                crate::unified_exec::NotificationSlot::Allowed { .. }
+            ));
+        }
+        assert!(handle.claim_terminal(crate::unified_exec::MonitorState::Exited { exit_code: 0 }));
+
+        let provenance = PendingTurnProvenance {
+            parent_turn: PendingParentTurn::Unique("parent".to_string()),
+            root_turn: PendingParentTurn::Unique("root".to_string()),
+        };
+        let mut queue = TurnInputQueue::default();
+        queue.extend_pending(
+            vec![
+                PendingInput::MonitorNotification(MonitorNotificationDraft::batch(
+                    Arc::clone(&handle),
+                    vec!["first".to_string()],
+                    /*omitted_lines*/ 0,
+                )),
+                PendingInput::MonitorNotification(MonitorNotificationDraft::batch(
+                    Arc::clone(&handle),
+                    vec!["suppressed".to_string()],
+                    /*omitted_lines*/ 0,
+                )),
+                PendingInput::MonitorNotification(MonitorNotificationDraft::terminal(
+                    Arc::clone(&handle),
+                    /*lagged*/ false,
+                )),
+            ],
+            provenance.clone(),
+        );
+
+        let (items, actual_provenance) = queue.take_all();
+        assert_eq!(actual_provenance, provenance);
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|item| matches!(
+            item,
+            TurnInput::ResponseItem(envelope) if envelope.metadata.is_none()
+        )));
+
+        let payloads = items.iter().map(monitor_payload).collect::<Vec<_>>();
+        assert_eq!(
+            payloads
+                .iter()
+                .map(|payload| payload["seq"].as_u64().expect("monitor seq"))
+                .collect::<Vec<_>>(),
+            vec![20, 21]
+        );
+        assert_eq!(payloads[0]["lines"], serde_json::json!(["first"]));
+        assert_eq!(payloads[0]["final"], Value::Bool(false));
+        assert_eq!(payloads[1]["lines"], serde_json::json!([]));
+        assert_eq!(payloads[1]["final"], Value::Bool(true));
+        assert_eq!(payloads[1]["suppressed_notifications"], Value::from(1_u64));
+        assert_eq!(handle.info().await.notifications_suppressed, 1);
+    }
+
+    #[tokio::test]
+    async fn queued_monitor_drafts_use_reset_window_and_suppress_after_nineteen_successors() {
+        let handle = crate::unified_exec::test_monitor_handle().await;
+        for _ in 0..MAX_MONITOR_NOTIFICATIONS {
+            assert!(matches!(
+                handle.reserve_notification(),
+                crate::unified_exec::NotificationSlot::Allowed { .. }
+            ));
+        }
+        handle.begin_notification_window();
+
+        let provenance = PendingTurnProvenance {
+            parent_turn: PendingParentTurn::Unique("parent".to_string()),
+            root_turn: PendingParentTurn::Unique("root".to_string()),
+        };
+        let mut queue = TurnInputQueue::default();
+        let drafts = (0..=MAX_MONITOR_NOTIFICATIONS)
+            .map(|index| {
+                PendingInput::MonitorNotification(MonitorNotificationDraft::batch(
+                    Arc::clone(&handle),
+                    vec![format!("line-{index}")],
+                    /*omitted_lines*/ 0,
+                ))
+            })
+            .collect();
+        queue.extend_pending(drafts, provenance.clone());
+
+        let (items, actual_provenance) = queue.take_all();
+        assert_eq!(actual_provenance, provenance);
+        assert_eq!(
+            items.len(),
+            usize::try_from(MAX_MONITOR_NOTIFICATIONS).expect("monitor cap fits usize")
+        );
+        let payloads = items.iter().map(monitor_payload).collect::<Vec<_>>();
+        assert_eq!(
+            payloads
+                .iter()
+                .map(|payload| payload["seq"].as_u64().expect("monitor seq"))
+                .collect::<Vec<_>>(),
+            (MAX_MONITOR_NOTIFICATIONS + 1..=MAX_MONITOR_NOTIFICATIONS * 2).collect::<Vec<_>>()
+        );
+        assert_eq!(payloads[0]["lines"], serde_json::json!(["line-0"]));
+        assert_eq!(
+            payloads.last().expect("last monitor payload")["lines"],
+            serde_json::json!([format!("line-{}", MAX_MONITOR_NOTIFICATIONS - 1)])
+        );
+        let info = handle.info().await;
+        assert_eq!(info.notifications_delivered, MAX_MONITOR_NOTIFICATIONS * 2);
+        assert_eq!(info.notifications_suppressed, 1);
+        assert_eq!(info.last_notification_seq, MAX_MONITOR_NOTIFICATIONS * 2);
+    }
 
     #[test]
     fn response_item_serde_preserves_legacy_shape_and_rejects_metadata() {
