@@ -513,7 +513,7 @@ jobs:
         run: |
           set +e
           output=$(timeout 5m cargo test -p codex-core --lib \
-            session::tests::try_start_turn_if_idle_accepts_user_input_in_plan_mode \
+            session::turn_input::tests::start_only_accepts_user_input_in_plan_mode \
             -- --exact --nocapture --test-threads=1 2>&1)
           first=$?
           printf '%s\n' "$output"
@@ -688,7 +688,7 @@ jobs:
             stream=1
           fi
           output=$(timeout 5m cargo test -p codex-core --lib \
-            session::tests::try_start_turn_if_idle_accepts_user_input_in_plan_mode \
+            session::turn_input::tests::start_only_accepts_user_input_in_plan_mode \
             -- --exact --nocapture --test-threads=1 2>&1)
           unit=$?
           printf '%s\n' "$output"
