@@ -246,9 +246,9 @@ async fn yielded_exec_completion_after_compaction_wakes_idle_session_once_and_re
     })
     .await?;
 
-    let completion_notifications = completion_requests
-        .iter()
-        .flat_map(|request| request.message_input_texts("developer"))
+    let completion_notifications = completion_requests[0]
+        .message_input_texts("developer")
+        .into_iter()
         .filter(|text| text.contains("<exec_command_completion>"))
         .collect::<Vec<_>>();
     assert_eq!(
@@ -478,13 +478,8 @@ async fn yielded_exec_completion_during_compaction_wakes_successor_once() -> Res
 
     let requests = streaming_server.requests().await;
     let successor_requests = &requests[3..];
-    let completion_notifications = successor_requests
-        .iter()
-        .map(Vec::as_slice)
-        .map(developer_input_texts)
-        .collect::<Result<Vec<_>>>()?
+    let completion_notifications = developer_input_texts(successor_requests[0])?
         .into_iter()
-        .flatten()
         .filter(|text| text.contains("<exec_command_completion>"))
         .collect::<Vec<_>>();
     assert_eq!(
