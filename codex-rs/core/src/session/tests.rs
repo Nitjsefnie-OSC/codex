@@ -9,6 +9,7 @@ use crate::context::ContextualUserFragment;
 use crate::context::ExecCommandCompletion;
 use crate::context::ExecCommandCompletionNotification;
 use crate::context::MonitorNotification;
+use crate::context::SubagentNotification;
 use crate::context::TurnAborted;
 use crate::environment_selection::ThreadEnvironments;
 use crate::environment_selection::TurnEnvironmentState;
@@ -132,6 +133,7 @@ use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::ConversationAudioParams;
@@ -10092,13 +10094,25 @@ struct HistoryReplacingAbortTask;
 struct ForcedAbortTask {
     started: Arc<Notify>,
     dropped: Arc<AtomicBool>,
+    background_wake_seen_before_drop: Arc<AtomicBool>,
 }
 
-struct TaskDropSignal(Arc<AtomicBool>);
+struct TaskDropSignal {
+    session: Arc<Session>,
+    dropped: Arc<AtomicBool>,
+    background_wake_seen_before_drop: Arc<AtomicBool>,
+}
 
 impl Drop for TaskDropSignal {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
+        // A durable background delivery sets this flag before it notifies an idle
+        // successor. Observing it here makes persistence-before-task-drop fail
+        // at the causal boundary instead of merely comparing both states later.
+        if self.session.input_queue.background_wake_requested() {
+            self.background_wake_seen_before_drop
+                .store(true, Ordering::Release);
+        }
+        self.dropped.store(true, Ordering::Release);
     }
 }
 
@@ -10113,12 +10127,16 @@ impl SessionTask for ForcedAbortTask {
 
     async fn run(
         self: Arc<Self>,
-        _session: Arc<Session>,
+        session: Arc<Session>,
         _ctx: Arc<TurnContext>,
         _input: Vec<TurnInput>,
         _cancellation_token: CancellationToken,
     ) -> SessionTaskResult {
-        let _drop_signal = TaskDropSignal(Arc::clone(&self.dropped));
+        let _drop_signal = TaskDropSignal {
+            session,
+            dropped: Arc::clone(&self.dropped),
+            background_wake_seen_before_drop: Arc::clone(&self.background_wake_seen_before_drop),
+        };
         self.started.notify_one();
         std::future::pending().await
     }
@@ -11344,6 +11362,21 @@ async fn compact_task_queues_background_notifications_until_it_finishes() {
     )
     .await;
 
+    sess.input_queue
+        .enqueue_or_inject_mailbox_communication(
+            &sess.active_turn,
+            InterAgentCommunication::new(
+                AgentPath::try_from("/root/worker").expect("worker path should parse"),
+                AgentPath::root(),
+                Vec::new(),
+                "triggered completion provenance".to_string(),
+                /*trigger_turn*/ true,
+            ),
+            Some("parent-turn".to_string()),
+            Some("root-turn".to_string()),
+        )
+        .await;
+
     sess.deliver_monitor_notification(
         MonitorNotification {
             process_id: 17,
@@ -11377,6 +11410,32 @@ async fn compact_task_queues_background_notifications_until_it_finishes() {
         /*trigger_turn*/ false,
     ))
     .await;
+    sess.deliver_subagent_completion_item(ContextualUserFragment::into(SubagentNotification::new(
+        "worker",
+        AgentStatus::Completed(Some("legacy completion during compaction".to_string())),
+    )))
+    .await;
+
+    let turn_state = sess
+        .active_turn
+        .lock()
+        .await
+        .as_ref()
+        .map(|turn| Arc::clone(&turn.turn_state))
+        .expect("active turn state");
+    let (pending_inputs, parent_turn, root_turn) =
+        sess.input_queue.get_pending_input(&sess.active_turn).await;
+    assert_eq!(parent_turn.as_deref(), Some("parent-turn"));
+    assert_eq!(root_turn.as_deref(), Some("root-turn"));
+    assert!(pending_inputs.iter().any(|input| {
+        matches!(
+            input,
+            TurnInput::ResponseItem(item) if SubagentNotification::is_response_item(&item.item)
+        )
+    }));
+    sess.input_queue
+        .extend_pending_input_for_turn_state(turn_state.as_ref(), pending_inputs)
+        .await;
 
     let history_before_abort = sess.clone_history().await;
     assert_eq!(
@@ -11386,6 +11445,7 @@ async fn compact_task_queues_background_notifications_until_it_finishes() {
             .filter(|item| {
                 MonitorNotification::is_response_item(item)
                     || ExecCommandCompletionNotification::is_response_item(item)
+                    || SubagentNotification::is_response_item(item)
             })
             .count(),
         "compaction must queue background notifications instead of persisting them immediately"
@@ -11412,8 +11472,24 @@ async fn compact_task_queues_background_notifications_until_it_finishes() {
     );
     assert!(history_after_abort.raw_items().any(|item| match item {
         ResponseItem::AgentMessage { content, .. } => content.iter().any(|content| {
-            matches!(content, AgentMessageInputContent::InputText { text } if text.contains("completion during compaction"))
+            matches!(content, AgentMessageInputContent::InputText { text } if text.contains("completion during compaction") || text.contains("triggered completion provenance"))
         }),
+        _ => false,
+    }));
+    assert_eq!(
+        1,
+        history_after_abort
+            .raw_items()
+            .filter(|item| SubagentNotification::is_response_item(item))
+            .count(),
+        "legacy completion must be persisted for the regular successor"
+    );
+    assert!(history_after_abort.raw_items().any(|item| match item {
+        ResponseItem::Message { role, content, .. } if role == "user" => content.iter().any(
+            |content| {
+                matches!(content, ContentItem::InputText { text } if text.contains("legacy completion during compaction"))
+            },
+        ),
         _ => false,
     }));
 }
@@ -11466,12 +11542,14 @@ async fn forced_compact_abort_drops_task_before_persisting_queued_notifications(
     let started = Arc::new(Notify::new());
     let started_wait = started.notified();
     let dropped = Arc::new(AtomicBool::new(false));
+    let background_wake_seen_before_drop = Arc::new(AtomicBool::new(false));
     sess.spawn_task(
         Arc::clone(&tc),
         Vec::new(),
         ForcedAbortTask {
             started: Arc::clone(&started),
             dropped: Arc::clone(&dropped),
+            background_wake_seen_before_drop: Arc::clone(&background_wake_seen_before_drop),
         },
     )
     .await;
@@ -11501,6 +11579,14 @@ async fn forced_compact_abort_drops_task_before_persisting_queued_notifications(
     assert!(
         dropped.load(Ordering::Acquire),
         "abort_all_tasks should wait for the forced-abort task future to drop"
+    );
+    assert!(
+        !background_wake_seen_before_drop.load(Ordering::Acquire),
+        "background notification persistence must not become visible before the aborted task drops"
+    );
+    assert!(
+        sess.input_queue.background_wake_requested(),
+        "queued monitor delivery should request a background wake after task drop"
     );
     let history = sess.clone_history().await;
     assert_eq!(
