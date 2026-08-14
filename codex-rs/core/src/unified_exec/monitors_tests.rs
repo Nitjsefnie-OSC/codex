@@ -50,6 +50,38 @@ fn compaction_starts_a_new_notification_window_without_resetting_lifetime_stats(
 }
 
 #[test]
+fn a_deferred_batch_uses_the_new_window_after_compaction() {
+    let mut counters = MonitorCounters::default();
+    for _ in 0..MAX_MONITOR_NOTIFICATIONS {
+        assert!(allowed_seq(counters.reserve()).is_some());
+    }
+
+    // The watcher has queued one draft, but it has not reserved anything yet.
+    counters.begin_notification_window();
+    assert_eq!(allowed_seq(counters.reserve()), Some(21));
+    for _ in 0..MAX_MONITOR_NOTIFICATIONS - 1 {
+        assert!(allowed_seq(counters.reserve()).is_some());
+    }
+    assert_eq!(allowed_seq(counters.reserve()), None);
+    assert_eq!(counters.delivered, 40);
+    assert_eq!(counters.suppressed, 1);
+}
+
+#[test]
+fn a_deferred_batch_is_suppressed_without_reset_before_terminal_delivery() {
+    let mut counters = MonitorCounters::default();
+    for _ in 0..MAX_MONITOR_NOTIFICATIONS {
+        assert!(allowed_seq(counters.reserve()).is_some());
+    }
+
+    // A draft materialized against an exhausted old window is suppressed and
+    // therefore does not consume a sequence number before the terminal item.
+    assert_eq!(allowed_seq(counters.reserve()), None);
+    assert_eq!(counters.reserve_terminal(), 21);
+    assert_eq!(counters.suppressed, 1);
+}
+
+#[test]
 fn the_terminal_notification_is_never_capped() {
     let mut counters = MonitorCounters::default();
     for _ in 0..MAX_MONITOR_NOTIFICATIONS + 10 {

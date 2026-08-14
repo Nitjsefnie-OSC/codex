@@ -1,4 +1,5 @@
 use super::TurnInput;
+use super::input_queue::PendingInput;
 use super::session::Session;
 use super::turn_context::TurnContext;
 use crate::context::ContextualUserFragment;
@@ -211,7 +212,19 @@ impl Session {
     ) {
         let item = ContextualUserFragment::into(notification);
         self.deliver_background_input(
-            TurnInput::ResponseItem(item.into()),
+            PendingInput::Turn(TurnInput::ResponseItem(item.into())),
+            BackgroundTurnContext::Existing(fallback_turn_context),
+        )
+        .await;
+    }
+
+    pub(crate) async fn deliver_monitor_notification_draft(
+        self: &Arc<Self>,
+        draft: crate::unified_exec::MonitorNotificationDraft,
+        fallback_turn_context: &TurnContext,
+    ) {
+        self.deliver_background_input(
+            PendingInput::MonitorNotification(draft),
             BackgroundTurnContext::Existing(fallback_turn_context),
         )
         .await;
@@ -224,7 +237,7 @@ impl Session {
     ) {
         let item = ContextualUserFragment::into(notification);
         self.deliver_background_input(
-            TurnInput::ResponseItem(item.into()),
+            PendingInput::Turn(TurnInput::ResponseItem(item.into())),
             BackgroundTurnContext::Existing(fallback_turn_context),
         )
         .await;
@@ -238,7 +251,7 @@ impl Session {
         Box::pin(async move {
             session
                 .deliver_background_input(
-                    TurnInput::AgentCompletion(communication),
+                    PendingInput::Turn(TurnInput::AgentCompletion(communication)),
                     BackgroundTurnContext::Default,
                 )
                 .await;
@@ -253,7 +266,7 @@ impl Session {
         Box::pin(async move {
             session
                 .deliver_background_input(
-                    TurnInput::ResponseItem(item.into()),
+                    PendingInput::Turn(TurnInput::ResponseItem(item.into())),
                     BackgroundTurnContext::Default,
                 )
                 .await;
@@ -268,15 +281,17 @@ impl Session {
     /// submission cannot erase it before the next model request.
     async fn deliver_background_input(
         self: &Arc<Self>,
-        input: TurnInput,
+        input: PendingInput,
         fallback_turn_context: BackgroundTurnContext<'_>,
     ) {
         let _delivery_guard = self
             .input_queue
             .lock_background_notification_delivery()
             .await;
-        let publishes_agent_completion_activity = matches!(&input, TurnInput::AgentCompletion(_))
-            || matches!(&input, TurnInput::ResponseItem(item) if SubagentNotification::is_response_item(&item.item));
+        let publishes_agent_completion_activity = matches!(
+            &input,
+            PendingInput::Turn(TurnInput::AgentCompletion(_))
+        ) || matches!(&input, PendingInput::Turn(TurnInput::ResponseItem(item)) if SubagentNotification::is_response_item(&item.item));
         let (ordered_inputs, provenance) = self.input_queue.ordered_background_inputs(input).await;
         let (ordered_inputs, provenance) = match self
             .input_queue
@@ -292,6 +307,18 @@ impl Session {
             Ok(()) => return,
             Err((ordered_inputs, provenance)) => (ordered_inputs, provenance),
         };
+        let ordered_inputs = ordered_inputs
+            .into_iter()
+            .filter_map(PendingInput::materialize)
+            .collect::<Vec<_>>();
+        let publishes_agent_completion_activity = ordered_inputs.iter().any(|input| {
+            matches!(input, TurnInput::AgentCompletion(_))
+                || matches!(input, TurnInput::ResponseItem(item) if SubagentNotification::is_response_item(&item.item))
+        });
+        let requests_background_wake = !ordered_inputs.is_empty();
+        if ordered_inputs.is_empty() {
+            return;
+        }
         let owned_turn_context;
         let fallback_turn_context = match fallback_turn_context {
             BackgroundTurnContext::Existing(turn_context) => turn_context,
@@ -302,7 +329,6 @@ impl Session {
                 owned_turn_context.as_ref()
             }
         };
-
         for input in ordered_inputs {
             match input {
                 TurnInput::ResponseItem(item) => {
@@ -318,6 +344,9 @@ impl Session {
                     unreachable!("only mailbox and background input reach durable delivery")
                 }
             }
+        }
+        if !requests_background_wake {
+            return;
         }
         self.input_queue
             .request_background_wake(provenance, publishes_agent_completion_activity);

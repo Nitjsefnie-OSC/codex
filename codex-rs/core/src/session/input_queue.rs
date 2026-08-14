@@ -1,9 +1,11 @@
+use crate::context::ContextualUserFragment;
 use crate::context::SubagentNotification;
 use crate::context::is_background_notification;
 use crate::state::ActiveTurn;
 use crate::state::MailboxDeliveryPhase;
 use crate::state::TaskKind;
 use crate::state::TurnState;
+use crate::unified_exec::MonitorNotificationDraft;
 use codex_diagnostics::Gauge;
 use codex_diagnostics::GaugeGuard;
 use codex_history::ResponseItemEnvelope;
@@ -35,6 +37,69 @@ pub enum TurnInput {
     InterAgentCommunication(InterAgentCommunication),
     /// A terminal child result delivered through the durable background-wake path.
     AgentCompletion(InterAgentCommunication),
+}
+
+/// Input waiting for a turn, including monitor output that must not reserve a
+/// notification sequence number until an active compaction has finished.
+pub(crate) enum PendingInput {
+    Turn(TurnInput),
+    MonitorNotification(MonitorNotificationDraft),
+}
+
+impl From<TurnInput> for PendingInput {
+    fn from(input: TurnInput) -> Self {
+        Self::Turn(input)
+    }
+}
+
+impl PendingInput {
+    pub(crate) fn materialize(self) -> Option<TurnInput> {
+        match self {
+            Self::Turn(input) => Some(input),
+            Self::MonitorNotification(draft) => draft
+                .materialize()
+                .map(ContextualUserFragment::into)
+                .map(ResponseItemEnvelope::from)
+                .map(TurnInput::ResponseItem),
+        }
+    }
+
+    fn is_background(&self) -> bool {
+        match self {
+            Self::Turn(input) => InputQueue::input_is_background(input),
+            Self::MonitorNotification(_) => true,
+        }
+    }
+
+    fn is_user_input(&self) -> bool {
+        matches!(self, Self::Turn(TurnInput::UserInput { .. }))
+    }
+
+    fn has_agent_completion(&self) -> bool {
+        match self {
+            Self::Turn(TurnInput::AgentCompletion(_)) => true,
+            Self::Turn(TurnInput::ResponseItem(item)) => {
+                SubagentNotification::is_response_item(&item.item)
+            }
+            Self::Turn(TurnInput::UserInput { .. })
+            | Self::Turn(TurnInput::InterAgentCommunication(_))
+            | Self::MonitorNotification(_) => false,
+        }
+    }
+
+    fn requires_follow_up(&self) -> bool {
+        match self {
+            Self::Turn(TurnInput::InterAgentCommunication(communication)) => {
+                communication.trigger_turn
+            }
+            Self::MonitorNotification(_) => false,
+            Self::Turn(
+                TurnInput::UserInput { .. }
+                | TurnInput::ResponseItem(_)
+                | TurnInput::AgentCompletion(_),
+            ) => true,
+        }
+    }
 }
 
 mod turn_input_response_item {
@@ -91,7 +156,7 @@ pub(crate) struct TurnInputQueue {
 }
 
 struct QueuedTurnInput {
-    input: TurnInput,
+    input: PendingInput,
     provenance: PendingTurnProvenance,
 }
 
@@ -306,18 +371,22 @@ impl InputQueue {
     pub(crate) async fn inject_background_inputs_if_running(
         &self,
         active_turn: &Mutex<Option<ActiveTurn>>,
-        inputs: Vec<TurnInput>,
+        inputs: Vec<PendingInput>,
         provenance: PendingTurnProvenance,
         activity: Option<InputQueueActivity>,
-    ) -> Result<(), (Vec<TurnInput>, PendingTurnProvenance)> {
+    ) -> Result<(), (Vec<PendingInput>, PendingTurnProvenance)> {
         let mut active = active_turn.lock().await;
         let Some(active_turn) = active.as_mut() else {
             return Err((inputs, provenance));
         };
+        let mut compact = false;
         if let Some(task) = active_turn.task.as_ref() {
             let accepts_background_notifications = match task.kind {
                 TaskKind::Regular => task.task.accepts_background_notifications(),
-                TaskKind::Compact => true,
+                TaskKind::Compact => {
+                    compact = true;
+                    true
+                }
                 TaskKind::Review => false,
             };
             if !accepts_background_notifications {
@@ -332,8 +401,18 @@ impl InputQueue {
             provenance
                 .mark_root_ambiguity_for_existing(task.turn_context.turn_metadata_state.as_ref());
         }
-        turn_state.pending_input.extend(inputs, provenance);
-        if let Some(activity) = activity {
+        let inputs = if compact {
+            inputs
+        } else {
+            inputs
+                .into_iter()
+                .filter_map(PendingInput::materialize)
+                .map(PendingInput::Turn)
+                .collect()
+        };
+        let has_inputs = !inputs.is_empty();
+        turn_state.pending_input.extend_pending(inputs, provenance);
+        if has_inputs && let Some(activity) = activity {
             self.activity_tx.send_replace(activity);
         }
         Ok(())
@@ -414,7 +493,7 @@ impl InputQueue {
         } else {
             PendingTurnProvenance::default()
         };
-        let input = TurnInput::InterAgentCommunication(communication);
+        let input = PendingInput::Turn(TurnInput::InterAgentCommunication(communication));
         match self
             .inject_background_inputs_if_running(
                 active_turn,
@@ -426,7 +505,7 @@ impl InputQueue {
         {
             Ok(()) => {}
             Err((mut inputs, provenance)) => {
-                let TurnInput::InterAgentCommunication(communication) =
+                let PendingInput::Turn(TurnInput::InterAgentCommunication(communication)) =
                     inputs.pop().expect("mailbox injection returns its input")
                 else {
                     unreachable!("mailbox injection preserves the communication variant")
@@ -518,11 +597,16 @@ impl InputQueue {
 
     pub(crate) async fn ordered_background_inputs(
         &self,
-        completion: TurnInput,
-    ) -> (Vec<TurnInput>, PendingTurnProvenance) {
+        completion: impl Into<PendingInput>,
+    ) -> (Vec<PendingInput>, PendingTurnProvenance) {
         let mut drained = self.drain_mailbox_inputs().await;
-        drained.items.push(completion);
-        (drained.items, drained.provenance)
+        let items = drained
+            .items
+            .drain(..)
+            .map(PendingInput::Turn)
+            .chain(std::iter::once(completion.into()))
+            .collect();
+        (items, drained.provenance)
     }
 
     pub(crate) async fn turn_state_for_sub_id(
@@ -559,12 +643,12 @@ impl InputQueue {
         let mut turn_state = turn_state.lock().await;
         // Explicit same-turn work still needs a follow-up. Queue-only child mail does not: keep
         // it pending so task completion records it for the next turn without sampling again.
-        if turn_state.pending_input.items.iter().any(|queued| {
-            !matches!(
-                &queued.input,
-                TurnInput::InterAgentCommunication(communication) if !communication.trigger_turn
-            )
-        }) {
+        if turn_state
+            .pending_input
+            .items
+            .iter()
+            .any(|queued| queued.input.requires_follow_up())
+        {
             return;
         }
         turn_state.set_mailbox_delivery_phase(MailboxDeliveryPhase::NextTurn);
@@ -649,6 +733,7 @@ impl InputQueue {
         turn_state: &Mutex<TurnState>,
     ) -> (Vec<TurnInput>, PendingTurnProvenance) {
         let mut turn_state = turn_state.lock().await;
+        turn_state.pending_input.materialize_monitor_drafts();
         turn_state.pending_input.take_all()
     }
 
@@ -656,7 +741,8 @@ impl InputQueue {
         &self,
         turn_state: &Mutex<TurnState>,
     ) -> (bool, bool, bool) {
-        let turn_state = turn_state.lock().await;
+        let mut turn_state = turn_state.lock().await;
+        turn_state.pending_input.materialize_monitor_drafts();
         (
             !turn_state.pending_input.items.is_empty(),
             turn_state.pending_input.has_user_input(),
@@ -664,7 +750,7 @@ impl InputQueue {
                 .pending_input
                 .items
                 .iter()
-                .any(|queued| !Self::input_is_background(&queued.input)),
+                .any(|queued| !queued.input.is_background()),
         )
     }
 
@@ -695,12 +781,16 @@ impl InputQueue {
         turn_state: &Mutex<TurnState>,
     ) -> (Vec<TurnInput>, PendingTurnProvenance) {
         let mut turn_state = turn_state.lock().await;
+        turn_state.pending_input.materialize_monitor_drafts();
         let pending_items = std::mem::take(&mut turn_state.pending_input.items);
         let mut notification_items = Vec::new();
         let mut notification_provenance = PendingTurnProvenance::default();
         let mut remaining_items = VecDeque::with_capacity(pending_items.len());
         for queued in pending_items {
-            match queued.input {
+            let Some(input) = queued.input.materialize() else {
+                continue;
+            };
+            match input {
                 TurnInput::ResponseItem(response_item)
                     if is_background_notification(&response_item.item) =>
                 {
@@ -712,7 +802,7 @@ impl InputQueue {
                     notification_items.push(item);
                 }
                 input => remaining_items.push_back(QueuedTurnInput {
-                    input,
+                    input: PendingInput::Turn(input),
                     provenance: queued.provenance,
                 }),
             }
@@ -746,23 +836,30 @@ impl InputQueue {
             let mut active = active_turn.lock().await;
             match active.as_mut() {
                 Some(active_turn) => {
+                    let compact = active_turn
+                        .task
+                        .as_ref()
+                        .is_some_and(|task| task.kind == TaskKind::Compact);
                     let active_turn_metadata = active_turn
                         .task
                         .as_ref()
                         .map(|task| Arc::clone(&task.turn_context.turn_metadata_state));
                     let mut turn_state = active_turn.turn_state.lock().await;
                     let accepts_mailbox_delivery =
-                        turn_state.accepts_mailbox_delivery_for_current_turn();
+                        !compact && turn_state.accepts_mailbox_delivery_for_current_turn();
+                    if !compact {
+                        turn_state.pending_input.materialize_monitor_drafts();
+                    }
                     let (pending_input, provenance) = if accepts_mailbox_delivery
                         && let Some(first) = turn_state.pending_input.items.front()
                     {
-                        let first_is_background = Self::input_is_background(&first.input);
+                        let first_is_background = first.input.is_background();
                         let prefix_len = turn_state
                             .pending_input
                             .items
                             .iter()
                             .take_while(|queued| {
-                                Self::input_is_background(&queued.input) == first_is_background
+                                queued.input.is_background() == first_is_background
                             })
                             .count();
                         let mut provenance = PendingTurnProvenance::default();
@@ -770,9 +867,9 @@ impl InputQueue {
                             .pending_input
                             .items
                             .drain(..prefix_len)
-                            .map(|queued| {
+                            .filter_map(|queued| {
                                 provenance.merge_state(queued.provenance);
-                                queued.input
+                                queued.input.materialize()
                             })
                             .collect();
                         (items, provenance)
@@ -866,7 +963,14 @@ impl InputQueue {
             let active = active_turn.lock().await;
             match active.as_ref() {
                 Some(active_turn) => {
-                    let turn_state = active_turn.turn_state.lock().await;
+                    let compact = active_turn
+                        .task
+                        .as_ref()
+                        .is_some_and(|task| task.kind == TaskKind::Compact);
+                    let mut turn_state = active_turn.turn_state.lock().await;
+                    if !compact {
+                        turn_state.pending_input.materialize_monitor_drafts();
+                    }
                     (
                         !turn_state.pending_input.items.is_empty(),
                         turn_state.accepts_mailbox_delivery_for_current_turn(),
@@ -964,6 +1068,13 @@ impl PendingTurnProvenance {
 
 impl TurnInputQueue {
     fn extend(&mut self, input: Vec<TurnInput>, provenance: PendingTurnProvenance) {
+        self.extend_pending(
+            input.into_iter().map(PendingInput::Turn).collect(),
+            provenance,
+        );
+    }
+
+    fn extend_pending(&mut self, input: Vec<PendingInput>, provenance: PendingTurnProvenance) {
         self.items
             .extend(input.into_iter().map(|input| QueuedTurnInput {
                 input,
@@ -971,31 +1082,42 @@ impl TurnInputQueue {
             }));
     }
 
+    fn materialize_monitor_drafts(&mut self) {
+        let items = self
+            .items
+            .drain(..)
+            .filter_map(|queued| {
+                queued.input.materialize().map(|input| QueuedTurnInput {
+                    input: PendingInput::Turn(input),
+                    provenance: queued.provenance,
+                })
+            })
+            .collect::<VecDeque<_>>();
+        self.items = items;
+    }
+
     fn take_all(&mut self) -> (Vec<TurnInput>, PendingTurnProvenance) {
+        self.materialize_monitor_drafts();
         let mut provenance = PendingTurnProvenance::default();
         let items = self
             .items
             .drain(..)
-            .map(|queued| {
+            .filter_map(|queued| {
                 provenance.merge_state(queued.provenance);
-                queued.input
+                queued.input.materialize()
             })
             .collect();
         (items, provenance)
     }
 
     fn has_user_input(&self) -> bool {
-        self.items
-            .iter()
-            .any(|queued| matches!(&queued.input, TurnInput::UserInput { .. }))
+        self.items.iter().any(|queued| queued.input.is_user_input())
     }
 
     fn has_agent_completion(&self) -> bool {
-        self.items.iter().any(|queued| match &queued.input {
-            TurnInput::AgentCompletion(_) => true,
-            TurnInput::ResponseItem(item) => SubagentNotification::is_response_item(&item.item),
-            TurnInput::UserInput { .. } | TurnInput::InterAgentCommunication(_) => false,
-        })
+        self.items
+            .iter()
+            .any(|queued| queued.input.has_agent_completion())
     }
 }
 
