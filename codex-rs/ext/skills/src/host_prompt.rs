@@ -120,7 +120,6 @@ mod tests {
     use std::sync::Arc;
 
     use codex_exec_server::LOCAL_FS;
-    use codex_extension_api::ContextualUserFragment;
     use codex_protocol::protocol::SkillScope;
     use codex_skills::SkillMetadata;
     use codex_utils_absolute_path::AbsolutePathBuf;
@@ -144,6 +143,7 @@ mod tests {
             name: "large-skill".to_string(),
             description: "A large skill".to_string(),
             short_description: None,
+            model: None,
             interface: None,
             dependencies: None,
             policy: None,
