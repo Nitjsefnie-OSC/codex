@@ -791,6 +791,27 @@ async fn native_agent_completion_during_manual_compact_reaches_regular_successor
             ),
         })
         .await?;
+
+    // submit only waits for the completion operation to enter the session
+    // queue. A reply-bearing idle-start submission after it provides the
+    // queue barrier: its response cannot be produced until the completion
+    // handler has queued the input on the active compact task. The empty
+    // request must be rejected while compaction is active, so this cannot
+    // create a competing turn.
+    let completion_barrier = test
+        .codex
+        .start_turn_if_idle(TurnInputRequest::user_input(Vec::new()))
+        .await?;
+    assert!(
+        matches!(
+            completion_barrier,
+            codex_core::StartIfIdleSubmission::NotSubmitted {
+                reason: codex_core::NotSubmittedReason::NotIdle
+            }
+        ),
+        "completion barrier must observe the active compact turn",
+    );
+
     compact_gate_tx
         .send(())
         .map_err(|_| anyhow!("manual compact response gate closed unexpectedly"))?;
