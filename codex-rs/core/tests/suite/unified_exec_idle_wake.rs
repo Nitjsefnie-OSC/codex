@@ -2,12 +2,10 @@ use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::Result;
-use codex_core::TurnInputRequest;
 use codex_core::compact::SUMMARIZATION_PROMPT;
 use codex_features::Feature;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
-use codex_protocol::user_input::UserInput;
 use core_test_support::TestTargetOs;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -374,11 +372,7 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
         })
         .collect::<Result<Vec<_>>>()?;
 
-    test.codex
-        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
-            text: "start a live monitor before compaction".to_string(),
-            text_elements: Vec::new(),
-        }]))
+    test.submit_turn("start a live monitor before compaction")
         .await?;
     completion_receivers
         .remove(0)
@@ -388,10 +382,6 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
         .remove(0)
         .await
         .with_context(|| "monitor follow-up response stage did not complete")?;
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
-    .await;
     test.fs()
         .write_file(&start_gate, b"ready".to_vec(), /*sandbox*/ None)
         .await?;
