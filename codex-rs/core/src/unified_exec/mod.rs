@@ -69,6 +69,7 @@ pub use monitors::MonitorAcknowledgement;
 pub(crate) use monitors::MonitorAttachment;
 pub use monitors::MonitorInfo;
 pub use monitors::MonitorKind;
+pub(crate) use monitors::MonitorNotificationDraft;
 pub use monitors::MonitorOutput;
 pub use monitors::MonitorOwner;
 pub use monitors::MonitorState;

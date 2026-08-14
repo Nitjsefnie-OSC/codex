@@ -266,6 +266,96 @@ pub(crate) enum NotificationSlot {
     Suppressed,
 }
 
+/// A monitor notification whose sequence number is reserved only when the
+/// notification is ready to become model-visible.
+///
+/// Monitor watchers can outlive the turn that started them. Keeping the raw,
+/// already bounded payload here lets session delivery queue output while a
+/// compaction task is active without spending the old notification window.
+pub(crate) enum MonitorNotificationDraft {
+    Batch {
+        handle: Arc<MonitorHandle>,
+        lines: Vec<String>,
+        omitted_lines: usize,
+    },
+    Terminal {
+        handle: Arc<MonitorHandle>,
+        lagged: bool,
+    },
+}
+
+impl MonitorNotificationDraft {
+    pub(crate) fn batch(
+        handle: Arc<MonitorHandle>,
+        lines: Vec<String>,
+        omitted_lines: usize,
+    ) -> Self {
+        Self::Batch {
+            handle,
+            lines,
+            omitted_lines,
+        }
+    }
+
+    pub(crate) fn terminal(handle: Arc<MonitorHandle>, lagged: bool) -> Self {
+        Self::Terminal { handle, lagged }
+    }
+
+    /// Reserve this draft's sequence number and build its model-visible item.
+    ///
+    /// A capped batch returns `None` when its window is exhausted. Suppression
+    /// is recorded by the reservation itself, while terminal notifications are
+    /// always materialized after all earlier drafts in queue order.
+    pub(crate) fn materialize(self) -> Option<crate::context::MonitorNotification> {
+        match self {
+            Self::Batch {
+                handle,
+                lines,
+                omitted_lines,
+            } => {
+                let NotificationSlot::Allowed { seq } = handle.reserve_notification() else {
+                    return None;
+                };
+                Some(crate::context::MonitorNotification {
+                    process_id: handle.process_id,
+                    seq,
+                    command: handle.command().to_string(),
+                    kind: handle.kind().as_str(),
+                    terminal_state: None,
+                    lines,
+                    omitted_lines,
+                    suppressed_notifications: 0,
+                    note: None,
+                })
+            }
+            Self::Terminal { handle, lagged } => {
+                let seq = handle.reserve_terminal_notification();
+                let suppressed = handle.suppressed_notifications();
+                let process_id = handle.process_id;
+                let mut note = format!(
+                    "Read the monitor's retained output with monitor(action=\"read\", process_id={process_id})."
+                );
+                if lagged {
+                    note.push_str(
+                        " Some output outran the notification channel; the retained output is authoritative.",
+                    );
+                }
+                Some(crate::context::MonitorNotification {
+                    process_id: handle.process_id,
+                    seq,
+                    command: handle.command().to_string(),
+                    kind: handle.kind().as_str(),
+                    terminal_state: Some(handle.state().describe()),
+                    lines: Vec::new(),
+                    omitted_lines: 0,
+                    suppressed_notifications: suppressed,
+                    note: Some(note),
+                })
+            }
+        }
+    }
+}
+
 impl MonitorHandle {
     pub(crate) fn new(
         process_id: i32,

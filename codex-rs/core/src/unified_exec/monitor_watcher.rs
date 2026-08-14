@@ -23,9 +23,8 @@ use super::async_watcher::TRAILING_OUTPUT_GRACE;
 use super::monitors::MAX_LINES_PER_NOTIFICATION;
 use super::monitors::MAX_NOTIFICATION_BYTES;
 use super::monitors::MonitorHandle;
+use super::monitors::MonitorNotificationDraft;
 use super::monitors::MonitorState;
-use super::monitors::NotificationSlot;
-use crate::context::MonitorNotification;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 
@@ -215,24 +214,11 @@ async fn deliver_batch(
     if lines.is_empty() {
         return;
     }
-    let NotificationSlot::Allowed { seq } = handle.reserve_notification() else {
-        return;
-    };
     let (lines, omitted_lines) = cap_lines(lines);
     inject(
         session,
         turn,
-        MonitorNotification {
-            process_id: handle.process_id,
-            seq,
-            command: handle.command().to_string(),
-            kind: handle.kind().as_str(),
-            terminal_state: None,
-            lines,
-            omitted_lines,
-            suppressed_notifications: 0,
-            note: None,
-        },
+        MonitorNotificationDraft::batch(Arc::clone(handle), lines, omitted_lines),
     )
     .await;
 }
@@ -247,31 +233,10 @@ async fn deliver_terminal(
     if !handle.claim_terminal(state.clone()) {
         return;
     }
-    let seq = handle.reserve_terminal_notification();
-    let suppressed = handle.suppressed_notifications();
-    let mut note = format!(
-        "Read the monitor's retained output with monitor(action=\"read\", process_id={}).",
-        handle.process_id
-    );
-    if lagged {
-        note.push_str(
-            " Some output outran the notification channel; the retained output is authoritative.",
-        );
-    }
     inject(
         session,
         turn,
-        MonitorNotification {
-            process_id: handle.process_id,
-            seq,
-            command: handle.command().to_string(),
-            kind: handle.kind().as_str(),
-            terminal_state: Some(state.describe()),
-            lines: Vec::new(),
-            omitted_lines: 0,
-            suppressed_notifications: suppressed,
-            note: Some(note),
-        },
+        MonitorNotificationDraft::terminal(Arc::clone(handle), lagged),
     )
     .await;
 }
@@ -311,10 +276,10 @@ fn truncate_on_char_boundary(line: &str, max_bytes: usize) -> String {
 async fn inject(
     session: &Arc<Session>,
     turn: &Arc<TurnContext>,
-    notification: MonitorNotification,
+    notification: MonitorNotificationDraft,
 ) {
     session
-        .deliver_monitor_notification(notification, turn.as_ref())
+        .deliver_monitor_notification_draft(notification, turn.as_ref())
         .await;
 }
 

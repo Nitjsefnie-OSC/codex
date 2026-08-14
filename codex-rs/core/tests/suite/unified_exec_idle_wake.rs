@@ -271,7 +271,8 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
 
     const START_GATE: &str = "monitor-compaction-start.ready";
     const BEFORE_COMPACTION_GATE: &str = "monitor-compaction-before.ready";
-    const AFTER_COMPACTION_GATE: &str = "monitor-compaction-after.ready";
+    const DURING_COMPACTION_GATE: &str = "monitor-compaction-during.ready";
+    const DURING_COMPACTION_BATCH_READY: &str = "monitor-compaction-during-batch.ready";
     const BATCH_READY_PREFIX: &str = "monitor-compaction-batch-";
     const BATCH_ACK_PREFIX: &str = "monitor-compaction-batch-ack-";
     const PRE_COMPACTION_NOTIFICATION_COUNT: usize = 20;
@@ -280,13 +281,13 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
     let monitor_command = match test_target_os() {
         TestTargetOs::Linux | TestTargetOs::MacOs => {
             let command = format!(
-                "while [ ! -f {START_GATE} ]; do sleep 0.05; done; i=1; while [ \"$i\" -le {PRE_COMPACTION_NOTIFICATION_COUNT} ]; do j=0; while [ \"$j\" -lt {LINES_PER_NOTIFICATION} ]; do printf 'monitor-before-%s-%s\\n' \"$i\" \"$j\"; j=$((j + 1)); done; touch {BATCH_READY_PREFIX}$i.ready; while [ ! -f {BATCH_ACK_PREFIX}$i ]; do sleep 0.05; done; i=$((i + 1)); done; touch {BEFORE_COMPACTION_GATE}; while [ ! -f {AFTER_COMPACTION_GATE} ]; do sleep 0.05; done; j=0; while [ \"$j\" -lt {LINES_PER_NOTIFICATION} ]; do printf 'monitor-after-%s\\n' \"$j\"; j=$((j + 1)); done; sleep 30"
+                "while [ ! -f {START_GATE} ]; do sleep 0.05; done; i=1; while [ \"$i\" -le {PRE_COMPACTION_NOTIFICATION_COUNT} ]; do j=0; while [ \"$j\" -lt {LINES_PER_NOTIFICATION} ]; do printf 'monitor-before-%s-%s\\n' \"$i\" \"$j\"; j=$((j + 1)); done; touch {BATCH_READY_PREFIX}$i.ready; while [ ! -f {BATCH_ACK_PREFIX}$i ]; do sleep 0.05; done; i=$((i + 1)); done; touch {BEFORE_COMPACTION_GATE}; while [ ! -f {DURING_COMPACTION_GATE} ]; do sleep 0.05; done; j=0; while [ \"$j\" -lt {LINES_PER_NOTIFICATION} ]; do printf 'monitor-after-%s\\n' \"$j\"; j=$((j + 1)); done; touch {DURING_COMPACTION_BATCH_READY}; sleep 30"
             );
             vec!["bash".to_string(), "-c".to_string(), command]
         }
         TestTargetOs::Windows => {
             let command = format!(
-                "while (-not (Test-Path -LiteralPath '{START_GATE}')) {{ Start-Sleep -Milliseconds 50 }}; $i=1; while ($i -le {PRE_COMPACTION_NOTIFICATION_COUNT}) {{ for ($j=0; $j -lt {LINES_PER_NOTIFICATION}; $j++) {{ [Console]::Out.WriteLine(\"monitor-before-$i-$j\") }}; New-Item -ItemType File -Force -Path \"{BATCH_READY_PREFIX}$i.ready\" | Out-Null; while (-not (Test-Path -LiteralPath \"{BATCH_ACK_PREFIX}$i\")) {{ Start-Sleep -Milliseconds 50 }}; $i++ }}; New-Item -ItemType File -Force -Path '{BEFORE_COMPACTION_GATE}' | Out-Null; while (-not (Test-Path -LiteralPath '{AFTER_COMPACTION_GATE}')) {{ Start-Sleep -Milliseconds 50 }}; for ($j=0; $j -lt {LINES_PER_NOTIFICATION}; $j++) {{ [Console]::Out.WriteLine(\"monitor-after-$j\") }}; Start-Sleep -Seconds 30"
+                "while (-not (Test-Path -LiteralPath '{START_GATE}')) {{ Start-Sleep -Milliseconds 50 }}; $i=1; while ($i -le {PRE_COMPACTION_NOTIFICATION_COUNT}) {{ for ($j=0; $j -lt {LINES_PER_NOTIFICATION}; $j++) {{ [Console]::Out.WriteLine(\"monitor-before-$i-$j\") }}; New-Item -ItemType File -Force -Path \"{BATCH_READY_PREFIX}$i.ready\" | Out-Null; while (-not (Test-Path -LiteralPath \"{BATCH_ACK_PREFIX}$i\")) {{ Start-Sleep -Milliseconds 50 }}; $i++ }}; New-Item -ItemType File -Force -Path '{BEFORE_COMPACTION_GATE}' | Out-Null; while (-not (Test-Path -LiteralPath '{DURING_COMPACTION_GATE}')) {{ Start-Sleep -Milliseconds 50 }}; for ($j=0; $j -lt {LINES_PER_NOTIFICATION}; $j++) {{ [Console]::Out.WriteLine(\"monitor-after-$j\") }}; New-Item -ItemType File -Force -Path '{DURING_COMPACTION_BATCH_READY}' | Out-Null; Start-Sleep -Seconds 30"
             );
             vec![
                 "powershell".to_string(),
@@ -301,6 +302,7 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
         "kind": "watcher",
     }))?;
 
+    let (compact_release_tx, compact_release_rx) = tokio::sync::oneshot::channel();
     let mut response_streams = vec![
         vec![StreamingSseChunk {
             gate: None,
@@ -333,17 +335,24 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
         }]);
     }
     response_streams.extend([
-        vec![StreamingSseChunk {
-            gate: None,
-            body: sse(vec![
-                ev_response_created("monitor-compaction-summary-response"),
-                ev_assistant_message(
-                    "monitor-compaction-summary-message",
-                    "summary after monitor compaction",
-                ),
-                ev_completed("monitor-compaction-summary-response"),
-            ]),
-        }],
+        vec![
+            StreamingSseChunk {
+                gate: None,
+                body: sse(vec![ev_response_created(
+                    "monitor-compaction-summary-response",
+                )]),
+            },
+            StreamingSseChunk {
+                gate: Some(compact_release_rx),
+                body: sse(vec![
+                    ev_assistant_message(
+                        "monitor-compaction-summary-message",
+                        "summary after monitor compaction",
+                    ),
+                    ev_completed("monitor-compaction-summary-response"),
+                ]),
+            },
+        ],
         vec![StreamingSseChunk {
             gate: None,
             body: sse(vec![
@@ -381,11 +390,16 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
         .selection()
         .cwd
         .join(BEFORE_COMPACTION_GATE)?;
-    let after_compaction_gate = test
+    let during_compaction_gate = test
         .executor_environment()
         .selection()
         .cwd
-        .join(AFTER_COMPACTION_GATE)?;
+        .join(DURING_COMPACTION_GATE)?;
+    let during_compaction_batch_ready = test
+        .executor_environment()
+        .selection()
+        .cwd
+        .join(DURING_COMPACTION_BATCH_READY)?;
     let batch_ready_gates = (1..=PRE_COMPACTION_NOTIFICATION_COUNT)
         .map(|seq| {
             let path = format!("{BATCH_READY_PREFIX}{seq}.ready");
@@ -532,6 +546,37 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
     }
 
     test.codex.submit(Op::Compact).await?;
+    timeout(
+        Duration::from_secs(10),
+        streaming_server.wait_for_request_count(3 + PRE_COMPACTION_NOTIFICATION_COUNT),
+    )
+    .await
+    .with_context(|| "timed out waiting for the active compaction request")?;
+    test.fs()
+        .write_file(
+            &during_compaction_gate,
+            b"ready".to_vec(),
+            /*sandbox*/ None,
+        )
+        .await?;
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if test
+                .fs()
+                .read_file(&during_compaction_batch_ready, /*sandbox*/ None)
+                .await
+                .is_ok()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .with_context(|| "timed out waiting for monitor output during compaction")?;
+    compact_release_tx
+        .send(())
+        .map_err(|_| anyhow::anyhow!("compaction response was dropped before release"))?;
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::ContextCompacted(_))
     })
@@ -545,13 +590,6 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
         .await
         .with_context(|| "local compaction response stage did not complete")?;
 
-    test.fs()
-        .write_file(
-            &after_compaction_gate,
-            b"ready".to_vec(),
-            /*sandbox*/ None,
-        )
-        .await?;
     timeout(
         Duration::from_secs(10),
         streaming_server.wait_for_request_count(4 + PRE_COMPACTION_NOTIFICATION_COUNT),
