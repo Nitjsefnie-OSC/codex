@@ -390,9 +390,10 @@ async fn start_if_idle(
         // user message for that turn.
         session
             .input_queue
-            .extend_pending_input_for_turn_state(
+            .extend_pending_input_batch_for_turn_state(
                 turn_state.as_ref(),
                 vec![pending_turn_input(input)],
+                crate::session::input_queue::PendingTurnProvenance::default(),
             )
             .await;
     }

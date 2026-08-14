@@ -232,7 +232,6 @@ use self::handlers::submission_loop;
 pub(crate) use self::input_queue::InputQueue;
 pub(crate) use self::input_queue::InputQueueActivity;
 pub(crate) use self::input_queue::PendingInputBatch;
-pub(crate) use self::input_queue::PendingParentTurn;
 pub(crate) use self::input_queue::PendingTurnProvenance;
 pub(crate) use self::input_queue::TurnInput;
 pub(crate) use self::input_queue::TurnInputQueue;
@@ -3384,6 +3383,10 @@ impl Session {
                 state.history.set_world_state_baseline(snapshot);
             }
         }
+        self.services
+            .unified_exec_manager
+            .begin_notification_window()
+            .await;
 
         self.persist_rollout_items(&[RolloutItem::Compacted(compacted_item)])
             .await;

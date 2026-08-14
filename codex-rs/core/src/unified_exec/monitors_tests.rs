@@ -34,6 +34,22 @@ fn a_noisy_monitor_stops_at_its_cap_and_counts_what_it_dropped() {
 }
 
 #[test]
+fn compaction_starts_a_new_notification_window_without_resetting_lifetime_stats() {
+    let mut counters = MonitorCounters::default();
+    for _ in 0..MAX_MONITOR_NOTIFICATIONS {
+        assert!(allowed_seq(counters.reserve()).is_some());
+    }
+    assert_eq!(allowed_seq(counters.reserve()), None);
+
+    counters.begin_notification_window();
+
+    assert_eq!(allowed_seq(counters.reserve()), Some(21));
+    assert_eq!(counters.delivered, 21);
+    assert_eq!(counters.suppressed, 1);
+    assert_eq!(counters.last_seq, 21);
+}
+
+#[test]
 fn the_terminal_notification_is_never_capped() {
     let mut counters = MonitorCounters::default();
     for _ in 0..MAX_MONITOR_NOTIFICATIONS + 10 {
@@ -44,6 +60,7 @@ fn the_terminal_notification_is_never_capped() {
 
     assert_eq!(terminal, MAX_MONITOR_NOTIFICATIONS + 1);
     assert_eq!(counters.last_seq, terminal);
+    assert_eq!(allowed_seq(counters.reserve()), None);
 }
 
 #[test]

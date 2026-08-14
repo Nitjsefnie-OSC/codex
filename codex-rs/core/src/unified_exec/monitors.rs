@@ -181,6 +181,7 @@ pub(crate) struct MonitorAttachment {
 pub(crate) struct MonitorCounters {
     next_seq: u64,
     delivered: u64,
+    delivered_in_window: u64,
     suppressed: u64,
     last_seq: u64,
     acknowledged_seq: u64,
@@ -188,14 +189,15 @@ pub(crate) struct MonitorCounters {
 
 impl MonitorCounters {
     /// Reserve a sequence number for a batch notification, or report that the
-    /// monitor's notification cap has already been spent.
+    /// monitor's notification cap for this context window has already been
+    /// spent.
     fn reserve(&mut self) -> NotificationSlot {
-        if self.delivered >= MAX_MONITOR_NOTIFICATIONS {
+        if self.delivered_in_window >= MAX_MONITOR_NOTIFICATIONS {
             self.suppressed += 1;
             return NotificationSlot::Suppressed;
         }
         NotificationSlot::Allowed {
-            seq: self.advance(),
+            seq: self.advance(true),
         }
     }
 
@@ -203,7 +205,13 @@ impl MonitorCounters {
     /// terminal notification is never capped — it is the one message that must
     /// always arrive.
     fn reserve_terminal(&mut self) -> u64 {
-        self.advance()
+        self.advance(false)
+    }
+
+    /// Start a new model-visible notification window after compaction has
+    /// successfully replaced the in-memory history.
+    fn begin_notification_window(&mut self) {
+        self.delivered_in_window = 0;
     }
 
     /// Record how far the caller has consumed the notifications. Acknowledgement
@@ -222,9 +230,12 @@ impl MonitorCounters {
         self.last_seq.saturating_sub(self.acknowledged_seq)
     }
 
-    fn advance(&mut self) -> u64 {
+    fn advance(&mut self, counts_toward_window: bool) -> u64 {
         self.next_seq += 1;
         self.delivered += 1;
+        if counts_toward_window {
+            self.delivered_in_window += 1;
+        }
         self.last_seq = self.next_seq;
         self.next_seq
     }
@@ -314,6 +325,10 @@ impl MonitorHandle {
 
     pub(crate) fn reserve_terminal_notification(&self) -> u64 {
         self.counters().reserve_terminal()
+    }
+
+    pub(crate) fn begin_notification_window(&self) {
+        self.counters().begin_notification_window();
     }
 
     pub(crate) fn suppressed_notifications(&self) -> u64 {
@@ -435,6 +450,12 @@ impl MonitorStore {
             .iter()
             .filter_map(|process_id| self.monitors.get(process_id).map(Arc::clone))
             .collect()
+    }
+
+    pub(crate) fn begin_notification_window(&self) {
+        for handle in self.monitors.values() {
+            handle.begin_notification_window();
+        }
     }
 
     /// Evict the oldest terminal record, falling back to the oldest record of
