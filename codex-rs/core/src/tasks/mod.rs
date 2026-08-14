@@ -745,7 +745,7 @@ impl Session {
             .lock_background_notification_delivery()
             .await;
         let mut publish_background_wake = false;
-        if let Some(mut active_turn) = self.take_active_turn(&reason).await {
+        if let Some(active_turn) = self.take_active_turn(&reason).await {
             if let Some(finishing) = active_turn.finishing.as_ref() {
                 let mut terminal_persisted = finishing.terminal_persisted.clone();
                 let terminal_is_persisted = *terminal_persisted.borrow();

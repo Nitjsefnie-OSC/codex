@@ -10792,7 +10792,7 @@ async fn abort_cleanup_history_is_durable_before_turn_aborted() {
     )
     .await;
     let cleanup_item = ResponseItem::Message {
-        id: Some("cleanup-item".to_string()),
+        id: Some(ResponseItemId::with_suffix("msg", "cleanup-item")),
         role: "assistant".to_string(),
         content: vec![ContentItem::OutputText {
             text: "cleanup persisted before abort".to_string(),

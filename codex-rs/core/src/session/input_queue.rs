@@ -1544,6 +1544,13 @@ mod tests {
         let (items, provenance) = input_queue
             .ordered_background_inputs(TurnInput::AgentCompletion(completion.clone()))
             .await;
+        let items = items
+            .into_iter()
+            .map(|item| {
+                item.materialize()
+                    .expect("mailbox input should materialize")
+            })
+            .collect::<Vec<_>>();
 
         assert_eq!(
             items,

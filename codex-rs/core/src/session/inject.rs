@@ -209,6 +209,7 @@ impl Session {
     /// it for the regular successor. At every other turn boundary the item is
     /// recorded first, so interruption, shutdown, and a competing user
     /// submission cannot erase it before the next model request.
+    #[cfg(test)]
     pub(crate) async fn deliver_monitor_notification(
         self: &Arc<Self>,
         notification: MonitorNotification,
