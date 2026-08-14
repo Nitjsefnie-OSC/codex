@@ -344,6 +344,27 @@ impl Session {
         let task: Arc<dyn AnySessionTask> = Arc::new(task);
         let task_kind = task.kind();
         let span_name = task.span_name();
+        let background_delivery_guard = loop {
+            let guard = self
+                .input_queue
+                .lock_background_notification_delivery()
+                .await;
+            let abort_complete = self
+                .active_turn
+                .lock()
+                .await
+                .as_ref()
+                .filter(|active_turn| active_turn.aborting)
+                .map(|active_turn| Arc::clone(&active_turn.abort_complete));
+            let Some(abort_complete) = abort_complete else {
+                break guard;
+            };
+            let notified = abort_complete.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            drop(guard);
+            notified.await;
+        };
         let started_at = Instant::now();
         let turn_started_at_unix_ms = turn_context
             .turn_timing_state
@@ -370,10 +391,6 @@ impl Session {
             .await
             .clear_turn(&turn_context.sub_id);
 
-        let background_delivery_guard = self
-            .input_queue
-            .lock_background_notification_delivery()
-            .await;
         let (mut pending_items, provenance) = if preserve_pending_input {
             (Vec::new(), PendingTurnProvenance::default())
         } else {
@@ -654,11 +671,15 @@ impl Session {
             }
             let task = active_turn.task.take().expect("active task was checked");
             active_turn.aborting = true;
-            (task, Arc::clone(&active_turn.turn_state))
+            (
+                task,
+                Arc::clone(&active_turn.turn_state),
+                Arc::clone(&active_turn.abort_complete),
+            )
         };
         drop(delivery_guard);
 
-        let (task, turn_state) = detached;
+        let (task, turn_state, abort_complete) = detached;
         let turn_context = self.cancel_task_for_abort(task, reason.clone()).await;
 
         let delivery_guard = self
@@ -677,6 +698,9 @@ impl Session {
                 &delivery_guard,
             )
             .await;
+        if let Err(err) = self.flush_rollout().await {
+            warn!("failed to flush abort cleanup before terminal event: {err}");
+        }
         self.emit_aborted_turn(&turn_context, reason).await;
 
         let active_turn = {
@@ -694,6 +718,7 @@ impl Session {
         }
         drop(delivery_guard);
         persisted.publish(&self.input_queue);
+        abort_complete.notify_waiters();
         Some(turn_context)
     }
 

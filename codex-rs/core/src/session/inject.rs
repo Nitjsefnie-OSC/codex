@@ -28,6 +28,7 @@ impl Session {
         provenance: crate::session::input_queue::PendingTurnProvenance,
         delivery_guard: tokio::sync::OwnedMutexGuard<()>,
     ) {
+        let has_items = !items.is_empty();
         let persisted = self
             .persist_background_input_batch_without_wake(
                 turn_context,
@@ -36,6 +37,9 @@ impl Session {
                 &delivery_guard,
             )
             .await;
+        if has_items && let Err(err) = self.flush_rollout().await {
+            tracing::warn!("failed to flush background notification before wake: {err}");
+        }
         persisted.publish(&self.input_queue);
     }
 
@@ -71,9 +75,6 @@ impl Session {
                         unreachable!("foreground input cannot enter background persistence")
                     }
                 }
-            }
-            if let Err(err) = self.flush_rollout().await {
-                tracing::warn!("failed to flush background notification before wake: {err}");
             }
         }
         PersistedBackgroundInputBatch {

@@ -92,6 +92,7 @@ use crate::rollout::recorder::RolloutRecorder;
 use crate::state::ActiveTurn;
 use crate::state::FinishingTurn;
 use crate::state::TaskKind;
+use crate::tasks::MailboxParentProvenance;
 use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskResult;
 use crate::tasks::UserShellCommandMode;
@@ -10101,6 +10102,20 @@ struct DeliverOnAbortTask {
     notification: MonitorNotification,
 }
 
+struct BlockingAbortTask {
+    abort_started: Arc<Notify>,
+    release_abort: Arc<Notify>,
+}
+
+struct BlockingStartTask {
+    started: Arc<Notify>,
+    run_count: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+struct RecordOnAbortTask {
+    item: ResponseItem,
+}
+
 struct TaskDropSignal {
     dropped: Arc<AtomicBool>,
 }
@@ -10213,6 +10228,83 @@ impl SessionTask for DeliverOnAbortTask {
     async fn abort(&self, session: Arc<Session>, ctx: Arc<TurnContext>) {
         session
             .deliver_monitor_notification(self.notification.clone(), ctx.as_ref())
+            .await;
+    }
+}
+
+impl SessionTask for BlockingAbortTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.blocking_abort"
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        _session: Arc<Session>,
+        _ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        cancellation_token: CancellationToken,
+    ) -> SessionTaskResult {
+        cancellation_token.cancelled().await;
+        Ok(None)
+    }
+
+    async fn abort(&self, _session: Arc<Session>, _ctx: Arc<TurnContext>) {
+        self.abort_started.notify_one();
+        self.release_abort.notified().await;
+    }
+}
+
+impl SessionTask for BlockingStartTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.blocking_start"
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        _session: Arc<Session>,
+        _ctx: Arc<TurnContext>,
+        input: Vec<TurnInput>,
+        cancellation_token: CancellationToken,
+    ) -> SessionTaskResult {
+        assert_eq!(input.len(), 1, "the pending start input must be preserved");
+        self.run_count.fetch_add(1, Ordering::AcqRel);
+        self.started.notify_one();
+        cancellation_token.cancelled().await;
+        Ok(None)
+    }
+}
+
+impl SessionTask for RecordOnAbortTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.record_on_abort"
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        _session: Arc<Session>,
+        _ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        cancellation_token: CancellationToken,
+    ) -> SessionTaskResult {
+        cancellation_token.cancelled().await;
+        Ok(None)
+    }
+
+    async fn abort(&self, session: Arc<Session>, ctx: Arc<TurnContext>) {
+        session
+            .record_conversation_items(ctx.as_ref(), std::slice::from_ref(&self.item))
             .await;
     }
 }
@@ -10586,6 +10678,166 @@ async fn abort_cleanup_delivery_is_persisted_before_turn_aborted() {
             .count(),
         "history reread at TurnAborted must include exactly one cleanup notification"
     );
+    assert!(rx.try_recv().is_err(), "no event may follow TurnAborted");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aborting_sentinel_blocks_direct_task_start_until_cleanup_finishes() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let abort_started = Arc::new(Notify::new());
+    let release_abort = Arc::new(Notify::new());
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        BlockingAbortTask {
+            abort_started: Arc::clone(&abort_started),
+            release_abort: Arc::clone(&release_abort),
+        },
+    )
+    .await;
+
+    let abort_task = tokio::spawn({
+        let sess = Arc::clone(&sess);
+        async move {
+            sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+        }
+    });
+    timeout(Duration::from_secs(2), abort_started.notified())
+        .await
+        .expect("abort hook should reach its delivery-lock-free wait");
+
+    let next_turn = sess
+        .new_default_turn_with_sub_id("next-turn-after-abort".to_string())
+        .await;
+    let started = Arc::new(Notify::new());
+    let run_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let start_task = tokio::spawn({
+        let sess = Arc::clone(&sess);
+        let started = Arc::clone(&started);
+        let run_count = Arc::clone(&run_count);
+        async move {
+            sess.start_task(
+                next_turn,
+                vec![TurnInput::UserInput {
+                    content: vec![UserInput::Text {
+                        text: "preserve this start".to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                    client_id: None,
+                }],
+                BlockingStartTask { started, run_count },
+                MailboxParentProvenance::Ignore,
+            )
+            .await;
+        }
+    });
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let active = sess.active_turn.lock().await;
+            if active
+                .as_ref()
+                .is_some_and(|active_turn| active_turn.aborting && active_turn.task.is_none())
+            {
+                break;
+            }
+            drop(active);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("abort should retain a taskless sentinel");
+    assert!(
+        !start_task.is_finished(),
+        "direct start must wait instead of replacing the aborting sentinel"
+    );
+
+    release_abort.notify_one();
+    abort_task.await.expect("abort transaction should complete");
+    timeout(Duration::from_secs(2), started.notified())
+        .await
+        .expect("pending direct start should run after the sentinel clears");
+    assert_eq!(1, run_count.load(Ordering::Acquire));
+    assert!(
+        sess.active_turn
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|active_turn| active_turn.task.as_ref())
+            .is_some(),
+        "the successor task should remain installed exactly once"
+    );
+    start_task
+        .await
+        .expect("direct start should finish dispatching");
+
+    sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abort_cleanup_history_is_durable_before_turn_aborted() {
+    let (mut sess, tc, rx) = make_session_and_context_with_rx().await;
+    let store = attach_in_memory_thread_store(
+        Arc::get_mut(&mut sess).expect("session should be uniquely owned"),
+    )
+    .await;
+    let cleanup_item = ResponseItem::Message {
+        id: Some("cleanup-item".to_string()),
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText {
+            text: "cleanup persisted before abort".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        RecordOnAbortTask {
+            item: cleanup_item.clone(),
+        },
+    )
+    .await;
+
+    sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+
+    let mut cleanup_event_seen = false;
+    loop {
+        let event = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("turn abort event should be delivered")
+            .expect("event channel should remain open");
+        match &event.msg {
+            EventMsg::RawResponseItem(RawResponseItemEvent { item }) if item == &cleanup_item => {
+                cleanup_event_seen = true
+            }
+            EventMsg::TurnAborted(_) => break,
+            _ => {}
+        }
+    }
+
+    assert!(cleanup_event_seen);
+    let durable_history = sess
+        .live_thread()
+        .expect("test should have persisted thread")
+        .load_history(/*include_archived*/ true)
+        .await
+        .expect("durable history should be readable at TurnAborted");
+    let cleanup_index = durable_history.items.iter().position(
+        |item| matches!(item, RolloutItem::ResponseItem(envelope) if envelope.item == cleanup_item),
+    );
+    let terminal_index = durable_history
+        .items
+        .iter()
+        .position(|item| matches!(item, RolloutItem::EventMsg(EventMsg::TurnAborted(_))));
+    assert!(
+        cleanup_index.is_some_and(|cleanup_index| {
+            terminal_index.is_some_and(|terminal_index| cleanup_index < terminal_index)
+        }),
+        "abort cleanup must be durable before TurnAborted in rollout order"
+    );
+    let calls = wait_for_flush_count(&store, /*expected_flushes*/ 3).await;
+    assert_eq!(3, calls.flush_thread);
     assert!(rx.try_recv().is_err(), "no event may follow TurnAborted");
 }
 
