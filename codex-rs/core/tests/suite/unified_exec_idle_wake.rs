@@ -478,7 +478,7 @@ async fn yielded_exec_completion_during_compaction_wakes_successor_once() -> Res
 
     let requests = streaming_server.requests().await;
     let successor_requests = &requests[3..];
-    let completion_notifications = developer_input_texts(successor_requests[0])?
+    let completion_notifications = developer_input_texts(&successor_requests[0])?
         .into_iter()
         .filter(|text| text.contains("<exec_command_completion>"))
         .collect::<Vec<_>>();
