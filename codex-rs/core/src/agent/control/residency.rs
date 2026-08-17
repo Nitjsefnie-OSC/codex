@@ -236,6 +236,12 @@ async fn is_unloadable(thread: &CodexThread) -> bool {
         AgentStatus::Completed(_) | AgentStatus::Errored(_) | AgentStatus::Interrupted
     ) && thread.session.active_turn.lock().await.is_none()
         && !thread.session.input_queue.has_pending_mailbox_items().await
+        && !thread
+            .session
+            .services
+            .agent_control
+            .has_live_descendants(thread.session.thread_id)
+            .await
 }
 
 #[cfg(test)]

@@ -6,6 +6,8 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::Weak;
 
 use codex_exec_server::EnvironmentManager;
 use codex_extension_api::LoadUserInstructionsFuture;
@@ -30,6 +32,77 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::protocol::SessionSource;
 use once_cell::sync::Lazy;
+
+struct BackgroundInputAdmissionHook {
+    turn_id: String,
+    notify: Weak<tokio::sync::Notify>,
+}
+
+static BACKGROUND_INPUT_ADMISSION_HOOKS: Lazy<Mutex<Vec<BackgroundInputAdmissionHook>>> =
+    Lazy::new(|| Mutex::new(Vec::new()));
+
+/// The per-window cap used for model-visible monitor notifications.
+pub const MONITOR_NOTIFICATION_WINDOW_LIMIT: usize =
+    unified_exec::MAX_MONITOR_NOTIFICATIONS as usize;
+
+/// Test-only guard for observing background input admission into an active
+/// compaction turn.
+pub struct BackgroundInputAdmissionGuard {
+    turn_id: String,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for BackgroundInputAdmissionGuard {
+    fn drop(&mut self) {
+        let mut hooks = BACKGROUND_INPUT_ADMISSION_HOOKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        hooks.retain(|hook| {
+            hook.turn_id != self.turn_id
+                || hook
+                    .notify
+                    .upgrade()
+                    .is_some_and(|notify| !Arc::ptr_eq(&notify, &self.notify))
+        });
+    }
+}
+
+/// Install a test hook and return a notification future source. The hook is
+/// intentionally outside the model/session API; production code only emits a
+/// notification when a test has explicitly installed one. Admission is keyed
+/// by the active compaction turn id so parallel sessions cannot wake one
+/// another's test.
+pub fn install_background_input_admission_hook(
+    turn_id: impl Into<String>,
+) -> (BackgroundInputAdmissionGuard, Arc<tokio::sync::Notify>) {
+    let turn_id = turn_id.into();
+    let notify = Arc::new(tokio::sync::Notify::new());
+    BACKGROUND_INPUT_ADMISSION_HOOKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(BackgroundInputAdmissionHook {
+            turn_id: turn_id.clone(),
+            notify: Arc::downgrade(&notify),
+        });
+    (
+        BackgroundInputAdmissionGuard {
+            turn_id,
+            notify: Arc::clone(&notify),
+        },
+        notify,
+    )
+}
+
+pub(crate) fn notify_background_input_admission(turn_id: &str) {
+    let hooks = BACKGROUND_INPUT_ADMISSION_HOOKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for hook in hooks.iter().filter(|hook| hook.turn_id == turn_id) {
+        if let Some(notify) = hook.notify.upgrade() {
+            notify.notify_one();
+        }
+    }
+}
 
 use crate::ThreadManager;
 use crate::config::Config;

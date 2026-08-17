@@ -79,23 +79,26 @@ pub(super) fn resolve_tool_response(
     let tc = std::pin::pin!(v8::TryCatch::new(scope));
     let mut tc = tc.init();
     let resolver = v8::Local::new(&tc, &resolver);
-    match response {
+    let settled = match response {
         Ok(result) => {
             let value = json_to_v8(&mut tc, &result)
                 .ok_or_else(|| "failed to serialize tool response".to_string())?;
-            resolver.resolve(&tc, value);
+            resolver.resolve(&tc, value)
         }
         Err(error_text) => {
             let value = v8::String::new(&tc, &error_text)
                 .ok_or_else(|| "failed to allocate tool error".to_string())?;
-            resolver.reject(&tc, value.into());
+            resolver.reject(&tc, value.into())
         }
-    }
+    };
     if tc.has_caught() {
         return Err(tc
             .exception()
             .map(|exception| value_to_error_text(&mut tc, exception))
             .unwrap_or_else(|| "unknown code mode exception".to_string()));
+    }
+    if settled != Some(true) {
+        return Err("code mode tool promise could not be settled".to_string());
     }
     Ok(())
 }

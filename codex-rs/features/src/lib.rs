@@ -126,6 +126,9 @@ pub enum Feature {
     UnifiedExec,
     /// Allow unified exec commands to allocate an interactive terminal.
     UnifiedExecTty,
+    /// Expose the `monitor` tool for running long-lived work on the unified
+    /// exec process manager with model-visible progress notifications.
+    MonitorTool,
     /// Route shell tool execution through the zsh exec bridge.
     ShellZshFork,
     /// Allow unified exec to compose with the zsh exec bridge.
@@ -937,6 +940,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::UnifiedExecTty,
         key: "unified_exec_tty",
+        stage: Stage::Stable,
+        default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::MonitorTool,
+        key: "monitor_tool",
         stage: Stage::Stable,
         default_enabled: true,
     },

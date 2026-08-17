@@ -82,6 +82,10 @@ impl SessionTask for UserShellCommandTask {
         "session_task.user_shell"
     }
 
+    fn accepts_background_notifications(&self) -> bool {
+        false
+    }
+
     async fn run(
         self: Arc<Self>,
         session: Arc<Session>,

@@ -63,7 +63,155 @@ fn assert_literal_plan_prompt(chat: &ChatWidget, op: Result<Op, TryRecvError>, p
 }
 
 #[tokio::test]
-async fn plan_draft_footer_snapshot() {
+async fn plan_mode_nudge_shows_only_for_eligible_default_mode_drafts() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    set_composer_text(&mut chat, "make a plan");
+    chat.pre_draw_tick();
+    assert!(chat.bottom_pane.plan_mode_nudge_visible());
+
+    set_composer_text(&mut chat, "/plan");
+    chat.pre_draw_tick();
+    assert!(!chat.bottom_pane.plan_mode_nudge_visible());
+
+    set_composer_text(&mut chat, "!plan");
+    chat.pre_draw_tick();
+    assert!(!chat.bottom_pane.plan_mode_nudge_visible());
+
+    set_composer_text(&mut chat, "make a plan");
+    let plan_mask = collaboration_modes::plan_mask(chat.model_catalog.as_ref())
+        .expect("expected plan collaboration mode");
+    chat.set_collaboration_mask(plan_mask);
+    chat.pre_draw_tick();
+    assert!(!chat.bottom_pane.plan_mode_nudge_visible());
+}
+
+#[tokio::test]
+async fn plan_mode_nudge_hides_while_task_or_modal_is_active() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    set_composer_text(&mut chat, "make a plan");
+    chat.pre_draw_tick();
+    assert!(chat.bottom_pane.plan_mode_nudge_visible());
+
+    chat.on_task_started();
+    chat.pre_draw_tick();
+    assert!(!chat.bottom_pane.plan_mode_nudge_visible());
+
+    chat.on_task_complete(
+        /*last_agent_message*/ None, /*duration_ms*/ None, /*from_replay*/ false,
+    );
+    chat.show_selection_view(SelectionViewParams {
+        items: vec![SelectionItem {
+            name: "Keep planning".to_string(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    chat.pre_draw_tick();
+    assert!(!chat.bottom_pane.plan_mode_nudge_visible());
+}
+
+#[tokio::test]
+async fn plan_mode_nudge_dismissal_is_scoped_to_current_thread() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    let first_thread = ThreadId::new();
+    let second_thread = ThreadId::new();
+    chat.thread_id = Some(first_thread);
+    set_composer_text(&mut chat, "make a plan");
+    chat.pre_draw_tick();
+    assert!(chat.bottom_pane.plan_mode_nudge_visible());
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    chat.pre_draw_tick();
+    assert!(!chat.bottom_pane.plan_mode_nudge_visible());
+
+    chat.thread_id = Some(second_thread);
+    chat.pre_draw_tick();
+    assert!(chat.bottom_pane.plan_mode_nudge_visible());
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    chat.pre_draw_tick();
+    assert!(!chat.bottom_pane.plan_mode_nudge_visible());
+
+    chat.thread_id = Some(first_thread);
+    chat.pre_draw_tick();
+    assert!(!chat.bottom_pane.plan_mode_nudge_visible());
+}
+
+#[tokio::test]
+async fn plan_mode_nudge_shift_tab_uses_existing_mode_cycle_path() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    set_composer_text(&mut chat, "make a plan");
+    chat.pre_draw_tick();
+    assert!(chat.bottom_pane.plan_mode_nudge_visible());
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::BackTab));
+    chat.pre_draw_tick();
+    assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Plan);
+    assert!(!chat.bottom_pane.plan_mode_nudge_visible());
+}
+
+/// `tui.show_prompt_suggestions = false` must remove the `Create a plan?` nudge
+/// from the rendered footer without taking Plan mode away.
+///
+/// The first half is the non-vacuity control: the same draft renders the nudge
+/// while the setting is enabled.
+#[tokio::test]
+async fn plan_mode_nudge_hidden_when_prompt_suggestions_disabled() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    assert!(
+        chat.config.tui_show_prompt_suggestions,
+        "default must preserve upstream behavior"
+    );
+    set_composer_text(&mut chat, "make a plan");
+    chat.pre_draw_tick();
+    assert!(chat.bottom_pane.plan_mode_nudge_visible());
+    assert!(
+        render_bottom_popup(&chat, /*width*/ 80).contains("Create a plan?"),
+        "control: the nudge renders while prompt suggestions are enabled"
+    );
+
+    chat.config.tui_show_prompt_suggestions = false;
+    chat.sync_prompt_suggestions_enabled();
+    set_composer_text(&mut chat, "make a plan");
+    chat.pre_draw_tick();
+    assert!(!chat.bottom_pane.plan_mode_nudge_visible());
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(
+        !popup.contains("Create a plan?"),
+        "expected no plan nudge when suggestions are disabled, got: {popup:?}"
+    );
+    assert!(
+        popup.contains("make a plan"),
+        "the draft must still render while the nudge is suppressed, got: {popup:?}"
+    );
+    assert_chatwidget_snapshot!(
+        "plan_mode_nudge_prompt_suggestions_disabled",
+        normalize_snapshot_paths(popup),
+    );
+
+    // Rebase guard: forcing visibility through the composer boundary must still
+    // render nothing, so a future call site cannot bypass the setting.
+    chat.bottom_pane
+        .set_plan_mode_nudge_visible(/*visible*/ true);
+    assert!(!chat.bottom_pane.plan_mode_nudge_visible());
+    let forced_popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(
+        !forced_popup.contains("Create a plan?"),
+        "expected forced nudge visibility to stay suppressed, got: {forced_popup:?}"
+    );
+
+    // Explicit mode switching is untouched: Shift-Tab still enters Plan mode.
+    chat.handle_key_event(KeyEvent::from(KeyCode::BackTab));
+    chat.pre_draw_tick();
+    assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Plan);
+    assert!(
+        !render_bottom_popup(&chat, /*width*/ 80).contains("Create a plan?"),
+        "entering Plan mode must not reintroduce the suggestion"
+    );
+}
+
+#[tokio::test]
+async fn plan_mode_nudge_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
     chat.set_token_info(Some(make_token_info(
         /*total_tokens*/ 50_000, /*context_window*/ 100_000,

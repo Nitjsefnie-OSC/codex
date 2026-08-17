@@ -99,6 +99,7 @@ use codex_tools::create_tools_raw_json_for_responses_api;
 use eventsource_stream::Event;
 use eventsource_stream::EventStreamError;
 use futures::StreamExt;
+use futures::future::BoxFuture;
 use http::HeaderMap as ApiHeaderMap;
 use http::HeaderValue;
 use http::StatusCode;
@@ -217,6 +218,19 @@ fn reasoning_effort_for_request(
         ReasoningEffortConfig::Persistent => ReasoningEffortConfig::Custom("disabled".to_string()),
         effort => effort,
     }
+}
+
+/// Resolves the reasoning effort that the request builder puts on the wire.
+///
+/// Keep the default selection and the `Ultra` wire spelling in one place so
+/// request metadata reported by tools cannot drift from the request body.
+pub(crate) fn request_reasoning_effort(
+    model_info: &ModelInfo,
+    effort: Option<ReasoningEffortConfig>,
+) -> Option<ReasoningEffortConfig> {
+    effort
+        .or_else(|| model_info.default_reasoning_level.clone())
+        .map(reasoning_effort_for_request)
 }
 
 fn session_telemetry_for_request(
@@ -910,9 +924,7 @@ impl ModelClient {
         summary: ReasoningSummaryConfig,
     ) -> Reasoning {
         Reasoning {
-            effort: effort
-                .or_else(|| model_info.default_reasoning_level.clone())
-                .map(|effort| reasoning_effort_for_request(model_info, effort)),
+            effort: request_reasoning_effort(model_info, effort),
             summary: (model_info.supports_reasoning_summary_parameter
                 && summary != ReasoningSummaryConfig::None)
                 .then_some(summary),
@@ -1486,6 +1498,13 @@ impl ModelClientSession {
         Ok(())
     }
     /// Returns a websocket connection for this turn.
+    fn websocket_connection<'a>(
+        &'a mut self,
+        params: WebsocketConnectParams<'a>,
+    ) -> BoxFuture<'a, std::result::Result<&'a ApiWebSocketConnection, ApiError>> {
+        Box::pin(async move { self.websocket_connection_inner(params).await })
+    }
+
     #[instrument(
         name = "model_client.websocket_connection",
         level = "info",
@@ -1498,10 +1517,10 @@ impl ModelClientSession {
             turn.has_metadata_header = params.responses_metadata.has_turn_metadata()
         )
     )]
-    async fn websocket_connection(
-        &mut self,
-        params: WebsocketConnectParams<'_>,
-    ) -> std::result::Result<&ApiWebSocketConnection, ApiError> {
+    async fn websocket_connection_inner<'a>(
+        &'a mut self,
+        params: WebsocketConnectParams<'a>,
+    ) -> std::result::Result<&'a ApiWebSocketConnection, ApiError> {
         let WebsocketConnectParams {
             session_telemetry,
             api_provider,
@@ -1517,7 +1536,6 @@ impl ModelClientSession {
             }
             None => true,
         };
-
         if needs_new {
             self.reset_websocket_session();
             let new_conn = match self
@@ -1735,6 +1753,37 @@ impl ModelClientSession {
 
     /// Streams a turn via the Responses API over WebSocket transport.
     #[allow(clippy::too_many_arguments)]
+    fn stream_responses_websocket<'a>(
+        &'a mut self,
+        prompt: &'a Prompt,
+        model_info: &'a ModelInfo,
+        session_telemetry: &'a SessionTelemetry,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        service_tier: Option<String>,
+        responses_metadata: &'a CodexResponsesMetadata,
+        warmup: bool,
+        request_trace: Option<W3cTraceContext>,
+        inference_trace: &'a InferenceTraceContext,
+    ) -> BoxFuture<'a, Result<WebsocketStreamOutcome>> {
+        Box::pin(async move {
+            self.stream_responses_websocket_inner(
+                prompt,
+                model_info,
+                session_telemetry,
+                effort,
+                summary,
+                service_tier,
+                responses_metadata,
+                warmup,
+                request_trace,
+                inference_trace,
+            )
+            .await
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     #[instrument(
         name = "model_client.stream_responses_websocket",
         level = "info",
@@ -1748,18 +1797,18 @@ impl ModelClientSession {
             websocket.warmup = warmup
         )
     )]
-    async fn stream_responses_websocket(
-        &mut self,
-        prompt: &Prompt,
-        model_info: &ModelInfo,
-        session_telemetry: &SessionTelemetry,
+    async fn stream_responses_websocket_inner<'a>(
+        &'a mut self,
+        prompt: &'a Prompt,
+        model_info: &'a ModelInfo,
+        session_telemetry: &'a SessionTelemetry,
         effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
         service_tier: Option<String>,
-        responses_metadata: &CodexResponsesMetadata,
+        responses_metadata: &'a CodexResponsesMetadata,
         warmup: bool,
         request_trace: Option<W3cTraceContext>,
-        inference_trace: &InferenceTraceContext,
+        inference_trace: &'a InferenceTraceContext,
     ) -> Result<WebsocketStreamOutcome> {
         let provider = Arc::clone(&self.client.state.provider);
         let auth_manager = provider.auth_manager();
@@ -2050,16 +2099,43 @@ impl ModelClientSession {
     /// fall back to the HTTP Responses API transport otherwise. The trace context may be enabled or
     /// disabled, but is always explicit so transport paths do not need separate trace/no-trace
     /// branches.
-    pub async fn stream(
-        &mut self,
-        prompt: &Prompt,
-        model_info: &ModelInfo,
-        session_telemetry: &SessionTelemetry,
+    pub fn stream<'a>(
+        &'a mut self,
+        prompt: &'a Prompt,
+        model_info: &'a ModelInfo,
+        session_telemetry: &'a SessionTelemetry,
         effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
         service_tier: Option<String>,
-        responses_metadata: &CodexResponsesMetadata,
-        inference_trace: &InferenceTraceContext,
+        responses_metadata: &'a CodexResponsesMetadata,
+        inference_trace: &'a InferenceTraceContext,
+    ) -> BoxFuture<'a, Result<ResponseStream>> {
+        Box::pin(async move {
+            self.stream_inner(
+                prompt,
+                model_info,
+                session_telemetry,
+                effort,
+                summary,
+                service_tier,
+                responses_metadata,
+                inference_trace,
+            )
+            .await
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_inner<'a>(
+        &'a mut self,
+        prompt: &'a Prompt,
+        model_info: &'a ModelInfo,
+        session_telemetry: &'a SessionTelemetry,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        service_tier: Option<String>,
+        responses_metadata: &'a CodexResponsesMetadata,
+        inference_trace: &'a InferenceTraceContext,
     ) -> Result<ResponseStream> {
         let wire_api = self.client.state.provider.info().wire_api;
         match wire_api {

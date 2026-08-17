@@ -1,7 +1,7 @@
 use super::residency::is_v2_resident_session_source;
 use super::*;
 use crate::agent::role::apply_role_to_config;
-use crate::codex_thread::CodexThread;
+use crate::agent::role::apply_role_to_config_for_multi_agent_v2;
 use crate::config::PermissionProfileSnapshot;
 use crate::context::ContextualUserFragment;
 use crate::context::CurrentTimeReminder;
@@ -278,30 +278,35 @@ impl AgentControl {
         .await
     }
 
-    fn validate_loaded_v2_child(
+    pub(crate) fn ensure_v2_agent_loaded(
         &self,
-        thread: &CodexThread,
-        parent_thread_id: ThreadId,
-    ) -> CodexResult<()> {
-        if thread.is_running()
-            && thread.multi_agent_version() == Some(MultiAgentVersion::V2)
-            && thread.session_source.parent_thread_id() == Some(parent_thread_id)
-            && Arc::ptr_eq(&self.state, &thread.session.services.agent_control.state)
-        {
-            return Ok(());
-        }
-        Err(CodexErr::InvalidRequest(format!(
-            "multi-agent v2 child {} is not owned by its loaded parent",
-            thread.session.thread_id
-        )))
+        config: Config,
+        thread_id: ThreadId,
+    ) -> BoxFuture<'_, CodexResult<()>> {
+        Box::pin(self.ensure_v2_agent_loaded_with_admission(
+            config,
+            thread_id,
+            V2ReloadAdmission::CapacityBounded,
+        ))
     }
 
-    /// A provided parent enables owner-validated reloads; `None` preserves sender-driven reloads.
-    pub(crate) async fn ensure_v2_agent_loaded(
+    pub(crate) fn ensure_v2_agent_loaded_for_completion(
+        &self,
+        config: Config,
+        thread_id: ThreadId,
+    ) -> BoxFuture<'_, CodexResult<()>> {
+        Box::pin(self.ensure_v2_agent_loaded_with_admission(
+            config,
+            thread_id,
+            V2ReloadAdmission::CompletionDelivery,
+        ))
+    }
+
+    async fn ensure_v2_agent_loaded_with_admission(
         &self,
         mut config: Config,
         thread_id: ThreadId,
-        parent: Option<Arc<CodexThread>>,
+        admission: V2ReloadAdmission,
     ) -> CodexResult<()> {
         let state = self.upgrade()?;
         let parent = if let Some(parent) = parent {
@@ -364,26 +369,11 @@ impl AgentControl {
         let (session_source, _) = initial_history
             .get_resumed_session_sources()
             .unwrap_or((stored_source, None));
-        if let Some(parent_thread_id) = owner_thread_id {
-            if session_source.parent_thread_id() != Some(parent_thread_id)
-                || initial_history
-                    .get_resumed_parent_thread_id()
-                    .is_some_and(|recorded_parent| recorded_parent != parent_thread_id)
-                || stored_parent_thread_id
-                    .is_some_and(|recorded_parent| recorded_parent != parent_thread_id)
-            {
-                return Err(CodexErr::InvalidRequest(format!(
-                    "cannot resume multi-agent v2 child {thread_id}: recorded parent ownership is inconsistent"
-                )));
-            }
-            if let Ok(thread) = state.get_thread(thread_id).await {
-                self.validate_loaded_v2_child(&thread, parent_thread_id)?;
-                self.touch_loaded_v2_residency(&state, thread_id).await;
-                return Ok(());
-            }
-        }
-        config.model_reasoning_effort = stored_reasoning_effort;
-        if let Some(role_name) = session_source.get_agent_role() {
+        if matches!(
+            &session_source,
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
+        ) {
+            let role_name = session_source.get_agent_role();
             let runtime_approval_policy = config.permissions.approval_policy.value();
             let runtime_approvals_reviewer = config.approvals_reviewer;
             let runtime_cwd = config.cwd.clone();
@@ -400,7 +390,7 @@ impl AgentControl {
                 ),
             };
 
-            apply_role_to_config(&mut config, Some(&role_name))
+            apply_role_to_config_for_multi_agent_v2(&mut config, role_name.as_deref())
                 .await
                 .map_err(CodexErr::InvalidRequest)?;
             config
@@ -435,117 +425,13 @@ impl AgentControl {
                 })?;
             config.model_provider_id = stored_model_provider;
         }
-        let parent_thread_id = owner_thread_id
-            .or_else(|| initial_history.get_resumed_parent_thread_id())
-            .or(stored_parent_thread_id);
-        let (inherited_environments, inherited_exec_policy, client_mcp_extensions) = if let Some(
-            (parent, parent_environments),
-        ) =
-            parent.as_ref()
-        {
-            let parent_config = parent.session.get_config().await;
-            if !crate::exec_policy::child_uses_parent_exec_policy(&parent_config, &config) {
-                return Err(CodexErr::InvalidRequest(format!(
-                    "cannot resume multi-agent v2 child {thread_id}: parent execution policy has changed; retry through the parent"
-                )));
-            }
-            if let Some(selections) = environment_selections.as_mut() {
-                for selection in selections {
-                    let environment_id = &selection.environment_id;
-                    let invalid_environment = |reason: &str| {
-                        CodexErr::InvalidRequest(format!(
-                            "cannot resume multi-agent v2 child {thread_id}: cached environment {environment_id} {reason}"
-                        ))
-                    };
-                    // Matching the attachment also keeps startup on the captured owner executor.
-                    let owner_environment = parent_environments
-                        .turn_environments()
-                        .find(|environment| {
-                            let parent_selection = &environment.selection;
-                            parent_selection.environment_id == selection.environment_id
-                                && parent_selection.cwd == selection.cwd
-                                && parent_selection.workspace_roots == selection.workspace_roots
-                        })
-                        .ok_or_else(|| {
-                            invalid_environment("no longer matches a ready parent environment")
-                        })?;
-                    let owner_config = owner_environment.config();
-                    let child_config = match &selection.config {
-                        EnvironmentConfigState::FromThread => {
-                            // Pin current owner authority instead of re-inferring child settings.
-                            selection.config = EnvironmentConfigState::Ready(owner_config.clone());
-                            continue;
-                        }
-                        EnvironmentConfigState::Ready(config) => config,
-                        EnvironmentConfigState::Pending | EnvironmentConfigState::Failed(_) => {
-                            return Err(invalid_environment("configuration is not ready"));
-                        }
-                    };
-                    let mut bounded_config = child_config.clone();
-                    bounded_config.permission_profile = owner_config.permission_profile.clone();
-                    if bounded_config != *owner_config {
-                        return Err(invalid_environment(
-                            "configuration differs from the current parent",
-                        ));
-                    }
-                    if child_config.permission_profile == owner_config.permission_profile {
-                        continue;
-                    }
-                    if owner_environment.environment.is_remote() {
-                        return Err(invalid_environment(
-                            "permissions changed on a remote executor",
-                        ));
-                    }
-                    let cwd = selection.cwd.to_abs_path().map_err(|_| {
-                        invalid_environment("working directory is not a local absolute path")
-                    })?;
-                    let roots = owner_environment
-                        .workspace_roots()
-                        .iter()
-                        .map(PathUri::to_abs_path)
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(|_| {
-                            invalid_environment("workspace roots are not local absolute paths")
-                        })?;
-                    let authority = owner_environment
-                        .permission_profile()
-                        .clone()
-                        .materialize_project_roots_with_workspace_roots(&roots);
-                    let requested = child_config
-                        .permission_profile
-                        .permission_profile()
-                        .clone()
-                        .materialize_project_roots_with_workspace_roots(&roots);
-                    let permissions =
-                        intersect_effective_permission_profiles(&authority, &requested, &cwd)
-                            .map_err(|err| {
-                                invalid_environment(&format!(
-                                    "permissions cannot be intersected safely: {err}"
-                                ))
-                            })?;
-                    bounded_config.permission_profile =
-                        PermissionProfileSnapshot::legacy(permissions);
-                    selection.config = EnvironmentConfigState::Ready(bounded_config);
-                }
-            }
-            (
-                Some(parent_environments.clone()),
-                Some(Arc::clone(&parent.session.services.exec_policy)),
-                Some(parent.client_mcp_extensions()),
-            )
-        } else {
-            (
-                self.inherited_environments_for_source(&state, Some(&session_source))
-                    .await,
-                self.inherited_exec_policy_for_source(&state, Some(&session_source), &config)
-                    .await,
-                None,
-            )
+        let residency_slot = match admission {
+            V2ReloadAdmission::CapacityBounded => Some(
+                self.reserve_v2_residency_slot(&state, &config, Some(thread_id))
+                    .await?,
+            ),
+            V2ReloadAdmission::CompletionDelivery => None,
         };
-        // Reserving a slot can evict an idle nested parent. Keep its authority captured above.
-        let residency_slot = self
-            .reserve_v2_residency_slot(&state, &config, Some(thread_id))
-            .await?;
 
         match state
             .resume_thread_with_history_with_source(ResumeThreadWithHistoryOptions {
@@ -566,7 +452,12 @@ impl AgentControl {
                     self.validate_loaded_v2_child(&reloaded_thread.thread, parent_thread_id)?;
                 }
                 self.state.clear_evicted_environments(thread_id);
-                residency_slot.commit(reloaded_thread.thread_id);
+                if let Some(residency_slot) = residency_slot {
+                    residency_slot.commit(reloaded_thread.thread_id);
+                } else {
+                    self.touch_loaded_v2_residency(&state, reloaded_thread.thread_id)
+                        .await;
+                }
                 state.notify_thread_created(reloaded_thread.thread_id);
                 Ok(())
             }
@@ -992,9 +883,10 @@ impl AgentControl {
             }
 
             match item {
-                RolloutItem::ResponseItem(response_item) => {
-                    retain_forked_item(response_item, &mut replaced_parent_developer_instructions)
-                }
+                RolloutItem::ResponseItem(response_item) => retain_forked_item(
+                    &mut response_item.item,
+                    &mut replaced_parent_developer_instructions,
+                ),
                 RolloutItem::Compacted(compacted) => {
                     // This checkpoint belongs to the inherited parent prefix.
                     compacted.latest_token_usage_record = None;

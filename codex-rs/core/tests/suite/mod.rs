@@ -109,11 +109,14 @@ mod model_switching;
 mod model_visible_layout;
 mod models_cache_ttl;
 mod models_etag_responses;
+#[cfg(unix)]
+mod monitor;
 mod multi_agent_mode;
 mod multi_agent_resume;
 #[cfg(unix)]
 mod multi_exec_server_sandbox;
 mod network_approval;
+mod notification_interrupt;
 mod openai_file_mcp;
 mod otel;
 mod override_updates;
@@ -177,6 +180,8 @@ mod truncation;
 mod turn_input_submission;
 mod turn_state;
 mod unified_exec;
+#[cfg(unix)]
+mod unified_exec_idle_wake;
 mod unified_exec_process_events;
 mod unified_exec_stdin_approval;
 mod unified_exec_stdin_review_size;
@@ -188,6 +193,7 @@ mod user_shell_cmd;
 mod view_image;
 mod web_search;
 mod websocket_fallback;
+mod whoami;
 mod window_headers;
 #[cfg(target_os = "windows")]
 mod windows_sandbox;

@@ -1,20 +1,22 @@
-use codex_protocol::AgentPath;
-
 use super::ContextualUserFragment;
 use codex_protocol::models::ContentItemKind;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InterAgentCompletionMessage {
-    task_name: AgentPath,
-    sender: AgentPath,
+    task_name: String,
+    sender: String,
     payload: String,
 }
 
 impl InterAgentCompletionMessage {
-    pub(crate) fn new(task_name: AgentPath, sender: AgentPath, payload: impl Into<String>) -> Self {
+    pub(crate) fn new(
+        task_name: impl Into<String>,
+        sender: impl Into<String>,
+        payload: impl Into<String>,
+    ) -> Self {
         Self {
-            task_name,
-            sender,
+            task_name: task_name.into(),
+            sender: sender.into(),
             payload: payload.into(),
         }
     }

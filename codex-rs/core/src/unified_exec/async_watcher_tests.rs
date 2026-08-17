@@ -57,6 +57,7 @@ async fn streaming_output_harness() -> anyhow::Result<StreamingOutputHarness> {
         crate::session::step_context::StepContext::for_test(turn),
         tokio_util::sync::CancellationToken::new(),
         "streaming-output-test".to_string(),
+        crate::unified_exec::InitialExecCommandOutputDestination::Rollout,
     );
     let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
     start_streaming_output(&process, &context, Arc::clone(&transcript));
@@ -226,7 +227,7 @@ async fn exit_watcher_waits_for_late_network_denial_before_classifying_end() -> 
 
     #[allow(deprecated)]
     let cwd = context.step_context.turn.cwd.clone().into();
-    spawn_exit_watcher(
+    let watcher = spawn_exit_watcher(
         Arc::clone(&process),
         Arc::clone(&context.session),
         Arc::clone(&context.step_context.turn),
@@ -239,6 +240,7 @@ async fn exit_watcher_waits_for_late_network_denial_before_classifying_end() -> 
         Instant::now(),
         Some(network_denial_monitor),
         /*plugin_metrics_sidecar*/ None,
+        /*completion_notification*/ None,
     );
 
     let exited_at = Instant::now();
@@ -270,6 +272,7 @@ async fn exit_watcher_waits_for_late_network_denial_before_classifying_end() -> 
         elapsed >= Duration::from_millis(10) && elapsed < TRAILING_OUTPUT_GRACE,
         "completion should wait for denial without falling back to the output grace: {elapsed:?}"
     );
+    watcher.await.expect("exit watcher");
 
     Ok(())
 }

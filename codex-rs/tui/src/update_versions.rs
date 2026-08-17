@@ -5,9 +5,16 @@ pub(crate) fn is_newer(latest: &str, current: &str) -> Option<bool> {
     }
 }
 
+/// Strips the release-channel tag prefix off a release tag.
+///
+/// The prefix comes from the fork manifest rather than being hard-coded,
+/// because it identifies the channel: upstream tags `rust-v1.5.0`, the fork
+/// tags `fork-v1.5.0`, and a tag from the wrong channel must fail to parse
+/// rather than be read as an available upgrade.
 pub(crate) fn extract_version_from_latest_tag(latest_tag_name: &str) -> anyhow::Result<String> {
+    let prefix = &codex_fork_manifest::manifest().release_channel.tag_prefix;
     latest_tag_name
-        .strip_prefix("rust-v")
+        .strip_prefix(prefix.as_str())
         .map(str::to_owned)
         .ok_or_else(|| anyhow::anyhow!("Failed to parse latest tag name '{latest_tag_name}'"))
 }
@@ -31,8 +38,10 @@ mod tests {
 
     #[test]
     fn extracts_version_from_latest_tag() {
+        let prefix = &codex_fork_manifest::manifest().release_channel.tag_prefix;
         assert_eq!(
-            extract_version_from_latest_tag("rust-v1.5.0").expect("failed to parse version"),
+            extract_version_from_latest_tag(&format!("{prefix}1.5.0"))
+                .expect("failed to parse version"),
             "1.5.0"
         );
     }
@@ -40,6 +49,11 @@ mod tests {
     #[test]
     fn latest_tag_without_prefix_is_invalid() {
         assert!(extract_version_from_latest_tag("v1.5.0").is_err());
+    }
+
+    #[test]
+    fn an_upstream_release_tag_is_not_an_upgrade_for_this_fork() {
+        assert!(extract_version_from_latest_tag("rust-v1.5.0").is_err());
     }
 
     #[test]

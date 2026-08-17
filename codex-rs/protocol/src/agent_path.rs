@@ -17,6 +17,7 @@ pub struct AgentPath(String);
 impl AgentPath {
     pub const ROOT: &str = "/root";
     pub const MORPHEUS: &str = "/morpheus";
+    pub const MAX_NEW_PATH_BYTES: usize = 256;
     const ROOT_SEGMENT: &str = "root";
 
     pub fn root() -> Self {
@@ -53,7 +54,14 @@ impl AgentPath {
 
     pub fn join(&self, agent_name: &str) -> Result<Self, String> {
         validate_agent_name(agent_name)?;
-        Self::from_string(format!("{self}/{agent_name}"))
+        let path = format!("{self}/{agent_name}");
+        if path.len() > Self::MAX_NEW_PATH_BYTES {
+            return Err(format!(
+                "agent path must not exceed {} bytes",
+                Self::MAX_NEW_PATH_BYTES
+            ));
+        }
+        Self::from_string(path)
     }
 
     pub fn resolve(&self, reference: &str) -> Result<Self, String> {
@@ -235,6 +243,20 @@ mod tests {
         assert_eq!(
             AgentPath::root().resolve("../sibling"),
             Err("agent_name `..` is reserved".to_string())
+        );
+        assert_eq!(
+            AgentPath::root().join(&"a".repeat(AgentPath::MAX_NEW_PATH_BYTES)),
+            Err(format!(
+                "agent path must not exceed {} bytes",
+                AgentPath::MAX_NEW_PATH_BYTES
+            ))
+        );
+        assert!(
+            AgentPath::try_from(format!(
+                "/root/{}",
+                "a".repeat(AgentPath::MAX_NEW_PATH_BYTES)
+            ))
+            .is_ok()
         );
     }
 }

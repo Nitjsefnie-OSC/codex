@@ -747,6 +747,25 @@ pub struct Tui {
     /// Overrides the legacy top-level `disable_paste_burst` setting. Defaults to `false`.
     pub disable_paste_burst: Option<bool>,
 
+    /// Show the safety-buffering status detail and choice menu while a turn is
+    /// waiting on the model.
+    ///
+    /// When `false` the TUI keeps waiting on the same in-flight turn and only
+    /// suppresses the local presentation; it never retries, changes model or
+    /// effort, cancels the request, or alters the server-side safeguard.
+    /// Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub show_safety_buffering_ui: bool,
+
+    /// Show composer prompt suggestions, such as the `Create a plan?` nudge.
+    ///
+    /// Plan mode itself and explicit mode switching stay available when this is
+    /// `false`. This is unrelated to `features.tool_suggest`, which controls
+    /// plugin and connector installation suggestions.
+    /// Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub show_prompt_suggestions: bool,
+
     /// Start the composer in Vim mode (`Normal`) by default.
     /// Defaults to `false`.
     #[serde(default)]

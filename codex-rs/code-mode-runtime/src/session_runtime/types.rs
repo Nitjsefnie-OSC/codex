@@ -134,6 +134,15 @@ pub(crate) trait SessionRuntimeDelegate: Send + Sync + 'static {
         cancellation_token: CancellationToken,
     ) -> impl Future<Output = Result<(), String>> + Send;
 
+    fn tool_result_delivered(
+        &self,
+        _cell_id: CellId,
+        _runtime_tool_call_id: String,
+        _delivered: bool,
+    ) -> impl Future<Output = Result<(), String>> + Send {
+        async { Ok(()) }
+    }
+
     fn cell_closed(&self, cell_id: &CellId);
 }
 

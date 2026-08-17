@@ -111,6 +111,17 @@ pub trait CodeModeSessionDelegate: Send + Sync {
         cancellation_token: CancellationToken,
     ) -> NotificationFuture<'a>;
 
+    /// Records whether a nested tool result reached its JavaScript promise.
+    /// Delegates without delivery-sensitive state can ignore it.
+    fn tool_result_delivered<'a>(
+        &'a self,
+        _cell_id: CellId,
+        _runtime_tool_call_id: String,
+        _delivered: bool,
+    ) -> NotificationFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Releases delegate state associated with a cell after it reaches a terminal state.
     fn cell_closed(&self, cell_id: &CellId);
 }

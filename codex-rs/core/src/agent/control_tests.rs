@@ -309,15 +309,20 @@ fn history_contains_text<'a>(
     needle: &str,
 ) -> bool {
     history_items.into_iter().any(|item| {
-        let ResponseItem::Message { content, .. } = item else {
-            return false;
-        };
-        content.iter().any(|content_item| match content_item {
-            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
-                text.contains(needle)
-            }
-            ContentItem::InputImage { .. } | ContentItem::InputAudio { .. } => false,
-        })
+        match item {
+            ResponseItem::Message { content, .. } => content.iter().any(|content_item| {
+                match content_item {
+                    ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                        text.contains(needle)
+                    }
+                    ContentItem::InputImage { .. } | ContentItem::InputAudio { .. } => false,
+                }
+            }),
+            ResponseItem::AgentMessage { content, .. } => content.iter().any(|content_item| {
+                matches!(content_item, codex_protocol::models::AgentMessageInputContent::InputText { text } if text.contains(needle))
+            }),
+            _ => false,
+        }
     })
 }
 
@@ -726,260 +731,149 @@ async fn send_inter_agent_communication_without_turn_queues_message_without_trig
 
 #[tokio::test]
 async fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent() {
-    check_v2_agent_reload(V2ReloadRoute::Sender).await;
+    ensure_v2_agent_loaded_reloads_registered_unloaded_agent_body().await;
 }
 
-#[tokio::test]
-async fn ensure_v2_child_loaded_preserves_evicted_parent_authority() {
-    check_v2_agent_reload(V2ReloadRoute::NestedParent).await;
-}
-
-#[derive(Clone, Copy)]
-enum V2ReloadRoute {
-    Sender,
-    NestedParent,
-}
-
-async fn spawn_v2_reload_test_child(
-    control: &AgentControl,
-    config: Config,
-    parent: &CodexThread,
-    task_name: &str,
-) -> LiveAgent {
-    let source = thread_spawn_source(
-        parent.session.thread_id,
-        &parent.session_source,
-        next_thread_spawn_depth(&parent.session_source),
-        /*agent_role*/ None,
-        Some(task_name.to_string()),
-    )
-    .expect("child source");
-    control
-        .spawn_agent_with_metadata(
-            config,
-            text_input("hello child"),
-            Some(source),
-            SpawnAgentOptions {
-                parent_thread_id: Some(parent.session.thread_id),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("spawn_agent should succeed")
-}
-
-async fn check_v2_agent_reload(route: V2ReloadRoute) {
-    let (home, mut config) = test_config().await;
-    let _ = config.features.enable(Feature::MultiAgentV2);
-    let _ = config.features.enable(Feature::Sqlite);
-    config.model = Some("gpt-5.6-sol".to_string());
-    config.multi_agent_v2.max_concurrent_threads_per_session = 3;
-    config.permissions.allow_login_shell = true;
-    config
-        .permissions
-        .set_permission_profile(PermissionProfile::read_only())
-        .expect("read-only parent profile");
-    let harness = AgentControlHarness::new_with_config(home, config).await;
-    let client_mcp_extensions =
-        ClientMcpExtensions::new([(OPENAI_FORM_EXTENSION_ID.to_string(), serde_json::json!({}))]);
-    let root = harness
-        .manager
-        .start_thread(StartThreadOptions {
-            history_mode: Some(ThreadHistoryMode::Paginated),
-            client_mcp_extensions: client_mcp_extensions.clone(),
-            ..StartThreadOptions::new(harness.config.clone())
-        })
-        .await
-        .expect("start root thread");
-    let control = root.thread.session.services.agent_control.clone();
-    let parent_thread = match route {
-        V2ReloadRoute::Sender => root.thread,
-        V2ReloadRoute::NestedParent => {
-            let parent = spawn_v2_reload_test_child(
-                &control,
-                harness.config.clone(),
-                &root.thread,
-                "parent",
+fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent_body()
+-> futures::future::BoxFuture<'static, ()> {
+    Box::pin(async move {
+        let (home, mut config) = test_config().await;
+        let _ = config.features.enable(Feature::MultiAgentV2);
+        let _ = config.features.enable(Feature::Sqlite);
+        config.model = Some("gpt-5.6-sol".to_string());
+        let harness = AgentControlHarness::new_with_config(home, config).await;
+        let (parent_thread_id, _parent_thread) = harness.start_paginated_thread().await;
+        let agent_path = AgentPath::try_from("/root/worker").expect("agent path");
+        let mut child_config = harness.config.clone();
+        child_config.model = Some("gpt-5.6-luna".to_string());
+        let spawned_agent = harness
+            .control
+            .spawn_agent_with_metadata(
+                child_config,
+                text_input("hello child"),
+                Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    parent_thread_id,
+                    depth: 1,
+                    agent_path: Some(agent_path.clone()),
+                    agent_nickname: None,
+                    agent_role: None,
+                })),
+                SpawnAgentOptions {
+                    parent_thread_id: Some(parent_thread_id),
+                    ..Default::default()
+                },
             )
-            .await;
-            harness
-                .manager
-                .get_thread(parent.thread_id)
-                .await
-                .expect("nested parent should exist")
-        }
-    };
-    let parent_thread_id = parent_thread.session.thread_id;
-    let mut child_config = harness.config.clone();
-    child_config.model = Some("gpt-5.6-luna".to_string());
-    let spawned_agent =
-        spawn_v2_reload_test_child(&control, child_config, &parent_thread, "worker").await;
-    let agent_path = spawned_agent
-        .metadata
-        .agent_path
-        .clone()
-        .expect("agent path");
-    let child_thread = harness
-        .manager
-        .get_thread(spawned_agent.thread_id)
-        .await
-        .expect("child thread should exist");
-    child_thread
-        .inject_response_items(vec![assistant_message(
-            "child persisted",
-            Some(MessagePhase::FinalAnswer),
-        )])
-        .await
-        .expect("child rollout should persist with v2 metadata");
-    child_thread
-        .shutdown_and_wait()
-        .await
-        .expect("child thread should shut down");
-    let stored_child = child_thread
-        .read_thread(
-            /*include_archived*/ true, /*include_history*/ false,
-        )
-        .await
-        .expect("child metadata should be readable");
-    assert_eq!(stored_child.history_mode, ThreadHistoryMode::Paginated);
-
-    assert!(
-        harness
+            .await
+            .expect("spawn_agent should succeed");
+        let child_thread = harness
             .manager
-            .remove_thread(&spawned_agent.thread_id)
+            .get_thread(spawned_agent.thread_id)
             .await
-            .is_some()
-    );
-    match harness.manager.get_thread(spawned_agent.thread_id).await {
-        Err(err) => match err.details() {
-            CodexErrorDetails::ThreadNotFound(id) => assert_eq!(*id, spawned_agent.thread_id),
-            _ => panic!("expected ThreadNotFound, got {err:?}"),
-        },
-        Ok(_) => panic!("expected thread to be removed"),
-    }
-
-    let mut sender_config = harness.config.clone();
-    sender_config.model_provider_id = "ollama".to_string();
-    sender_config.model_provider = sender_config
-        .model_providers
-        .get("ollama")
-        .cloned()
-        .expect("ollama provider should be configured");
-
-    let mut parent_turn = parent_thread.session.new_default_turn().await;
-    match route {
-        V2ReloadRoute::Sender => control
-            .ensure_v2_agent_loaded(sender_config, spawned_agent.thread_id, /*parent*/ None)
+            .expect("child thread should exist");
+        child_thread
+            .inject_response_items(vec![assistant_message(
+                "child persisted",
+                Some(MessagePhase::FinalAnswer),
+            )])
             .await
-            .expect("known v2 agent should reload"),
-        V2ReloadRoute::NestedParent => {
-            let environment = parent_turn
-                .environments
-                .primary()
-                .expect("parent environment");
-            let thread_config = environment.config().clone();
-            let mut owner_config = thread_config.clone();
-            owner_config.allow_login_shell = false;
-            let mut selection = environment.selection();
-            selection.config = EnvironmentConfigState::Ready(owner_config);
-            parent_thread
-                .session
-                .services
-                .turn_environments
-                .update_selections(std::slice::from_ref(&selection), &thread_config);
-            parent_turn = parent_thread.session.new_default_turn().await;
-            parent_thread.session.mark_interrupted();
-            // The fixture has no task runner to finish the turn or consume child results.
-            *parent_thread.session.active_turn.lock().await = None;
-            let _ = parent_thread
-                .session
-                .input_queue
-                .drain_mailbox_input_items()
-                .await;
+            .expect("child rollout should persist with v2 metadata");
+        child_thread
+            .shutdown_and_wait()
+            .await
+            .expect("child thread should shut down");
+        let stored_child = child_thread
+            .read_thread(
+                /*include_archived*/ true, /*include_history*/ false,
+            )
+            .await
+            .expect("child metadata should be readable");
+        assert_eq!(stored_child.history_mode, ThreadHistoryMode::Paginated);
+
+        assert!(
             harness
                 .manager
-                .ensure_multi_agent_v2_child_loaded(spawned_agent.thread_id)
+                .remove_thread(&spawned_agent.thread_id)
                 .await
-                .expect("known child should reload through its parent");
-            assert!(harness.manager.get_thread(parent_thread_id).await.is_err());
+                .is_some()
+        );
+        match harness.manager.get_thread(spawned_agent.thread_id).await {
+            Err(err) => match err.details() {
+                CodexErrorDetails::ThreadNotFound(id) => assert_eq!(*id, spawned_agent.thread_id),
+                _ => panic!("expected ThreadNotFound, got {err:?}"),
+            },
+            Ok(_) => panic!("expected thread to be removed"),
         }
-    }
-    let reloaded_child = harness
-        .manager
-        .get_thread(spawned_agent.thread_id)
-        .await
-        .expect("reloaded child thread should exist");
-    if matches!(route, V2ReloadRoute::NestedParent) {
-        let reloaded_turn = reloaded_child.session.new_default_turn().await;
+
+        let mut sender_config = harness.config.clone();
+        sender_config.model_provider_id = "ollama".to_string();
+        sender_config.model_provider = sender_config
+            .model_providers
+            .get("ollama")
+            .cloned()
+            .expect("ollama provider should be configured");
+
+        harness
+            .control
+            .ensure_v2_agent_loaded(sender_config, spawned_agent.thread_id)
+            .await
+            .expect("known v2 agent should reload");
+        let reloaded_child = harness
+            .manager
+            .get_thread(spawned_agent.thread_id)
+            .await
+            .expect("reloaded child thread should exist");
+        assert_eq!(
+            reloaded_child.config_snapshot().await.model,
+            "gpt-5.6-luna",
+            "residency reload must preserve the worker model instead of inheriting its parent model",
+        );
         assert_eq!(
             (
-                reloaded_turn.environments.to_selections(),
-                reloaded_turn.permission_profile(),
-                reloaded_child.client_mcp_extensions(),
+                reloaded_child.config_snapshot().await.model_provider_id,
+                reloaded_child
+                    .session
+                    .new_default_turn()
+                    .await
+                    .provider
+                    .info()
+                    .clone(),
             ),
             (
-                parent_turn.environments.to_selections(),
-                parent_turn.permission_profile(),
-                client_mcp_extensions,
+                stored_child.model_provider,
+                harness.config.model_provider.clone()
             ),
+            "residency reload must preserve the worker provider instead of inheriting its sender's provider",
         );
-        assert!(Arc::ptr_eq(
-            &reloaded_child.session.services.exec_policy,
-            &parent_thread.session.services.exec_policy,
-        ));
-    }
-    assert_eq!(
-        reloaded_child.config_snapshot().await.model,
-        "gpt-5.6-luna",
-        "residency reload must preserve the worker model instead of inheriting its parent model",
-    );
-    assert_eq!(
-        (
-            reloaded_child.config_snapshot().await.model_provider_id,
-            reloaded_child
-                .session
-                .new_default_turn()
-                .await
-                .provider
-                .info()
-                .clone(),
-        ),
-        (
-            stored_child.model_provider,
-            harness.config.model_provider.clone()
-        ),
-        "residency reload must preserve the worker provider instead of inheriting its sender's provider",
-    );
 
-    let communication = InterAgentCommunication::new(
-        AgentPath::root(),
-        agent_path,
-        Vec::new(),
-        "hello after reload".to_string(),
-        /*trigger_turn*/ false,
-    );
-    control
-        .send_inter_agent_communication(
+        let communication = InterAgentCommunication::new(
+            AgentPath::root(),
+            agent_path,
+            Vec::new(),
+            "hello after reload".to_string(),
+            /*trigger_turn*/ false,
+        );
+        harness
+            .control
+            .send_inter_agent_communication(
+                spawned_agent.thread_id,
+                communication.clone(),
+                AgentCommunicationContext::new(AgentCommunicationKind::Message, ThreadId::new()),
+                /*parent_turn_id*/ None,
+                /*root_turn_id*/ None,
+            )
+            .await
+            .expect("send_inter_agent_communication should succeed after reload");
+        let expected = (
             spawned_agent.thread_id,
-            communication.clone(),
-            AgentCommunicationContext::new(AgentCommunicationKind::Message, ThreadId::new()),
-            Default::default(),
-        )
-        .await
-        .expect("send_inter_agent_communication should succeed after reload");
-    let expected = (
-        spawned_agent.thread_id,
-        Op::InterAgentCommunication {
-            communication,
-            start_options: Default::default(),
-        },
-    );
-    let captured = harness
-        .manager
-        .captured_ops()
-        .into_iter()
-        .find(|entry| captured_op_matches(entry, &expected));
-    assert!(captured.is_some());
+            Op::InterAgentCommunication { communication },
+        );
+        let captured = harness
+            .manager
+            .captured_ops()
+            .into_iter()
+            .find(|entry| captured_op_matches(entry, &expected));
+        assert!(captured.is_some());
+    })
 }
 
 #[tokio::test]
@@ -3338,7 +3232,7 @@ async fn multi_agent_v2_completion_ignores_dead_direct_parent() {
 async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
     let harness = AgentControlHarness::new().await;
     let (_root_thread_id, root_thread) = harness.start_thread().await;
-    let (worker_thread_id, _worker_thread) = harness.start_thread().await;
+    let (worker_thread_id, worker_thread) = harness.start_thread().await;
     let mut tester_config = harness.config.clone();
     let _ = tester_config.features.enable(Feature::MultiAgentV2);
     let tester_thread_id = harness
@@ -3383,41 +3277,28 @@ async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
         )
         .await;
 
+    let worker_identity =
+        crate::session_prefix::completion_agent_identity(&worker_path, worker_thread_id);
+    let tester_identity =
+        crate::session_prefix::completion_agent_identity(&tester_path, tester_thread_id);
     let expected_message = crate::session_prefix::format_inter_agent_completion_message(
-        worker_path.clone(),
-        tester_path.clone(),
+        &worker_identity,
+        &tester_identity,
         &AgentStatus::Completed(Some("done".to_string())),
+        None,
     )
     .expect("completed status should render");
-    let expected = (
-        worker_thread_id,
-        Op::InterAgentCommunication {
-            communication: InterAgentCommunication::new(
-                tester_path.clone(),
-                worker_path.clone(),
-                Vec::new(),
-                expected_message.clone(),
-                /*trigger_turn*/ false,
-            ),
-            start_options: Default::default(),
-        },
-    );
-
     timeout(Duration::from_secs(5), async {
         loop {
-            let captured = harness
-                .manager
-                .captured_ops()
-                .into_iter()
-                .find(|entry| captured_op_matches(entry, &expected));
-            if captured.is_some() {
+            let history = worker_thread.session.clone_history().await;
+            if history_contains_text(history.raw_items(), &expected_message) {
                 break;
             }
             sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("completion watcher should queue a direct-parent message");
+    .expect("completion watcher should durably deliver a direct-parent message");
 
     let root_history = root_thread.session.clone_history().await;
     assert!(!history_contains_assistant_inter_agent_communication(

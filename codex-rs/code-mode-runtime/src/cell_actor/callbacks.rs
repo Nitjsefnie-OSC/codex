@@ -51,25 +51,43 @@ pub(super) fn spawn_tool<H: CellHost>(
 ) {
     tasks.spawn(async move {
         let id = invocation.id.clone();
-        let callback =
-            AssertUnwindSafe(async move { host.invoke_tool(invocation, cancellation_token).await })
-                .catch_unwind()
-                .await;
-        let (command, failure_reason) = match callback {
-            Ok(Ok(result)) => (RuntimeCommand::ToolResponse { id, result }, None),
-            Ok(Err(error_text)) => (RuntimeCommand::ToolError { id, error_text }, None),
+        let callback_host = Arc::clone(&host);
+        let callback = AssertUnwindSafe(async move {
+            callback_host
+                .invoke_tool(invocation, cancellation_token)
+                .await
+        })
+        .catch_unwind()
+        .await;
+        let failure_reason = match callback {
+            Ok(Ok(result)) => {
+                let (delivery_tx, delivery_rx) = tokio::sync::oneshot::channel();
+                let delivered = runtime_tx
+                    .send(RuntimeCommand::ToolResponse {
+                        id: id.clone(),
+                        result,
+                        delivery_tx,
+                    })
+                    .is_ok()
+                    && delivery_rx.await.unwrap_or(false);
+                if let Err(error) = host.tool_result_delivered(id, delivered).await {
+                    warn!("failed to record code mode tool-result delivery: {error}");
+                }
+                None
+            }
+            Ok(Err(error_text)) => {
+                let _ = runtime_tx.send(RuntimeCommand::ToolError { id, error_text });
+                None
+            }
             Err(_) => {
                 let failure_reason = "code mode tool task panicked".to_string();
-                (
-                    RuntimeCommand::ToolError {
-                        id,
-                        error_text: failure_reason.clone(),
-                    },
-                    Some(failure_reason),
-                )
+                let _ = runtime_tx.send(RuntimeCommand::ToolError {
+                    id,
+                    error_text: failure_reason.clone(),
+                });
+                Some(failure_reason)
             }
         };
-        let _ = runtime_tx.send(command);
         if let Some(failure_reason) = failure_reason {
             report_task_failure(task_failure_handler.as_ref(), failure_reason);
         }

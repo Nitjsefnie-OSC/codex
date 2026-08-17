@@ -106,27 +106,27 @@ impl RequestTracker {
         self.unclaimed_executes.remove(&id);
     }
 
-    pub(super) fn collect_cancellations(&mut self) -> Vec<CancellationAction> {
-        let mut actions = self
-            .pending
+    pub(super) fn take_cancellation(&mut self) -> Option<CancellationAction> {
+        if let Some(action) = self.pending.iter_mut().find_map(|(id, pending)| {
+            let cancellation = pending.cancellation_mut()?;
+            (cancellation.is_cancelled() && cancellation.mark_reported())
+                .then_some(CancellationAction::Send(*id))
+        }) {
+            return Some(action);
+        }
+        let request_id = self
+            .unclaimed_executes
             .iter_mut()
-            .filter_map(|(id, pending)| {
-                let cancellation = pending.cancellation_mut()?;
-                (cancellation.is_cancelled() && cancellation.mark_reported())
-                    .then_some(CancellationAction::Send(*id))
+            .find_map(|(id, execute)| {
+                (execute.cancellation.is_cancelled() && execute.cancellation.mark_reported())
+                    .then_some(*id)
+            })?;
+        self.unclaimed_executes
+            .remove(&request_id)
+            .map(|execute| CancellationAction::Terminate {
+                request_id,
+                execute,
             })
-            .collect::<Vec<_>>();
-        actions.extend(
-            self.unclaimed_executes
-                .extract_if(|_, execute| {
-                    execute.cancellation.is_cancelled() && execute.cancellation.mark_reported()
-                })
-                .map(|(request_id, execute)| CancellationAction::Terminate {
-                    request_id,
-                    execute,
-                }),
-        );
-        actions
     }
 
     pub(super) fn mark_cancelled(&mut self, id: RequestId) -> Option<CancellationAction> {

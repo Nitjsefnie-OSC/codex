@@ -433,8 +433,15 @@ impl TurnContext {
         self.initial_settings.effective_reasoning_effort()
     }
 
-    /// Legacy: returns the frozen initial-turn reasoning-effort label for tracing.
-    /// Step-scoped consumers should use their captured `StepContext::settings`.
+    /// Returns the effective reasoning effort encoded in the Responses request.
+    ///
+    /// `Ultra` is an internal configuration spelling that the request builder
+    /// sends as `Max`; callers reporting request metadata must use this value
+    /// rather than the unnormalized turn setting.
+    pub(crate) fn request_reasoning_effort(&self) -> Option<ReasoningEffortConfig> {
+        crate::client::request_reasoning_effort(&self.model_info, self.reasoning_effort.clone())
+    }
+
     pub(crate) fn effective_reasoning_effort_for_tracing(&self) -> String {
         self.effective_reasoning_effort()
             .map(|effort| effort.to_string())
@@ -883,21 +890,22 @@ impl Session {
         Ok(Some((turn_context, commit.snapshot)))
     }
 
-    /// Constructs a turn from the exact committed settings without starting a task.
-    async fn new_turn_from_configuration(
+    fn new_turn_from_configuration(
         &self,
         sub_id: String,
         session_configuration: SessionConfiguration,
-        options: NewTurnContextOptions,
-    ) -> Arc<TurnContext> {
-        self.new_turn_context_from_configuration(
-            sub_id,
-            session_configuration,
-            options,
-            TurnMultiAgentRuntime::ResolveAndStore,
-            self.git_enrichment_policy,
-        )
-        .await
+        final_output_json_schema: Option<Option<Value>>,
+    ) -> BoxFuture<'_, Arc<TurnContext>> {
+        Box::pin(async move {
+            self.new_turn_context_from_configuration(
+                sub_id,
+                session_configuration,
+                final_output_json_schema,
+                TurnMultiAgentRuntime::ResolveAndStore,
+                self.git_enrichment_policy,
+            )
+            .await
+        })
     }
 
     async fn new_startup_prewarm_turn_from_configuration(

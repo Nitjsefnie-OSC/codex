@@ -90,12 +90,17 @@ impl CodeModeSessionDelegate for GrpcDelegate {
                 .session
                 .upgrade()
                 .ok_or_else(|| "code-mode session is closed".to_string())?;
-            let _permit = session.delegate_permit()?;
+            let permit = session.delegate_permit()?;
             let execution_id = session
                 .execution_id(cell_id.as_str(), &cancellation)
                 .await?;
             let notification_id = Uuid::new_v4();
-            session
+            session.reserve_notification(notification_id, permit)?;
+            let mut pending = PendingNotification {
+                session: Arc::clone(&session),
+                id: Some(notification_id),
+            };
+            let result = session
                 .send_event(
                     proto::session_event::Event::Notification(proto::Notification {
                         notification_id: notification_id.to_string(),
@@ -105,6 +110,34 @@ impl CodeModeSessionDelegate for GrpcDelegate {
                         text,
                     }),
                     &cancellation,
+                )
+                .await;
+            if result.is_ok() {
+                pending.id = None;
+            }
+            result
+        })
+    }
+
+    fn tool_result_delivered<'a>(
+        &'a self,
+        cell_id: CellId,
+        runtime_tool_call_id: String,
+        delivered: bool,
+    ) -> NotificationFuture<'a> {
+        Box::pin(async move {
+            let session = self
+                .session
+                .upgrade()
+                .ok_or_else(|| "code-mode session is closed".to_string())?;
+            session
+                .send_event(
+                    proto::session_event::Event::ToolResultDelivered(proto::ToolResultDelivered {
+                        cell_id: cell_id.to_string(),
+                        runtime_tool_call_id,
+                        delivered,
+                    }),
+                    &CancellationToken::new(),
                 )
                 .await
         })
@@ -120,6 +153,19 @@ impl CodeModeSessionDelegate for GrpcDelegate {
 struct PendingToolCall {
     session: Arc<GrpcSession>,
     id: Option<Uuid>,
+}
+
+struct PendingNotification {
+    session: Arc<GrpcSession>,
+    id: Option<Uuid>,
+}
+
+impl Drop for PendingNotification {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            self.session.cancel_notification(id);
+        }
+    }
 }
 
 impl Drop for PendingToolCall {
