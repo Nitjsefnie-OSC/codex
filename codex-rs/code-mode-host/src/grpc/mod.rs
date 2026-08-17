@@ -99,8 +99,9 @@ impl GrpcCodeModeHost {
         request: proto::AcknowledgeNotificationRequest,
     ) -> Result<Response<proto::AcknowledgeNotificationResponse>, Status> {
         let _permit = self.state.control_permit()?;
-        self.state.session(&request.session_id)?;
-        validation::uuid(&request.notification_id, "notification ID")?;
+        let session = self.state.session(&request.session_id)?;
+        let notification_id = validation::uuid(&request.notification_id, "notification ID")?;
+        session.acknowledge_notification(notification_id)?;
         Ok(Response::new(proto::AcknowledgeNotificationResponse {}))
     }
 

@@ -70,6 +70,7 @@ members = [
     "keyring-store",
     "file-search",
     "file-watcher",
+    "fork-manifest",
     "linux-sandbox",
     "lmstudio",
     "login",
@@ -205,6 +206,7 @@ codex-feedback = { path = "feedback" }
 codex-install-context = { path = "install-context" }
 codex-file-search = { path = "file-search" }
 codex-file-watcher = { path = "file-watcher" }
+codex-fork-manifest = { path = "fork-manifest" }
 codex-git-utils = { path = "git-utils" }
 codex-hooks = { path = "hooks" }
 codex-history = { path = "history" }

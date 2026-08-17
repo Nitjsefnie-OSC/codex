@@ -39,10 +39,19 @@ use crate::tools::sandboxing::SandboxAttempt;
 use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
 use crate::unified_exec::ExecCommandRequest;
+use crate::unified_exec::InitialExecCommandOutputDestination;
+use crate::unified_exec::InitialExecCommandState;
+use crate::unified_exec::InitialExecOutputPersistenceDecision;
 use crate::unified_exec::MAX_UNIFIED_EXEC_PROCESSES;
 use crate::unified_exec::MAX_YIELD_TIME_MS;
 use crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS;
 use crate::unified_exec::MIN_YIELD_TIME_MS;
+use crate::unified_exec::MonitorAcknowledgement;
+use crate::unified_exec::MonitorAttachment;
+use crate::unified_exec::MonitorInfo;
+use crate::unified_exec::MonitorOutput;
+use crate::unified_exec::MonitorWaitOutcome;
+use crate::unified_exec::PendingInitialExecCommandOutput;
 use crate::unified_exec::ProcessEntry;
 use crate::unified_exec::ProcessStore;
 use crate::unified_exec::UnifiedExecContext;
@@ -50,6 +59,7 @@ use crate::unified_exec::UnifiedExecError;
 use crate::unified_exec::UnifiedExecProcessManager;
 use crate::unified_exec::WriteStdinInteractionEvent;
 use crate::unified_exec::WriteStdinRequest;
+use crate::unified_exec::async_watcher::YieldedExecCompletionContext;
 use crate::unified_exec::async_watcher::emit_exec_end_for_unified_exec;
 use crate::unified_exec::async_watcher::emit_failed_exec_end_for_unified_exec;
 use crate::unified_exec::async_watcher::spawn_exit_watcher;
@@ -57,6 +67,8 @@ use crate::unified_exec::async_watcher::start_streaming_output;
 use crate::unified_exec::clamp_yield_time;
 use crate::unified_exec::generate_chunk_id;
 use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
+use crate::unified_exec::monitor_watcher::spawn_monitor_watcher;
+use crate::unified_exec::monitors::MonitorHandle;
 use crate::unified_exec::process::OutputHandles;
 use crate::unified_exec::process::SpawnLifecycleHandle;
 use crate::unified_exec::process::UnifiedExecProcess;
@@ -113,6 +125,32 @@ fn deterministic_process_ids_forced_for_tests() -> bool {
 
 fn should_use_deterministic_process_ids() -> bool {
     cfg!(test) || deterministic_process_ids_forced_for_tests()
+}
+
+impl InitialExecOutputPersistenceDecision {
+    pub(crate) fn commit(mut self) {
+        for pending_output in self.pending_outputs.drain(..) {
+            pending_output.state.mark_yielded();
+        }
+    }
+}
+
+impl Drop for InitialExecOutputPersistenceDecision {
+    fn drop(&mut self) {
+        let abandoned = self
+            .pending_outputs
+            .drain(..)
+            .map(|pending_output| {
+                pending_output.state.mark_not_yielded();
+                pending_output.process.terminate();
+                (pending_output.process_id, pending_output.state)
+            })
+            .collect::<Vec<_>>();
+        remove_abandoned_initial_exec_processes_from_store(
+            Arc::clone(&self.process_store),
+            abandoned,
+        );
+    }
 }
 
 fn apply_unified_exec_env(mut env: HashMap<String, String>) -> HashMap<String, String> {
@@ -246,7 +284,7 @@ struct PreparedProcessHandles {
 }
 
 struct InitialExecCommandGuard {
-    active: Option<Arc<AtomicBool>>,
+    state: Option<Arc<InitialExecCommandState>>,
     metrics_sidecar: Option<PluginMetricsSidecar>,
 }
 
@@ -261,13 +299,108 @@ impl InitialExecCommandGuard {
         )
         .await;
     }
+
+    fn take_state(&mut self) -> Option<Arc<InitialExecCommandState>> {
+        self.state.take()
+    }
 }
 
 impl Drop for InitialExecCommandGuard {
     fn drop(&mut self) {
-        if let Some(active) = self.active.as_ref() {
-            active.store(false, Ordering::Release);
+        if let Some(state) = self.state.take() {
+            state.mark_not_yielded();
         }
+    }
+}
+
+struct ProcessSetupGuard {
+    process: Arc<UnifiedExecProcess>,
+    process_store: Arc<tokio::sync::Mutex<ProcessStore>>,
+    process_id: i32,
+    session: std::sync::Weak<crate::session::session::Session>,
+    network_approval: Option<DeferredNetworkApproval>,
+    armed: bool,
+}
+
+struct UnboundProcessReservationGuard {
+    process_store: Arc<tokio::sync::Mutex<ProcessStore>>,
+    process_id: i32,
+    armed: bool,
+}
+
+impl UnboundProcessReservationGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for UnboundProcessReservationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let process_store = Arc::clone(&self.process_store);
+        let process_id = self.process_id;
+        tokio::spawn(async move {
+            let mut store = process_store.lock().await;
+            store.reserved_process_ids.remove(&process_id);
+            store.reservation_owners.remove(&process_id);
+        });
+    }
+}
+
+impl ProcessSetupGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProcessSetupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.process.terminate();
+        self.process.output_drained_notify().notify_one();
+        let process = Arc::clone(&self.process);
+        let process_store = Arc::clone(&self.process_store);
+        let process_id = self.process_id;
+        let session = self.session.clone();
+        let network_approval = self.network_approval.clone();
+        tokio::spawn(async move {
+            let removed = {
+                let mut store = process_store.lock().await;
+                let process_matches = store
+                    .processes
+                    .get(&process_id)
+                    .is_some_and(|entry| Arc::ptr_eq(&entry.process, &process));
+                if process_matches {
+                    store.remove(process_id)
+                } else {
+                    let reservation_matches = store
+                        .reservation_owners
+                        .get(&process_id)
+                        .and_then(std::sync::Weak::upgrade)
+                        .is_some_and(|owner| Arc::ptr_eq(&owner, &process));
+                    if reservation_matches {
+                        store.reserved_process_ids.remove(&process_id);
+                        store.reservation_owners.remove(&process_id);
+                    }
+                    None
+                }
+            };
+            if let Some(entry) = removed {
+                unregister_network_approval_for_entry(&entry).await;
+            } else if let Some(network_approval) = network_approval
+                && let Some(session) = session.upgrade()
+            {
+                session
+                    .services
+                    .network_approval
+                    .unregister_call(network_approval.registration_id())
+                    .await;
+            }
+        });
     }
 }
 
@@ -418,7 +551,48 @@ fn terminate_process_on_network_denial(
     })
 }
 
+fn remove_abandoned_initial_exec_processes_from_store(
+    process_store: Arc<tokio::sync::Mutex<ProcessStore>>,
+    abandoned: Vec<(i32, Arc<InitialExecCommandState>)>,
+) {
+    if abandoned.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        let removed = {
+            let mut store = process_store.lock().await;
+            abandoned
+                .into_iter()
+                .filter_map(|(process_id, state)| {
+                    let state_matches = store.processes.get(&process_id).is_some_and(|entry| {
+                        Arc::ptr_eq(&entry.initial_exec_command_state, &state)
+                    });
+                    if !state_matches {
+                        return None;
+                    }
+                    store.remove(process_id)
+                })
+                .collect::<Vec<_>>()
+        };
+        for entry in removed {
+            entry.process.terminate();
+            unregister_network_approval_for_entry(&entry).await;
+        }
+    });
+}
+
 impl UnifiedExecProcessManager {
+    pub(crate) async fn begin_shutdown(&self) {
+        let _watcher_lifecycle_guard = self.watcher_lifecycle_lock.lock().await;
+        self.shutdown_started.store(true, Ordering::Release);
+    }
+
+    /// Reset each monitor's model-visible notification budget while compaction
+    /// publishes a new in-memory history window.
+    pub(crate) async fn begin_notification_window(&self) {
+        self.monitor_store.lock().await.begin_notification_window();
+    }
+
     pub(crate) async fn allocate_process_id(&self) -> i32 {
         loop {
             let mut store = self.process_store.lock().await;
@@ -461,6 +635,39 @@ impl UnifiedExecProcessManager {
         request: ExecCommandRequest,
         context: &UnifiedExecContext,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
+        self.exec_command_inner(request, context, /*monitor*/ None)
+            .await
+    }
+
+    /// Start a monitored process.
+    ///
+    /// This is an ordinary `exec_command` with a watcher attached: the process
+    /// lands in the same process store, gets the same process id, the same
+    /// bounded retained output, the same `write_stdin` and `list`/`terminate`
+    /// operations, and the same survival across turn interruption. What the
+    /// attachment adds is the model-facing notification pump and the watcher
+    /// metadata needed to reason about a long-lived process.
+    pub(crate) async fn start_monitor(
+        &self,
+        request: ExecCommandRequest,
+        context: &UnifiedExecContext,
+        attachment: MonitorAttachment,
+    ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
+        self.exec_command_inner(request, context, Some(attachment))
+            .await
+    }
+
+    async fn exec_command_inner(
+        &self,
+        request: ExecCommandRequest,
+        context: &UnifiedExecContext,
+        monitor: Option<MonitorAttachment>,
+    ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
+        let mut reservation_guard = UnboundProcessReservationGuard {
+            process_store: Arc::clone(&self.process_store),
+            process_id: request.process_id,
+            armed: true,
+        };
         let cwd = request.cwd.clone();
         let process = self
             .open_session_with_sandbox(&request, cwd.clone(), context)
@@ -468,16 +675,38 @@ impl UnifiedExecProcessManager {
 
         let (attempt, mut deferred_network_approval) = match process {
             Ok((attempt, deferred_network_approval)) => (attempt, deferred_network_approval),
-            Err(err) => {
-                self.release_process_id(request.process_id).await;
-                return Err(err);
-            }
+            Err(err) => return Err(err),
         };
         let UnifiedExecAttempt {
             process,
             metrics_sidecar,
         } = attempt;
         let process = Arc::new(process);
+        let mut process_setup_guard = ProcessSetupGuard {
+            process: Arc::clone(&process),
+            process_store: Arc::clone(&self.process_store),
+            process_id: request.process_id,
+            session: Arc::downgrade(&context.session),
+            network_approval: deferred_network_approval.clone(),
+            armed: true,
+        };
+        let reservation_bound = {
+            let mut store = self.process_store.lock().await;
+            if store.reserved_process_ids.contains(&request.process_id) {
+                store
+                    .reservation_owners
+                    .insert(request.process_id, Arc::downgrade(&process));
+                true
+            } else {
+                false
+            }
+        };
+        if !reservation_bound {
+            return Err(UnifiedExecError::process_failed(
+                "process ID reservation was lost before startup".to_string(),
+            ));
+        }
+        reservation_guard.disarm();
         let network_denial_monitor = deferred_network_approval.as_ref().map(|deferred| {
             terminate_process_on_network_denial(
                 Arc::clone(&process),
@@ -521,40 +750,74 @@ impl UnifiedExecProcessManager {
         );
         emitter.emit(event_ctx, ToolEventStage::Begin).await;
 
-        start_streaming_output(&process, context, Arc::clone(&transcript));
+        let watcher_lifecycle_guard = self.watcher_lifecycle_lock.lock().await;
+        if self.shutdown_started.load(Ordering::Acquire) {
+            drop(watcher_lifecycle_guard);
+            return Err(UnifiedExecError::process_failed(
+                "session is shutting down".to_string(),
+            ));
+        }
+
+        let notify_yielded_completion = monitor.is_none();
         let start = Instant::now();
-        // Persist live sessions before the initial yield wait so interrupting the
-        // turn cannot drop the last Arc and terminate the background process.
+        // Persist live sessions before monitor attachment so cancellation can
+        // never leave a monitor as the process's only owner.
         let process_started_alive = !process.has_exited() && process.exit_code().is_none();
-        let mut initial_exec_command_guard = if process_started_alive {
-            let initial_exec_command_active = Arc::new(AtomicBool::new(true));
-            self.store_process(
-                Arc::clone(&process),
-                context,
-                &request.command,
-                request.hook_command.clone(),
-                cwd.clone(),
-                plugin_attribution.clone(),
-                start,
-                request.process_id,
-                request.tty,
-                deferred_network_approval.clone(),
-                network_denial_monitor,
-                metrics_sidecar,
-                Arc::clone(&transcript),
-                Arc::clone(&initial_exec_command_active),
-            )
-            .await;
-            InitialExecCommandGuard {
-                active: Some(initial_exec_command_active),
+        let (mut initial_exec_command_guard, pruned_entry) = if process_started_alive {
+            let initial_exec_command_state = Arc::new(InitialExecCommandState::new());
+            let initial_exec_command_guard = InitialExecCommandGuard {
+                state: Some(Arc::clone(&initial_exec_command_state)),
                 metrics_sidecar: None,
-            }
+            };
+            let pruned_entry = self
+                .store_process_locked(
+                    Arc::clone(&process),
+                    context,
+                    &request.command,
+                    request.hook_command.clone(),
+                    cwd.clone(),
+                    plugin_attribution.clone(),
+                    start,
+                    request.process_id,
+                    request.tty,
+                    deferred_network_approval.clone(),
+                    network_denial_monitor,
+                    metrics_sidecar,
+                    Arc::clone(&transcript),
+                    Arc::clone(&initial_exec_command_state),
+                    notify_yielded_completion,
+                )
+                .await;
+            (initial_exec_command_guard, pruned_entry)
         } else {
-            InitialExecCommandGuard {
-                active: None,
-                metrics_sidecar,
+            (
+                InitialExecCommandGuard {
+                    state: None,
+                    metrics_sidecar,
+                },
+                None,
+            )
+        };
+        // Bytes the process produced before the monitor could subscribe belong
+        // to the monitor now, so put them back in front of the initial yield.
+        let monitor_seed = match monitor {
+            Some(attachment) => {
+                self.attach_monitor_locked(&request, context, &process, &transcript, attachment)
+                    .await
+            }
+            None => {
+                process.monitor_output_buffer().lock().await.take();
+                Vec::new()
             }
         };
+        start_streaming_output(&process, context, Arc::clone(&transcript));
+        if process_started_alive {
+            process_setup_guard.disarm();
+        }
+        drop(watcher_lifecycle_guard);
+        if let Some(pruned_entry) = pruned_entry {
+            unregister_network_approval_for_entry(&pruned_entry).await;
+        }
 
         let yield_time_ms = clamp_yield_time(request.yield_time_ms);
         // For the initial exec_command call, we both stream output to events
@@ -574,7 +837,8 @@ impl UnifiedExecProcessManager {
         ))
         .unwrap_or(usize::MAX);
         let output_omitted_bytes = NonZeroUsize::new(collected_output.omitted_bytes());
-        let collected = collected_output.to_bytes_with_omission_marker();
+        let mut collected = monitor_seed;
+        collected.extend(collected_output.to_bytes_with_omission_marker());
         let text = String::from_utf8_lossy(&collected).to_string();
         let chunk_id = generate_chunk_id();
         if deferred_network_approval
@@ -626,7 +890,7 @@ impl UnifiedExecProcessManager {
             return Err(UnifiedExecError::process_failed(message));
         }
         let process_id = request.process_id;
-        let (response_process_id, exit_code) = if process_started_alive {
+        let (mut response_process_id, mut exit_code) = if process_started_alive {
             match self.refresh_process_state(process_id).await {
                 ProcessStatus::Alive {
                     exit_code,
@@ -723,6 +987,33 @@ impl UnifiedExecProcessManager {
                 })?;
             (None, exit_code)
         };
+
+        if response_process_id.is_some()
+            && context.initial_output_destination != InitialExecCommandOutputDestination::Untracked
+        {
+            let store = self.process_store.lock().await;
+            let process_is_still_stored = store
+                .processes
+                .get(&process_id)
+                .is_some_and(|entry| Arc::ptr_eq(&entry.process, &process));
+            if process_is_still_stored {
+                let mut pending = self.initial_exec_outputs_pending_recording.lock().await;
+                if let Some(state) = initial_exec_command_guard.take_state() {
+                    pending.entry(context.call_id.clone()).or_default().push(
+                        PendingInitialExecCommandOutput {
+                            process_id,
+                            state: Arc::clone(&state),
+                            process: Arc::clone(&process),
+                            destination: context.initial_output_destination,
+                        },
+                    );
+                    state.mark_returned();
+                }
+            } else {
+                response_process_id = None;
+                exit_code = process.exit_code();
+            }
+        }
 
         let response = ExecCommandToolOutput {
             event_call_id: context.call_id.clone(),
@@ -841,8 +1132,10 @@ impl UnifiedExecProcessManager {
             let message =
                 network_denial_message_for_session(session.as_ref(), network_approval.clone())
                     .await;
+            let error = fail_process_with_message(process.as_ref(), message)
+                .with_collected_process_output(&collected);
             self.release_process_id(process_id).await;
-            return Err(fail_process_with_message(process.as_ref(), message));
+            return Err(error);
         }
         if let Some(message) = process.failure_message() {
             let finish_result = finish_deferred_network_approval_for_session(
@@ -852,9 +1145,12 @@ impl UnifiedExecProcessManager {
             .await;
             self.release_process_id(process_id).await;
             if let Err(message) = finish_result {
-                return Err(fail_process_with_message(process.as_ref(), message));
+                return Err(fail_process_with_message(process.as_ref(), message)
+                    .with_collected_process_output(&collected));
             }
-            return Err(UnifiedExecError::process_failed(message));
+            return Err(
+                UnifiedExecError::process_failed(message).with_collected_process_output(&collected)
+            );
         }
 
         // After polling, refresh_process_state tells us whether the PTY is
@@ -877,7 +1173,8 @@ impl UnifiedExecProcessManager {
                 if let Err(message) =
                     finish_network_approval_after_process_exit_for_entry(&entry).await
                 {
-                    return Err(fail_process_with_message(entry.process.as_ref(), message));
+                    return Err(fail_process_with_message(entry.process.as_ref(), message)
+                        .with_collected_process_output(&collected));
                 }
                 (None, exit_code, call_id)
             }
@@ -987,7 +1284,7 @@ impl UnifiedExecProcessManager {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn store_process(
+    async fn store_process_locked(
         &self,
         process: Arc<UnifiedExecProcess>,
         context: &UnifiedExecContext,
@@ -1002,37 +1299,39 @@ impl UnifiedExecProcessManager {
         network_denial_monitor: Option<tokio::task::JoinHandle<()>>,
         metrics_sidecar: Option<PluginMetricsSidecar>,
         transcript: Arc<tokio::sync::Mutex<HeadTailBuffer>>,
-        initial_exec_command_active: Arc<AtomicBool>,
-    ) {
+        initial_exec_command_state: Arc<InitialExecCommandState>,
+        notify_yielded_completion: bool,
+    ) -> Option<ProcessEntry> {
         let plugin_metrics_sidecar =
             metrics_sidecar.map(|sidecar| Arc::new(std::sync::Mutex::new(Some(sidecar))));
+        let completion_notification = notify_yielded_completion.then(|| {
+            YieldedExecCompletionContext::new(
+                Arc::clone(&initial_exec_command_state),
+                hook_command.clone(),
+            )
+        });
         let entry = ProcessEntry {
             process: Arc::clone(&process),
             plugin_metrics_sidecar: plugin_metrics_sidecar.clone(),
             call_id: context.call_id.clone(),
             process_id,
             cwd: cwd.clone(),
-            initial_exec_command_active,
+            initial_exec_command_state,
             hook_command,
             tty,
             network_approval,
             session: Arc::downgrade(&context.session),
             last_used: started_at,
         };
+        let mut exec_watcher_tasks = self.exec_watcher_tasks.lock().await;
+        exec_watcher_tasks.retain(|watcher| !watcher.is_finished());
         let pruned_entry = {
             let mut store = self.process_store.lock().await;
             let pruned_entry = Self::prune_processes_if_needed(&mut store);
             store.processes.insert(process_id, entry);
             pruned_entry
         };
-        // prune_processes_if_needed runs while holding process_store; do async
-        // network-approval cleanup only after dropping that lock.
-        if let Some(pruned_entry) = pruned_entry {
-            unregister_network_approval_for_entry(&pruned_entry).await;
-            pruned_entry.process.terminate();
-        }
-
-        spawn_exit_watcher(
+        let watcher = spawn_exit_watcher(
             Arc::clone(&process),
             Arc::clone(&context.session),
             Arc::clone(&context.step_context.turn),
@@ -1045,7 +1344,13 @@ impl UnifiedExecProcessManager {
             started_at,
             network_denial_monitor,
             plugin_metrics_sidecar,
+            completion_notification,
         );
+        exec_watcher_tasks.push(watcher);
+        if let Some(pruned_entry) = pruned_entry.as_ref() {
+            pruned_entry.process.terminate();
+        }
+        pruned_entry
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1337,6 +1642,7 @@ impl UnifiedExecProcessManager {
                 &mut pause_state,
                 &mut deadline,
                 &mut post_exit_deadline,
+                cancellation_token,
             )
             .await;
             let drained_output: HeadTailBuffer<MAX_BYTES>;
@@ -1412,6 +1718,7 @@ impl UnifiedExecProcessManager {
         pause_state: &mut Option<watch::Receiver<bool>>,
         deadline: &mut Instant,
         post_exit_deadline: &mut Option<Instant>,
+        cancellation_token: &CancellationToken,
     ) {
         let Some(receiver) = pause_state.as_mut() else {
             return;
@@ -1421,9 +1728,18 @@ impl UnifiedExecProcessManager {
         }
 
         let paused_at = Instant::now();
+        let mut process_exited = false;
         while *receiver.borrow() {
-            if receiver.changed().await.is_err() {
-                break;
+            tokio::select! {
+                _ = cancellation_token.cancelled() => {
+                    process_exited = true;
+                    break;
+                }
+                changed = receiver.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
             }
         }
 
@@ -1431,6 +1747,9 @@ impl UnifiedExecProcessManager {
         *deadline += paused_for;
         if let Some(post_exit_deadline) = post_exit_deadline.as_mut() {
             *post_exit_deadline += paused_for;
+        }
+        if process_exited {
+            *pause_state = None;
         }
     }
 
@@ -1452,6 +1771,7 @@ impl UnifiedExecProcessManager {
         let mut meta: Vec<(i32, Instant, bool)> = store
             .processes
             .iter()
+            .filter(|(_, entry)| !entry.initial_exec_command_state.is_unrecorded())
             .map(|(id, entry)| (*id, entry.last_used, entry.process.has_exited()))
             .collect();
         let mut found_locked_exited_process = false;
@@ -1518,21 +1838,30 @@ impl UnifiedExecProcessManager {
     }
 
     pub(crate) async fn terminate_all_processes(&self) {
-        let entries: Vec<ProcessEntry> = {
+        let _watcher_lifecycle_guard = self.watcher_lifecycle_lock.lock().await;
+        // Session teardown is a deliberate stop, not a crash: mark monitors
+        // before killing so each watcher's terminal notification says so.
+        for handle in self.monitor_store.lock().await.all() {
+            handle.request_stop();
+        }
+        let (entries, processes) = {
             let mut processes = self.process_store.lock().await;
-            let entries: Vec<ProcessEntry> = processes
+            let process_handles = processes
                 .processes
-                .drain()
-                .map(|(_, entry)| entry)
-                .collect();
-            processes.reserved_process_ids.clear();
-            entries
+                .values()
+                .map(|entry| Arc::clone(&entry.process))
+                .collect::<Vec<_>>();
+            (processes.drain_unclaimed(), process_handles)
         };
 
         for entry in entries {
             unregister_network_approval_for_entry(&entry).await;
-            entry.process.terminate();
         }
+        for process in processes {
+            process.terminate();
+        }
+        self.join_exec_watchers_locked().await;
+        self.join_monitor_watchers_locked().await;
     }
 
     pub(crate) async fn list_processes(&self) -> Vec<BackgroundTerminalInfo> {
@@ -1554,20 +1883,166 @@ impl UnifiedExecProcessManager {
             .collect()
     }
 
+    pub(crate) async fn prepare_initial_exec_command_output_persistence(
+        &self,
+        outputs: &[(String, String)],
+    ) -> InitialExecOutputPersistenceDecision {
+        let mut extracted = Vec::new();
+        if outputs.is_empty() {
+            return InitialExecOutputPersistenceDecision {
+                pending_outputs: extracted,
+                process_store: Arc::clone(&self.process_store),
+            };
+        }
+        let mut pending = self.initial_exec_outputs_pending_recording.lock().await;
+        let call_ids = outputs
+            .iter()
+            .map(|(call_id, _)| call_id)
+            .collect::<HashSet<_>>();
+        for call_id in call_ids {
+            let Some(mut states) = pending.remove(call_id) else {
+                continue;
+            };
+            let recorded_process_ids = outputs
+                .iter()
+                .filter(|(output_call_id, _)| output_call_id == call_id)
+                .filter_map(|(_, output)| {
+                    output
+                        .lines()
+                        .take_while(|line| *line != "Output:")
+                        .find_map(|line| line.strip_prefix("Process running with session ID "))
+                        .and_then(|process_id| process_id.parse::<i32>().ok())
+                })
+                .collect::<HashSet<_>>();
+            for pending_output in states.drain(..) {
+                if pending_output.destination == InitialExecCommandOutputDestination::Rollout
+                    && recorded_process_ids.contains(&pending_output.process_id)
+                {
+                    extracted.push(pending_output);
+                } else {
+                    pending
+                        .entry(call_id.clone())
+                        .or_default()
+                        .push(pending_output);
+                }
+            }
+        }
+        InitialExecOutputPersistenceDecision {
+            pending_outputs: extracted,
+            process_store: Arc::clone(&self.process_store),
+        }
+    }
+
+    pub(crate) async fn discard_unrecorded_initial_exec_command_outputs(&self) {
+        let mut pending = self.initial_exec_outputs_pending_recording.lock().await;
+        let mut abandoned = Vec::new();
+        let mut retained = HashMap::new();
+        for (call_id, states) in pending.drain() {
+            for pending_output in states {
+                if pending_output.destination == InitialExecCommandOutputDestination::Rollout {
+                    pending_output.state.mark_not_yielded();
+                    pending_output.process.terminate();
+                    abandoned.push((pending_output.process_id, pending_output.state));
+                } else {
+                    retained
+                        .entry(call_id.clone())
+                        .or_insert_with(Vec::new)
+                        .push(pending_output);
+                }
+            }
+        }
+        *pending = retained;
+        drop(pending);
+        self.remove_abandoned_initial_exec_processes(abandoned);
+    }
+
+    pub(crate) async fn acknowledge_code_mode_initial_exec_output(
+        &self,
+        call_id: &str,
+        process_id: i32,
+    ) {
+        let mut pending = self.initial_exec_outputs_pending_recording.lock().await;
+        let Some(mut states) = pending.remove(call_id) else {
+            return;
+        };
+        for pending_output in states.drain(..) {
+            if pending_output.destination == InitialExecCommandOutputDestination::CodeMode
+                && pending_output.process_id == process_id
+            {
+                pending_output.state.mark_yielded();
+            } else {
+                pending
+                    .entry(call_id.to_string())
+                    .or_default()
+                    .push(pending_output);
+            }
+        }
+    }
+
+    pub(crate) async fn discard_code_mode_initial_exec_outputs(&self, call_id: &str) {
+        let mut pending = self.initial_exec_outputs_pending_recording.lock().await;
+        let Some(states) = pending.remove(call_id) else {
+            return;
+        };
+        let mut abandoned = Vec::new();
+        for pending_output in states {
+            if pending_output.destination == InitialExecCommandOutputDestination::CodeMode {
+                pending_output.state.mark_not_yielded();
+                pending_output.process.terminate();
+                abandoned.push((pending_output.process_id, pending_output.state));
+            } else {
+                pending
+                    .entry(call_id.to_string())
+                    .or_default()
+                    .push(pending_output);
+            }
+        }
+        drop(pending);
+        self.remove_abandoned_initial_exec_processes(abandoned);
+    }
+
+    fn remove_abandoned_initial_exec_processes(
+        &self,
+        abandoned: Vec<(i32, Arc<InitialExecCommandState>)>,
+    ) {
+        remove_abandoned_initial_exec_processes_from_store(
+            Arc::clone(&self.process_store),
+            abandoned,
+        );
+    }
+
     pub(crate) async fn terminate_process(&self, process_id: i32) -> bool {
-        let (process, already_exited) = {
+        let (process, already_exited, network_approval, session) = {
             let store = self.process_store.lock().await;
             let Some(entry) = store.processes.get(&process_id) else {
                 return false;
             };
-            (Arc::clone(&entry.process), entry.process.has_exited())
+            (
+                Arc::clone(&entry.process),
+                entry.process.has_exited(),
+                entry.network_approval.clone(),
+                entry.session.clone(),
+            )
         };
 
         if !already_exited && process.terminate_confirmed().await.is_err() {
             return false;
         }
 
-        let entry = {
+        // Keep the process result available until cancellation-prone cleanup
+        // completes. If this future is dropped while unregistering, the exit
+        // watcher can still claim and durably announce the terminal result.
+        if let Some(network_approval) = network_approval
+            && let Some(session) = session.upgrade()
+        {
+            session
+                .services
+                .network_approval
+                .unregister_call(network_approval.registration_id())
+                .await;
+        }
+
+        {
             let mut store = self.process_store.lock().await;
             let Some(entry) = store.processes.get(&process_id) else {
                 return true;
@@ -1575,17 +2050,168 @@ impl UnifiedExecProcessManager {
             if !Arc::ptr_eq(&entry.process, &process) {
                 return true;
             }
-            if entry.initial_exec_command_active.load(Ordering::Acquire) {
+            if entry.initial_exec_command_state.is_unrecorded() {
                 return true;
             }
-            let Some(entry) = store.remove(process_id) else {
-                return false;
-            };
-            entry
+            // Once the watcher has announced a terminal result, retain the
+            // entry so the notification-directed write_stdin poll can collect
+            // it. Capacity pruning and session shutdown remain the bounded
+            // cleanup paths.
+            if entry
+                .initial_exec_command_state
+                .terminal_notification_claimed()
+            {
+                return true;
+            }
+            if store.remove_unclaimed(process_id).is_none() {
+                return true;
+            }
+        }
+
+        true
+    }
+
+    /// Register watcher metadata for a freshly spawned process and start its
+    /// notification pump. Returns the output the process had already produced,
+    /// which the caller must still account for in the tool result.
+    ///
+    /// A process starts writing the moment it is spawned, well before this runs
+    /// — approvals and sandbox selection sit in between. A broadcast receiver
+    /// only sees what is sent after it subscribes, so subscribing alone drops
+    /// the head of the output, and the head is usually the line that says what
+    /// started or why it failed. The complete bytes are in the process's own
+    /// output buffer, so the seed is taken from there and the subscription is
+    /// made under the same lock the reader takes to append: the reader cannot
+    /// publish between the two.
+    async fn attach_monitor_locked(
+        &self,
+        request: &ExecCommandRequest,
+        context: &UnifiedExecContext,
+        process: &Arc<UnifiedExecProcess>,
+        transcript: &Arc<tokio::sync::Mutex<HeadTailBuffer>>,
+        attachment: MonitorAttachment,
+    ) -> Vec<u8> {
+        let (transcript_seed, notification_seed, receiver) = {
+            let mut output_buffer = process.output_handles().output_buffer.lock().await;
+            let mut monitor_output_buffer = process.monitor_output_buffer().lock().await;
+            let transcript_seed = output_buffer.drain();
+            let notification_seed = monitor_output_buffer.take().unwrap_or_default();
+            (
+                transcript_seed.to_bytes_with_omission_marker(),
+                notification_seed.to_bytes_with_omission_marker(),
+                process.monitor_output_receiver(),
+            )
         };
 
-        unregister_network_approval_for_entry(&entry).await;
-        true
+        // The transcript backs `monitor` `read`, so it retains both stdout and
+        // stderr even though only the stdout seed is sent to the model.
+        if !transcript_seed.is_empty() {
+            transcript.lock().await.push_chunk(&transcript_seed);
+        }
+
+        let handle = Arc::new(MonitorHandle::new(
+            request.process_id,
+            attachment.command_display,
+            request.cwd.to_string(),
+            attachment.kind,
+            attachment.owner,
+            Arc::clone(process),
+            Arc::clone(transcript),
+        ));
+        let mut monitor_store = self.monitor_store.lock().await;
+        let mut monitor_watcher_tasks = self.monitor_watcher_tasks.lock().await;
+        monitor_watcher_tasks.retain(|watcher| !watcher.is_finished());
+        monitor_store.insert(Arc::clone(&handle));
+        let watcher = spawn_monitor_watcher(
+            handle,
+            Arc::clone(&context.session),
+            Arc::clone(&context.step_context.turn),
+            attachment.timeout,
+            notification_seed,
+            receiver,
+        );
+        monitor_watcher_tasks.push(watcher);
+        transcript_seed
+    }
+
+    async fn join_exec_watchers_locked(&self) {
+        let watchers = std::mem::take(&mut *self.exec_watcher_tasks.lock().await);
+        for watcher in watchers {
+            if let Err(err) = watcher.await
+                && !err.is_cancelled()
+            {
+                tracing::warn!("exec watcher task failed during shutdown: {err}");
+            }
+        }
+    }
+
+    async fn join_monitor_watchers_locked(&self) {
+        let watchers = std::mem::take(&mut *self.monitor_watcher_tasks.lock().await);
+        for watcher in watchers {
+            if let Err(err) = watcher.await
+                && !err.is_cancelled()
+            {
+                tracing::warn!("monitor watcher task failed during shutdown: {err}");
+            }
+        }
+    }
+
+    async fn monitor(&self, process_id: i32) -> Option<Arc<MonitorHandle>> {
+        self.monitor_store.lock().await.get(process_id)
+    }
+
+    /// Every monitor this session started, including finished ones whose
+    /// retained output is still readable.
+    pub(crate) async fn list_monitors(&self) -> Vec<MonitorInfo> {
+        let handles = self.monitor_store.lock().await.all();
+        let mut infos = Vec::with_capacity(handles.len());
+        for handle in handles {
+            infos.push(handle.info().await);
+        }
+        infos
+    }
+
+    /// Read a monitor's bounded retained output, optionally acknowledging the
+    /// notifications it has delivered.
+    pub(crate) async fn read_monitor_output(
+        &self,
+        process_id: i32,
+        acknowledgement: MonitorAcknowledgement,
+    ) -> Option<MonitorOutput> {
+        let handle = self.monitor(process_id).await?;
+        Some(handle.output(acknowledgement).await)
+    }
+
+    /// Stop a monitor. The watcher still delivers the terminal notification —
+    /// classified as `stopped` rather than as a bare exit code.
+    pub(crate) async fn stop_monitor(&self, process_id: i32) -> Option<bool> {
+        let handle = self.monitor(process_id).await?;
+        if handle.state().is_terminal() {
+            return Some(false);
+        }
+        handle.request_stop();
+        if !self.terminate_process(process_id).await {
+            // A short-lived monitor is never stored in the process store, and a
+            // pruned one has already been removed; terminate the handle we hold.
+            handle.process().terminate();
+        }
+        Some(true)
+    }
+
+    /// Wait for a monitor to reach a terminal state, giving up after `timeout`.
+    pub(crate) async fn wait_for_monitor(
+        &self,
+        process_id: i32,
+        timeout: Duration,
+    ) -> Option<MonitorWaitOutcome> {
+        let handle = self.monitor(process_id).await?;
+        let completed = tokio::time::timeout(timeout, handle.wait_for_terminal())
+            .await
+            .is_ok();
+        Some(MonitorWaitOutcome {
+            completed,
+            info: handle.info().await,
+        })
     }
 }
 

@@ -90,6 +90,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -119,6 +120,18 @@ fn capture_test_op(op: &Op) -> Option<Op> {
         Op::Interrupt => Some(Op::Interrupt),
         Op::InterAgentCommunication { communication } => Some(Op::InterAgentCommunication {
             communication: communication.clone(),
+        }),
+        Op::InterAgentCompletion { communication } => Some(Op::InterAgentCompletion {
+            communication: communication.clone(),
+        }),
+        Op::SubagentCompletion {
+            agent_reference,
+            status,
+            turn_id,
+        } => Some(Op::SubagentCompletion {
+            agent_reference: agent_reference.clone(),
+            status: status.clone(),
+            turn_id: turn_id.clone(),
         }),
         Op::Shutdown => Some(Op::Shutdown),
         _ => None,
@@ -335,6 +348,10 @@ pub(crate) struct ResumeThreadWithHistoryOptions {
 /// function to require an `Arc<&Self>`.
 pub(crate) struct ThreadManagerState {
     threads: Arc<RwLock<HashMap<ThreadId, Arc<CodexThread>>>>,
+    shutdown_gate: tokio::sync::Mutex<()>,
+    thread_spawn_gate: RwLock<()>,
+    shutdown_started: AtomicBool,
+    thread_spawn_epoch: AtomicU64,
     thread_created_tx: broadcast::Sender<ThreadId>,
     thread_id_generator: ThreadIdGenerator,
     auth_manager: Arc<AuthManager>,
@@ -463,6 +480,10 @@ impl ThreadManager {
         Self {
             state: Arc::new(ThreadManagerState {
                 threads: Arc::new(RwLock::new(HashMap::new())),
+                shutdown_gate: tokio::sync::Mutex::new(()),
+                thread_spawn_gate: RwLock::new(()),
+                shutdown_started: AtomicBool::new(false),
+                thread_spawn_epoch: AtomicU64::new(0),
                 thread_created_tx,
                 thread_id_generator: default_thread_id_generator(),
                 models_manager,
@@ -609,6 +630,10 @@ impl ThreadManager {
         Self {
             state: Arc::new(ThreadManagerState {
                 threads: Arc::new(RwLock::new(HashMap::new())),
+                shutdown_gate: tokio::sync::Mutex::new(()),
+                thread_spawn_gate: RwLock::new(()),
+                shutdown_started: AtomicBool::new(false),
+                thread_spawn_epoch: AtomicU64::new(0),
                 thread_created_tx,
                 thread_id_generator: default_thread_id_generator(),
                 models_manager: create_model_provider(provider, Some(auth_manager.clone()))
@@ -1100,7 +1125,11 @@ impl ThreadManager {
     /// Threads that complete shutdown are removed from the manager; incomplete shutdowns
     /// remain tracked so callers can retry or inspect them later.
     pub async fn shutdown_all_threads_bounded(&self, timeout: Duration) -> ThreadShutdownReport {
+        let _shutdown_guard = self.state.shutdown_gate.lock().await;
         let threads = {
+            let _thread_spawn_guard = self.state.thread_spawn_gate.write().await;
+            self.state.shutdown_started.store(true, Ordering::Release);
+            self.state.thread_spawn_epoch.fetch_add(1, Ordering::AcqRel);
             let threads = self.state.threads.read().await;
             threads
                 .iter()
@@ -1134,6 +1163,7 @@ impl ThreadManager {
         for thread_id in &report.completed {
             tracked_threads.remove(thread_id);
         }
+        drop(tracked_threads);
 
         report
             .completed
@@ -1144,6 +1174,10 @@ impl ThreadManager {
         report
             .timed_out
             .sort_by_key(std::string::ToString::to_string);
+        if report.submit_failed.is_empty() && report.timed_out.is_empty() {
+            let _thread_spawn_guard = self.state.thread_spawn_gate.write().await;
+            self.state.shutdown_started.store(false, Ordering::Release);
+        }
         report
     }
 
@@ -1761,6 +1795,15 @@ impl ThreadManagerState {
 
     /// Spawn a new thread with optional history and register it with the manager.
     async fn spawn_thread(&self, request: ThreadSpawnRequest) -> CodexResult<NewThread> {
+        let spawn_epoch = {
+            let _thread_spawn_guard = self.thread_spawn_gate.read().await;
+            if self.shutdown_started.load(Ordering::Acquire) {
+                return Err(CodexErr::UnsupportedOperation(
+                    "thread manager is shutting down".to_string(),
+                ));
+            }
+            self.thread_spawn_epoch.load(Ordering::Acquire)
+        };
         let ThreadSpawnRequest {
             options,
             auth_manager,
@@ -1910,7 +1953,7 @@ impl ThreadManagerState {
             session.services.mcp_runtime.enable_full_access_form_input();
         }
         let new_thread = self
-            .finalize_thread_spawn(session, io, tracked_session_source)
+            .finalize_thread_spawn(session, io, tracked_session_source, spawn_epoch)
             .await?;
         if source_changed_during_startup.load(Ordering::Acquire) {
             new_thread.thread.session.request_mcp_runtime_refresh();
@@ -1926,6 +1969,7 @@ impl ThreadManagerState {
         session: Arc<Session>,
         io: SessionIo,
         session_source: SessionSource,
+        spawn_epoch: u64,
     ) -> CodexResult<NewThread> {
         let thread_id = session.thread_id();
         let event = io.next_event().await?;
@@ -1939,6 +1983,18 @@ impl ThreadManagerState {
             }
         };
 
+        let thread_spawn_guard = self.thread_spawn_gate.read().await;
+        if self.shutdown_started.load(Ordering::Acquire)
+            || self.thread_spawn_epoch.load(Ordering::Acquire) != spawn_epoch
+        {
+            drop(thread_spawn_guard);
+            if let Err(err) = io.shutdown_and_wait().await {
+                warn!("failed to shut down thread rejected during manager shutdown: {err}");
+            }
+            return Err(CodexErr::UnsupportedOperation(
+                "thread manager is shutting down".to_string(),
+            ));
+        }
         {
             let mut threads = self.threads.write().await;
             if let std::collections::hash_map::Entry::Vacant(e) = threads.entry(thread_id) {
@@ -1957,6 +2013,7 @@ impl ThreadManagerState {
                 });
             }
         }
+        drop(thread_spawn_guard);
 
         if let Err(err) = io.shutdown_and_wait().await {
             warn!("failed to shut down duplicate thread {thread_id}: {err}");

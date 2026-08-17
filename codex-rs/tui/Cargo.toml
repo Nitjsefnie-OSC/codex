@@ -40,6 +40,7 @@ codex-exec-server = { workspace = true }
 codex-features = { workspace = true }
 codex-feedback = { workspace = true }
 codex-file-search = { workspace = true }
+codex-fork-manifest = { workspace = true }
 codex-git-utils = { workspace = true }
 codex-http-client = { workspace = true }
 codex-login = { workspace = true }

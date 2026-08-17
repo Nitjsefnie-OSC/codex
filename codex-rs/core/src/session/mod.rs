@@ -232,7 +232,10 @@ use self::code_mode_warning::unsupported_code_mode_warning;
 #[cfg(test)]
 use self::handlers::submission_dispatch_span;
 use self::handlers::submission_loop;
+pub(crate) use self::input_queue::InputQueue;
 pub(crate) use self::input_queue::InputQueueActivity;
+pub(crate) use self::input_queue::PendingInputBatch;
+pub(crate) use self::input_queue::PendingTurnProvenance;
 pub(crate) use self::input_queue::TurnInput;
 pub(crate) use self::input_queue::TurnInputQueue;
 use self::review::spawn_review_thread;
@@ -2005,72 +2008,91 @@ impl Session {
     }
 
     /// Sends the standard completion envelope from a spawned MultiAgentV2 child to its parent.
-    async fn forward_child_completion_to_parent(
-        &self,
-        turn_context: &TurnContext,
+    fn forward_child_completion_to_parent<'a>(
+        &'a self,
+        turn_context: &'a TurnContext,
         parent_thread_id: ThreadId,
-        child_agent_path: &codex_protocol::AgentPath,
+        child_agent_path: &'a codex_protocol::AgentPath,
         status: AgentStatus,
-    ) {
-        let Some(parent_agent_path) = child_agent_path
-            .as_str()
-            .rsplit_once('/')
-            .and_then(|(parent, _)| codex_protocol::AgentPath::try_from(parent).ok())
-        else {
-            return;
-        };
-
-        let Some(message) = format_inter_agent_completion_message(
-            parent_agent_path.clone(),
-            child_agent_path.clone(),
-            &status,
-        ) else {
-            return;
-        };
-        // `communication` owns the message. Keep a second copy only when the
-        // recorder will actually need it after parent delivery succeeds.
-        let trace_message = self
-            .services
-            .rollout_thread_trace
-            .is_enabled()
-            .then(|| message.clone());
-        let communication = InterAgentCommunication::new(
-            child_agent_path.clone(),
-            parent_agent_path,
-            Vec::new(),
-            message,
-            /*trigger_turn*/ false,
-        );
-        let context =
-            AgentCommunicationContext::new(AgentCommunicationKind::Result, self.thread_id);
-        if let Err(err) = self
-            .services
-            .agent_control
-            .send_inter_agent_communication(
-                parent_thread_id,
-                communication,
-                context,
-                /*parent_turn_id*/ None,
-                /*root_turn_id*/ None,
-            )
-            .await
-        {
-            debug!("failed to notify parent thread {parent_thread_id}: {err}");
-            return;
-        }
-        if let Some(message) = trace_message {
-            self.services
-                .rollout_thread_trace
-                .record_agent_result_interaction(
-                    turn_context.sub_id.as_str(),
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if let Err(err) = self
+                .services
+                .agent_control
+                .ensure_v2_agent_loaded_for_completion(
+                    (*turn_context.config).clone(),
                     parent_thread_id,
-                    &AgentResultTracePayload {
-                        child_agent_path: child_agent_path.as_str(),
-                        message: &message,
-                        status: &status,
-                    },
-                );
-        }
+                )
+                .await
+            {
+                debug!("failed to load parent thread {parent_thread_id} for completion: {err}");
+                return;
+            }
+            let Some(parent_agent_path) = child_agent_path
+                .as_str()
+                .rsplit_once('/')
+                .and_then(|(parent, _)| codex_protocol::AgentPath::try_from(parent).ok())
+            else {
+                return;
+            };
+            let parent_agent_path = crate::session_prefix::completion_agent_identity(
+                &parent_agent_path,
+                parent_thread_id,
+            );
+            let child_agent_path =
+                crate::session_prefix::completion_agent_identity(child_agent_path, self.thread_id);
+
+            let completion_turn_id =
+                crate::session_prefix::bounded_completion_turn_id(&turn_context.sub_id);
+            let Some(message) = format_inter_agent_completion_message(
+                &parent_agent_path,
+                &child_agent_path,
+                &status,
+                Some(&completion_turn_id),
+            ) else {
+                return;
+            };
+            // `communication` owns the message. Keep a second copy only when the
+            // recorder will actually need it after parent delivery succeeds.
+            let trace_message = self
+                .services
+                .rollout_thread_trace
+                .is_enabled()
+                .then(|| message.clone());
+            let trace_child_agent_path = child_agent_path.reference.clone();
+            let mut communication = InterAgentCommunication::new(
+                child_agent_path.model_path,
+                parent_agent_path.model_path,
+                Vec::new(),
+                message,
+                /*trigger_turn*/ false,
+            );
+            communication.set_turn_id_if_missing(&completion_turn_id);
+            let context =
+                AgentCommunicationContext::new(AgentCommunicationKind::Result, self.thread_id);
+            if let Err(err) = self
+                .services
+                .agent_control
+                .deliver_inter_agent_completion(parent_thread_id, communication, context)
+                .await
+            {
+                debug!("failed to notify parent thread {parent_thread_id}: {err}");
+                return;
+            }
+            if let Some(message) = trace_message {
+                self.services
+                    .rollout_thread_trace
+                    .record_agent_result_interaction(
+                        turn_context.sub_id.as_str(),
+                        parent_thread_id,
+                        &AgentResultTracePayload {
+                            child_agent_path: &trace_child_agent_path,
+                            message: &message,
+                            status: &status,
+                        },
+                    );
+            }
+        })
     }
 
     async fn maybe_mirror_event_text_to_realtime(&self, msg: &EventMsg) {
@@ -3083,9 +3105,32 @@ impl Session {
                     metadata: image,
                 });
         }
-        let rollout_items: Vec<RolloutItem> =
-            items.into_iter().map(RolloutItem::ResponseItem).collect();
-        self.persist_rollout_items(&rollout_items).await;
+        let function_call_outputs = response_items
+            .iter()
+            .filter_map(|item| match item {
+                ResponseItem::FunctionCallOutput {
+                    call_id, output, ..
+                } => output
+                    .text_content()
+                    .map(|output| (call_id.clone(), output.to_string())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let rollout_items = items
+            .into_iter()
+            .map(RolloutItem::ResponseItem)
+            .collect::<Vec<_>>();
+        if function_call_outputs.is_empty() {
+            self.persist_rollout_items(&rollout_items).await;
+        } else {
+            let decision = self
+                .services
+                .unified_exec_manager
+                .prepare_initial_exec_command_output_persistence(&function_call_outputs)
+                .await;
+            self.persist_rollout_items_with_exec_decision(rollout_items, decision)
+                .await;
+        }
         self.send_raw_response_items(turn_context, &response_items)
             .await;
     }
@@ -3245,6 +3290,9 @@ impl Session {
             approvals_reviewer: turn_context.config.approvals_reviewer,
             session_telemetry: turn_context.session_telemetry.clone(),
             turn: turn_context,
+            response_identity: Arc::new(
+                crate::session::step_context::ResponseIdentityState::default(),
+            ),
             environments,
             selected_capability_roots,
             executor_capability_discovery,
@@ -3376,17 +3424,23 @@ impl Session {
                 .map(|id| id.to_string()),
             window_id: Some(metadata.window_ids.window_id.to_string()),
         };
-        // Compaction starts a new history window, so its WorldState baseline must be full.
+        // Resetting background notification budgets and installing replacement history form
+        // one publication critical section. Holding the state guard while awaiting the reset
+        // means cancellation leaves the old history in place; once the reset completes, the
+        // replacement and baseline update have no intervening await.
         let mut world_state_item = None;
-        {
-            let mut state = self.state.lock().await;
-            state.replace_annotated_history(items, reference_context_item.clone());
-            if let Some(world_state) = world_state_baseline {
-                let snapshot = world_state.snapshot();
-                world_state_item = Some(WorldStateItem::full(snapshot.clone().into_object()));
-                state.history.set_world_state_baseline(snapshot);
-            }
+        let mut state = self.state.lock().await;
+        self.services
+            .unified_exec_manager
+            .begin_notification_window()
+            .await;
+        state.replace_annotated_history(items, reference_context_item.clone());
+        if let Some(world_state) = world_state_baseline {
+            let snapshot = world_state.snapshot();
+            world_state_item = Some(WorldStateItem::full(snapshot.clone().into_object()));
+            state.history.set_world_state_baseline(snapshot);
         }
+        drop(state);
 
         self.persist_rollout_items(&[RolloutItem::Compacted(compacted_item)])
             .await;
@@ -3405,6 +3459,26 @@ impl Session {
         }
     }
 
+    async fn persist_rollout_items_with_exec_decision(
+        &self,
+        rollout_items: Vec<RolloutItem>,
+        decision: crate::unified_exec::InitialExecOutputPersistenceDecision,
+    ) {
+        let Some(live_thread) = self.live_thread().cloned() else {
+            decision.commit();
+            return;
+        };
+        let persistence = tokio::spawn(async move {
+            live_thread
+                .append_items_with_post_commit(&rollout_items, || decision.commit())
+                .await
+        });
+        match persistence.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => error!("failed to record rollout items: {error:#}"),
+            Err(error) => error!("rollout persistence task failed: {error}"),
+        }
+    }
     pub fn enabled(&self, feature: Feature) -> bool {
         self.features.enabled(feature)
     }
@@ -3715,11 +3789,18 @@ impl Session {
 
     #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
     pub(crate) async fn persist_rollout_items(&self, items: &[RolloutItem]) {
-        if let Some(live_thread) = self.live_thread()
-            && let Err(e) = live_thread.append_items(items).await
-        {
+        self.try_persist_rollout_items(items).await;
+    }
+
+    async fn try_persist_rollout_items(&self, items: &[RolloutItem]) -> bool {
+        let Some(live_thread) = self.live_thread() else {
+            return true;
+        };
+        if let Err(e) = live_thread.append_items(items).await {
             error!("failed to record rollout items: {e:#}");
+            return false;
         }
+        true
     }
 
     pub(crate) async fn clone_history(&self) -> ContextManager {

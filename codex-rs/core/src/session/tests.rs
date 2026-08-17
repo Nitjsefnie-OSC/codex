@@ -6,6 +6,10 @@ use crate::config::ConfigBuilder;
 use crate::config::ConfigOverrides;
 use crate::config::test_config;
 use crate::context::ContextualUserFragment;
+use crate::context::ExecCommandCompletion;
+use crate::context::ExecCommandCompletionNotification;
+use crate::context::MonitorNotification;
+use crate::context::SubagentNotification;
 use crate::context::TurnAborted;
 use crate::environment_selection::EnvironmentConfigOrigin;
 use crate::environment_selection::ThreadEnvironments;
@@ -13,6 +17,7 @@ use crate::environment_selection::TurnEnvironmentState;
 use crate::function_tool::FunctionCallError;
 use crate::hook_mcp_executor::CoreHookMcpExecutor;
 use crate::plugins::plugins_manager_for_config;
+use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::session::step_context::StepContext;
 use crate::shell::default_user_shell;
 use crate::shell_snapshot::ShellSnapshot;
@@ -81,12 +86,16 @@ use codex_protocol::turn_input::TurnInputSubmission;
 use codex_tools::ToolSpec;
 use codex_utils_path_uri::PathUri;
 use std::collections::BTreeMap;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use tracing::Span;
 
 use crate::connectors::AppInfo;
 use crate::rollout::recorder::RolloutRecorder;
 use crate::state::ActiveTurn;
+use crate::state::FinishingTurn;
 use crate::state::TaskKind;
+use crate::tasks::MailboxParentProvenance;
 use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskResult;
 use crate::tasks::UserShellCommandMode;
@@ -128,6 +137,7 @@ use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::ConversationAudioParams;
@@ -183,6 +193,7 @@ use opentelemetry_sdk::metrics::data::MetricData;
 use opentelemetry_sdk::metrics::data::ResourceMetrics;
 use std::path::Path;
 use std::time::Duration;
+use tokio::sync::Notify;
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
 use tokio::time::timeout;
@@ -218,6 +229,9 @@ impl StepContext {
             approvals_reviewer: turn.config.approvals_reviewer,
             session_telemetry: turn.session_telemetry.clone(),
             turn: Arc::clone(&turn),
+            response_identity: Arc::new(
+                crate::session::step_context::ResponseIdentityState::default(),
+            ),
             environments,
             selected_capability_roots: Vec::new(),
             executor_capability_discovery: None,
@@ -671,7 +685,7 @@ async fn interrupting_regular_turn_waiting_on_startup_prewarm_emits_turn_aborted
     assert!(duration_ms.is_some());
 }
 
-fn test_model_client_session() -> crate::client::ModelClientSession {
+pub(crate) fn test_model_client_session() -> crate::client::ModelClientSession {
     let thread_id = ThreadId::try_from("00000000-0000-4000-8000-000000000001")
         .expect("test thread id should be valid");
     crate::client::ModelClient::new(
@@ -6000,6 +6014,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         conversation: Arc::new(RealtimeConversationManager::new()),
         active_turn: Mutex::new(None),
         async_hook_results,
+        shutdown_started: AtomicBool::new(false),
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         services,
@@ -7555,6 +7570,11 @@ async fn shutdown_complete_does_not_append_to_thread_store_after_shutdown() {
     assert!(session.async_hook_results.is_closed());
     assert!(session.async_hook_results.is_empty());
     assert!(result_sender.is_closed());
+    assert!(
+        session
+            .shutdown_started
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
 
     assert_eq!(
         codex_thread_store::InMemoryThreadStoreCalls {
@@ -8209,6 +8229,7 @@ where
         conversation: Arc::new(RealtimeConversationManager::new()),
         active_turn: Mutex::new(None),
         async_hook_results,
+        shutdown_started: AtomicBool::new(false),
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         services,
@@ -10151,6 +10172,235 @@ struct NeverEndingTask {
     listen_to_cancellation_token: bool,
 }
 
+#[derive(Clone, Copy)]
+struct HistoryReplacingAbortTask;
+
+struct ForcedAbortTask {
+    started: Arc<Notify>,
+    dropped: Arc<AtomicBool>,
+}
+
+struct DeliverOnAbortTask {
+    notification: MonitorNotification,
+}
+
+struct BlockingAbortTask {
+    abort_started: Arc<Notify>,
+    release_abort: Arc<Notify>,
+}
+
+struct BlockingStartTask {
+    started: Arc<Notify>,
+    run_count: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+struct RecordOnAbortTask {
+    item: ResponseItem,
+}
+
+struct TaskDropSignal {
+    dropped: Arc<AtomicBool>,
+}
+
+impl Drop for TaskDropSignal {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::Release);
+    }
+}
+
+impl SessionTask for ForcedAbortTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Compact
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.forced_abort"
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        _session: Arc<Session>,
+        _ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        _cancellation_token: CancellationToken,
+    ) -> SessionTaskResult {
+        let _drop_signal = TaskDropSignal {
+            dropped: Arc::clone(&self.dropped),
+        };
+        self.started.notify_one();
+        std::future::pending().await
+    }
+
+    async fn abort(&self, session: Arc<Session>, _ctx: Arc<TurnContext>) {
+        // This is the first history-recording boundary after the task future
+        // is dropped. If queued background persistence moves before abort
+        // handling, it is overwritten here and the test loses that delivery.
+        session
+            .replace_history(
+                vec![ResponseItem::Message {
+                    id: None,
+                    role: "assistant".to_string(),
+                    content: vec![ContentItem::OutputText {
+                        text: "forced abort history boundary".to_string(),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                }],
+                /*reference_context_item*/ None,
+            )
+            .await;
+    }
+}
+
+impl SessionTask for HistoryReplacingAbortTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Compact
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.history_replacing_abort"
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        session: Arc<Session>,
+        _ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        cancellation_token: CancellationToken,
+    ) -> SessionTaskResult {
+        cancellation_token.cancelled().await;
+        session
+            .replace_history(
+                vec![ResponseItem::Message {
+                    id: None,
+                    role: "assistant".to_string(),
+                    content: vec![ContentItem::OutputText {
+                        text: "history replaced during abort".to_string(),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                }],
+                /*reference_context_item*/ None,
+            )
+            .await;
+        Ok(None)
+    }
+}
+
+impl SessionTask for DeliverOnAbortTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.deliver_on_abort"
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        _session: Arc<Session>,
+        _ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        cancellation_token: CancellationToken,
+    ) -> SessionTaskResult {
+        cancellation_token.cancelled().await;
+        Ok(None)
+    }
+
+    async fn abort(&self, session: Arc<Session>, ctx: Arc<TurnContext>) {
+        session
+            .deliver_monitor_notification(self.notification.clone(), ctx.as_ref())
+            .await;
+    }
+}
+
+impl SessionTask for BlockingAbortTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.blocking_abort"
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        _session: Arc<Session>,
+        _ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        cancellation_token: CancellationToken,
+    ) -> SessionTaskResult {
+        cancellation_token.cancelled().await;
+        Ok(None)
+    }
+
+    async fn abort(&self, _session: Arc<Session>, _ctx: Arc<TurnContext>) {
+        self.abort_started.notify_one();
+        self.release_abort.notified().await;
+    }
+}
+
+impl SessionTask for BlockingStartTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.blocking_start"
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        _session: Arc<Session>,
+        _ctx: Arc<TurnContext>,
+        input: Vec<TurnInput>,
+        cancellation_token: CancellationToken,
+    ) -> SessionTaskResult {
+        assert_eq!(
+            input,
+            vec![TurnInput::UserInput {
+                content: vec![UserInput::Text {
+                    text: "preserve this start".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                client_id: None,
+            }],
+            "the pending start input must be preserved exactly",
+        );
+        self.run_count.fetch_add(1, Ordering::AcqRel);
+        self.started.notify_one();
+        cancellation_token.cancelled().await;
+        Ok(None)
+    }
+}
+
+impl SessionTask for RecordOnAbortTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.record_on_abort"
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        _session: Arc<Session>,
+        _ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        cancellation_token: CancellationToken,
+    ) -> SessionTaskResult {
+        cancellation_token.cancelled().await;
+        Ok(None)
+    }
+
+    async fn abort(&self, session: Arc<Session>, ctx: Arc<TurnContext>) {
+        session
+            .record_conversation_items(ctx.as_ref(), std::slice::from_ref(&self.item))
+            .await;
+    }
+}
+
 impl SessionTask for NeverEndingTask {
     fn kind(&self) -> TaskKind {
         self.kind
@@ -10458,6 +10708,239 @@ async fn abort_gracefully_emits_marker_before_turn_aborted() {
     assert!(rx.try_recv().is_err());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abort_cleanup_delivery_is_persisted_before_turn_aborted() {
+    let (sess, tc, rx) = make_session_and_context_with_rx().await;
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        DeliverOnAbortTask {
+            notification: MonitorNotification {
+                process_id: 17,
+                seq: 1,
+                command: "watch".to_string(),
+                kind: "watcher",
+                terminal_state: None,
+                lines: vec!["cleanup delivery".to_string()],
+                omitted_lines: 0,
+                suppressed_notifications: 0,
+                note: None,
+            },
+        },
+    )
+    .await;
+
+    timeout(
+        Duration::from_secs(2),
+        sess.abort_all_tasks(TurnAbortReason::Replaced),
+    )
+    .await
+    .expect("abort cleanup should not deadlock on background delivery");
+
+    let mut observed = Vec::new();
+    let history_at_abort = loop {
+        let event = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("turn abort event should be delivered")
+            .expect("event channel should remain open");
+        let is_terminal = matches!(&event.msg, EventMsg::TurnAborted(_));
+        observed.push(event.msg);
+        if is_terminal {
+            break sess.clone_history().await;
+        }
+    };
+
+    let monitor_index = observed
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                EventMsg::RawResponseItem(RawResponseItemEvent { item })
+                    if MonitorNotification::is_response_item(item)
+            )
+        })
+        .expect("abort cleanup notification should produce a raw response item");
+    let terminal_index = observed.len() - 1;
+    assert!(monitor_index < terminal_index);
+    assert_eq!(
+        1,
+        history_at_abort
+            .raw_items()
+            .filter(|item| MonitorNotification::is_response_item(item))
+            .count(),
+        "history reread at TurnAborted must include exactly one cleanup notification"
+    );
+    assert!(rx.try_recv().is_err(), "no event may follow TurnAborted");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aborting_sentinel_blocks_direct_task_start_until_cleanup_finishes() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let abort_started = Arc::new(Notify::new());
+    let release_abort = Arc::new(Notify::new());
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        BlockingAbortTask {
+            abort_started: Arc::clone(&abort_started),
+            release_abort: Arc::clone(&release_abort),
+        },
+    )
+    .await;
+
+    let abort_task = tokio::spawn({
+        let sess = Arc::clone(&sess);
+        async move {
+            sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+        }
+    });
+    timeout(Duration::from_secs(2), abort_started.notified())
+        .await
+        .expect("abort hook should reach its delivery-lock-free wait");
+
+    let next_turn = sess
+        .new_default_turn_with_sub_id("next-turn-after-abort".to_string())
+        .await;
+    let started = Arc::new(Notify::new());
+    let run_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let start_task = tokio::spawn({
+        let sess = Arc::clone(&sess);
+        let started = Arc::clone(&started);
+        let run_count = Arc::clone(&run_count);
+        async move {
+            sess.start_task(
+                next_turn,
+                vec![TurnInput::UserInput {
+                    content: vec![UserInput::Text {
+                        text: "preserve this start".to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                    client_id: None,
+                }],
+                BlockingStartTask { started, run_count },
+                MailboxParentProvenance::Ignore,
+            )
+            .await;
+        }
+    });
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let active = sess.active_turn.lock().await;
+            if active
+                .as_ref()
+                .is_some_and(|active_turn| active_turn.aborting && active_turn.task.is_none())
+            {
+                break;
+            }
+            drop(active);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("abort should retain a taskless sentinel");
+    assert!(
+        !start_task.is_finished(),
+        "direct start must wait instead of replacing the aborting sentinel"
+    );
+
+    release_abort.notify_one();
+    abort_task.await.expect("abort transaction should complete");
+    timeout(Duration::from_secs(2), started.notified())
+        .await
+        .expect("pending direct start should run after the sentinel clears");
+    assert_eq!(1, run_count.load(Ordering::Acquire));
+    assert!(
+        sess.active_turn
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|active_turn| active_turn.task.as_ref())
+            .is_some(),
+        "the successor task should remain installed exactly once"
+    );
+    start_task
+        .await
+        .expect("direct start should finish dispatching");
+
+    sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abort_cleanup_history_is_durable_before_turn_aborted() {
+    let (mut sess, tc, rx) = make_session_and_context_with_rx().await;
+    let store = attach_in_memory_thread_store(
+        Arc::get_mut(&mut sess).expect("session should be uniquely owned"),
+    )
+    .await;
+    let cleanup_item_id = ResponseItemId::with_suffix("msg", "cleanup-item");
+    let cleanup_item = ResponseItem::Message {
+        id: Some(cleanup_item_id.clone()),
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText {
+            text: "cleanup persisted before abort".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        RecordOnAbortTask {
+            item: cleanup_item.clone(),
+        },
+    )
+    .await;
+
+    sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+
+    let mut cleanup_event_seen = false;
+    let mut prepared_cleanup_item = None;
+    loop {
+        let event = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("turn abort event should be delivered")
+            .expect("event channel should remain open");
+        match &event.msg {
+            EventMsg::RawResponseItem(RawResponseItemEvent { item })
+                if item.id() == Some(&cleanup_item_id) =>
+            {
+                cleanup_event_seen = true;
+                prepared_cleanup_item = Some(item.clone());
+            }
+            EventMsg::TurnAborted(_) => break,
+            _ => {}
+        }
+    }
+
+    assert!(cleanup_event_seen);
+    let prepared_cleanup_item = prepared_cleanup_item.expect(
+        "the cleanup item with the stable id must be prepared and emitted before TurnAborted",
+    );
+    let durable_history = sess
+        .live_thread()
+        .expect("test should have persisted thread")
+        .load_history(/*include_archived*/ true)
+        .await
+        .expect("durable history should be readable at TurnAborted");
+    let cleanup_index = durable_history.items.iter().position(|item| {
+        matches!(item, RolloutItem::ResponseItem(envelope) if envelope.item == prepared_cleanup_item)
+    });
+    let terminal_index = durable_history
+        .items
+        .iter()
+        .position(|item| matches!(item, RolloutItem::EventMsg(EventMsg::TurnAborted(_))));
+    assert!(
+        cleanup_index.is_some_and(|cleanup_index| {
+            terminal_index.is_some_and(|terminal_index| cleanup_index < terminal_index)
+        }),
+        "abort cleanup must be durable before TurnAborted in rollout order"
+    );
+    let calls = wait_for_flush_count(&store, /*expected_flushes*/ 3).await;
+    assert_eq!(3, calls.flush_thread);
+    assert!(rx.try_recv().is_err(), "no event may follow TurnAborted");
+}
+
 async fn submit_steer_only(
     sess: &Arc<Session>,
     input: Vec<UserInput>,
@@ -10643,6 +11126,40 @@ async fn task_finish_emits_thread_idle_lifecycle_after_active_turn_clears() {
     assert!(session.active_turn.lock().await.is_none());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_idle_monitor_notifications_are_persisted_once_and_coalesce_wake() {
+    let (session, turn_context, _rx) = make_session_and_context_with_rx().await;
+    let notification = |seq| MonitorNotification {
+        process_id: 17,
+        seq,
+        command: "watch".to_string(),
+        kind: "watcher",
+        terminal_state: None,
+        lines: vec![format!("line-{seq}")],
+        omitted_lines: 0,
+        suppressed_notifications: 0,
+        note: None,
+    };
+
+    tokio::join!(
+        session.deliver_monitor_notification(notification(1), turn_context.as_ref()),
+        session.deliver_monitor_notification(notification(2), turn_context.as_ref()),
+    );
+
+    let history = session.clone_history().await;
+    assert_eq!(
+        2,
+        history
+            .raw_items()
+            .filter(|item| MonitorNotification::is_response_item(item))
+            .count(),
+        "racing idle notifications must not be dropped or duplicated"
+    );
+    assert!(session.input_queue.background_wake_requested());
+    assert!(session.input_queue.claim_background_wake());
+    assert!(!session.input_queue.claim_background_wake());
+}
+
 #[tokio::test]
 async fn thread_idle_lifecycle_waits_for_trigger_turn_mailbox_work() {
     struct ThreadIdleRecorder {
@@ -10687,6 +11204,42 @@ async fn thread_idle_lifecycle_waits_for_trigger_turn_mailbox_work() {
         .await;
 
     assert_eq!(0, calls.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn default_turn_construction_future_stays_small() {
+    let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
+    let future_size = {
+        let future = sess.new_default_turn_with_sub_id("future-size-regression".to_string());
+        std::mem::size_of_val(&future)
+    };
+
+    assert!(
+        future_size <= 8 * 1024,
+        "default turn construction future is {future_size} bytes"
+    );
+}
+
+#[tokio::test]
+async fn sampling_loop_future_boundary_is_pointer_sized() {
+    let (sess, turn_context) = make_session_and_context().await;
+    let sess = Arc::new(sess);
+    let turn_context = Arc::new(turn_context);
+    let future = super::turn::run_turn_sampling_loop(
+        Arc::clone(&sess),
+        Arc::clone(&turn_context),
+        CancellationToken::new(),
+        test_model_client_session(),
+        StepContext::for_test(Arc::clone(&turn_context)),
+        Arc::new(WorldState::default()),
+        Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        true,
+    );
+    let future_size = std::mem::size_of_val(&future);
+    assert!(
+        future_size <= 2 * std::mem::size_of::<usize>(),
+        "sampling loop API future boundary is {future_size} bytes"
+    );
 }
 
 #[tokio::test]
@@ -10819,6 +11372,795 @@ async fn trigger_turn_mailbox_mail_waits_for_next_turn_after_answer_boundary() {
     sess.abort_all_tasks(TurnAbortReason::Replaced).await;
 
     assert!(sess.input_queue.has_trigger_turn_mailbox_items().await);
+}
+
+#[tokio::test]
+async fn active_completion_preserves_earlier_mailbox_order() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let worker = AgentPath::try_from("/root/worker").expect("worker path should parse");
+    let progress = InterAgentCommunication::new(
+        worker.clone(),
+        AgentPath::root(),
+        Vec::new(),
+        "progress".to_string(),
+        /*trigger_turn*/ false,
+    );
+    let completion = InterAgentCommunication::new(
+        worker,
+        AgentPath::root(),
+        Vec::new(),
+        "done".to_string(),
+        /*trigger_turn*/ false,
+    );
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: true,
+        },
+    )
+    .await;
+    sess.input_queue
+        .enqueue_mailbox_communication(
+            progress.clone(),
+            /*parent_turn_id*/ None,
+            /*root_turn_id*/ None,
+        )
+        .await;
+
+    sess.deliver_inter_agent_completion(completion.clone())
+        .await;
+
+    assert_eq!(
+        (sess.input_queue.get_pending_input(&sess.active_turn).await).0,
+        vec![
+            TurnInput::InterAgentCommunication(progress),
+            TurnInput::AgentCompletion(completion),
+        ]
+    );
+    sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+}
+
+#[tokio::test]
+async fn active_mailbox_precedes_later_steer() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let progress = InterAgentCommunication::new(
+        AgentPath::try_from("/root/worker").expect("worker path should parse"),
+        AgentPath::root(),
+        Vec::new(),
+        "progress before steer".to_string(),
+        /*trigger_turn*/ false,
+    );
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: true,
+        },
+    )
+    .await;
+    {
+        let _delivery_guard = sess
+            .input_queue
+            .lock_background_notification_delivery()
+            .await;
+        sess.input_queue
+            .enqueue_or_inject_mailbox_communication(
+                &sess.active_turn,
+                progress.clone(),
+                /*parent_turn_id*/ None,
+                /*root_turn_id*/ None,
+            )
+            .await;
+    }
+
+    assert_eq!(
+        submit_steer_only(
+            &sess,
+            vec![UserInput::Text {
+                text: "steer after progress".to_string(),
+                text_elements: Vec::new(),
+            }],
+            &tc.sub_id,
+        )
+        .await,
+        TurnInputSubmission::Steered {
+            turn_id: tc.sub_id.clone(),
+        }
+    );
+
+    assert_eq!(
+        (sess.input_queue.get_pending_input(&sess.active_turn).await).0,
+        vec![
+            TurnInput::InterAgentCommunication(progress),
+            TurnInput::UserInput {
+                content: vec![UserInput::Text {
+                    text: "steer after progress".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                client_id: None,
+            },
+        ]
+    );
+    sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+}
+
+#[tokio::test]
+async fn deferred_mailbox_precedes_later_injected_context() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let progress = InterAgentCommunication::new(
+        AgentPath::try_from("/root/worker").expect("worker path should parse"),
+        AgentPath::root(),
+        Vec::new(),
+        "progress before injected context".to_string(),
+        /*trigger_turn*/ false,
+    );
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: true,
+        },
+    )
+    .await;
+    sess.input_queue
+        .defer_mailbox_delivery_to_next_turn(&sess.active_turn, &tc.sub_id)
+        .await;
+    sess.input_queue
+        .enqueue_mailbox_communication(
+            progress.clone(),
+            /*parent_turn_id*/ None,
+            /*root_turn_id*/ None,
+        )
+        .await;
+    let injected = user_message("context after progress");
+
+    sess.inject_if_running(vec![injected.clone()])
+        .await
+        .expect("context should inject into the running turn");
+
+    assert_eq!(
+        (sess.input_queue.get_pending_input(&sess.active_turn).await).0,
+        vec![
+            TurnInput::InterAgentCommunication(progress),
+            TurnInput::ResponseItem(injected.into()),
+        ]
+    );
+    sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+}
+
+#[tokio::test]
+async fn idle_mailbox_precedes_later_history_injection() {
+    let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
+    let progress = InterAgentCommunication::new(
+        AgentPath::try_from("/root/worker").expect("worker path should parse"),
+        AgentPath::root(),
+        Vec::new(),
+        "idle progress before injection".to_string(),
+        /*trigger_turn*/ false,
+    );
+    sess.input_queue
+        .enqueue_mailbox_communication(
+            progress, /*parent_turn_id*/ None, /*root_turn_id*/ None,
+        )
+        .await;
+
+    sess.inject_no_new_turn(
+        vec![user_message("history injection after progress")],
+        /*current_turn_context*/ None,
+    )
+    .await;
+
+    let history = sess.clone_history().await;
+    let texts = history
+        .raw_items()
+        .filter_map(|item| match item {
+            ResponseItem::AgentMessage { content, .. } => {
+                content.first().and_then(|content| match content {
+                    AgentMessageInputContent::InputText { text } => Some(text.as_str()),
+                    AgentMessageInputContent::EncryptedContent { .. } => None,
+                })
+            }
+            ResponseItem::Message { content, .. } => {
+                content.first().and_then(|content| match content {
+                    ContentItem::InputText { text } => Some(text.as_str()),
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        texts,
+        vec![
+            "idle progress before injection",
+            "history injection after progress",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn non_regular_task_persists_older_idle_mailbox_before_start() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let progress = InterAgentCommunication::new(
+        AgentPath::try_from("/root/worker").expect("worker path should parse"),
+        AgentPath::root(),
+        Vec::new(),
+        "idle progress before review".to_string(),
+        /*trigger_turn*/ false,
+    );
+    sess.input_queue
+        .enqueue_mailbox_communication(
+            progress, /*parent_turn_id*/ None, /*root_turn_id*/ None,
+        )
+        .await;
+
+    sess.spawn_task(
+        Arc::clone(&tc),
+        vec![TurnInput::UserInput {
+            content: vec![UserInput::Text {
+                text: "review after progress".to_string(),
+                text_elements: Vec::new(),
+            }],
+            client_id: None,
+        }],
+        NeverEndingTask {
+            kind: TaskKind::Review,
+            listen_to_cancellation_token: true,
+        },
+    )
+    .await;
+
+    let history = sess.clone_history().await;
+    assert!(history.raw_items().any(|item| {
+        matches!(item, ResponseItem::AgentMessage { content, .. }
+            if matches!(content.first(), Some(AgentMessageInputContent::InputText { text }) if text == "idle progress before review"))
+    }));
+    sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+}
+
+#[tokio::test]
+async fn non_regular_task_preserves_older_trigger_mail_wake() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let trigger = InterAgentCommunication::new(
+        AgentPath::try_from("/root/worker").expect("worker path should parse"),
+        AgentPath::root(),
+        Vec::new(),
+        "trigger before review".to_string(),
+        /*trigger_turn*/ true,
+    );
+    sess.input_queue
+        .enqueue_mailbox_communication(
+            trigger,
+            Some("parent-turn".to_string()),
+            /*root_turn_id*/ None,
+        )
+        .await;
+
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        NeverEndingTask {
+            kind: TaskKind::Review,
+            listen_to_cancellation_token: true,
+        },
+    )
+    .await;
+
+    assert!(sess.input_queue.background_wake_requested());
+    sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+}
+
+#[tokio::test]
+async fn interrupted_finishing_turn_persists_completion_without_wake() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    sess.input_queue
+        .request_background_wake(Default::default(), /*agent_completion*/ true);
+    sess.input_queue.request_agent_completion_activity();
+    let completion = InterAgentCommunication::new(
+        AgentPath::try_from("/root/worker").expect("worker path should parse"),
+        AgentPath::root(),
+        Vec::new(),
+        "completion during finish".to_string(),
+        /*trigger_turn*/ false,
+    );
+    let (terminal_persisted_tx, terminal_persisted_rx) = tokio::sync::watch::channel(false);
+    {
+        let mut active = sess.active_turn.lock().await;
+        let active_turn = active.get_or_insert_with(ActiveTurn::default);
+        active_turn.finishing = Some(FinishingTurn {
+            turn_context: Arc::clone(&tc),
+            terminal_persisted: terminal_persisted_rx,
+        });
+    }
+    sess.deliver_inter_agent_completion(completion).await;
+    terminal_persisted_tx.send_replace(true);
+
+    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+
+    assert!(
+        !sess.input_queue.background_wake_requested(),
+        "interrupt must suppress the persisted completion wake"
+    );
+    let (_, pending_activity) = sess.input_queue.subscribe_activity(None).await;
+    assert_eq!(pending_activity, None);
+    let history = sess.clone_history().await;
+    assert!(history.raw_items().any(|item| match item {
+        ResponseItem::AgentMessage { content, .. } => content.iter().any(|content| {
+            matches!(
+                content,
+                AgentMessageInputContent::InputText { text }
+                    if text.contains("completion during finish")
+            )
+        }),
+        _ => false,
+    }));
+}
+
+#[tokio::test]
+async fn interrupted_finishing_turn_does_not_wake_for_queue_only_mail() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let progress = InterAgentCommunication::new(
+        AgentPath::try_from("/root/worker").expect("worker path should parse"),
+        AgentPath::root(),
+        Vec::new(),
+        "queue only during finish".to_string(),
+        /*trigger_turn*/ false,
+    );
+    let (terminal_persisted_tx, terminal_persisted_rx) = tokio::sync::watch::channel(false);
+    {
+        let mut active = sess.active_turn.lock().await;
+        let active_turn = active.get_or_insert_with(ActiveTurn::default);
+        active_turn.finishing = Some(FinishingTurn {
+            turn_context: Arc::clone(&tc),
+            terminal_persisted: terminal_persisted_rx,
+        });
+    }
+    sess.input_queue
+        .enqueue_mailbox_communication(
+            progress, /*parent_turn_id*/ None, /*root_turn_id*/ None,
+        )
+        .await;
+    terminal_persisted_tx.send_replace(true);
+
+    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+
+    assert!(!sess.input_queue.background_wake_requested());
+}
+
+#[tokio::test]
+async fn replaced_finishing_turn_persists_older_mailbox_input() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let progress = InterAgentCommunication::new(
+        AgentPath::try_from("/root/worker").expect("worker path should parse"),
+        AgentPath::root(),
+        Vec::new(),
+        "mail before replacement".to_string(),
+        /*trigger_turn*/ false,
+    );
+    let (terminal_persisted_tx, terminal_persisted_rx) = tokio::sync::watch::channel(false);
+    {
+        let mut active = sess.active_turn.lock().await;
+        let active_turn = active.get_or_insert_with(ActiveTurn::default);
+        active_turn.finishing = Some(FinishingTurn {
+            turn_context: Arc::clone(&tc),
+            terminal_persisted: terminal_persisted_rx,
+        });
+    }
+    sess.input_queue
+        .enqueue_mailbox_communication(
+            progress, /*parent_turn_id*/ None, /*root_turn_id*/ None,
+        )
+        .await;
+    terminal_persisted_tx.send_replace(true);
+
+    sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+
+    let history = sess.clone_history().await;
+    let texts = history
+        .raw_items()
+        .filter_map(|item| match item {
+            ResponseItem::AgentMessage { content, .. } => content.first(),
+            _ => None,
+        })
+        .filter_map(|content| match content {
+            AgentMessageInputContent::InputText { text } => Some(text.as_str()),
+            AgentMessageInputContent::EncryptedContent { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(texts, vec!["mail before replacement"]);
+}
+
+#[tokio::test]
+async fn active_exec_completion_does_not_publish_agent_mailbox_activity() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: true,
+        },
+    )
+    .await;
+    let turn_state = sess
+        .active_turn
+        .lock()
+        .await
+        .as_ref()
+        .map(|turn| Arc::clone(&turn.turn_state))
+        .expect("active turn state");
+    let (mut activity_rx, pending_activity) = sess
+        .input_queue
+        .subscribe_activity(Some(turn_state.as_ref()))
+        .await;
+    assert_eq!(pending_activity, None);
+
+    sess.deliver_exec_command_completion_notification(
+        ExecCommandCompletionNotification {
+            session_id: 1,
+            command: "build".to_string(),
+            completion: ExecCommandCompletion::Exited { exit_code: 0 },
+            output_may_be_available: true,
+        },
+        tc.as_ref(),
+    )
+    .await;
+
+    tokio::select! {
+        biased;
+        _ = activity_rx.changed() => panic!("exec completion must not publish agent mailbox activity"),
+        _ = tokio::task::yield_now() => {}
+    }
+    sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+}
+
+#[tokio::test]
+async fn compact_task_queues_background_notifications_until_it_finishes() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        NeverEndingTask {
+            kind: TaskKind::Compact,
+            listen_to_cancellation_token: true,
+        },
+    )
+    .await;
+
+    sess.input_queue
+        .enqueue_or_inject_mailbox_communication(
+            &sess.active_turn,
+            InterAgentCommunication::new(
+                AgentPath::try_from("/root/worker").expect("worker path should parse"),
+                AgentPath::root(),
+                Vec::new(),
+                "triggered completion provenance".to_string(),
+                /*trigger_turn*/ true,
+            ),
+            Some("parent-turn".to_string()),
+            Some("root-turn".to_string()),
+        )
+        .await;
+
+    sess.deliver_monitor_notification(
+        MonitorNotification {
+            process_id: 17,
+            seq: 1,
+            command: "watch".to_string(),
+            kind: "watcher",
+            terminal_state: None,
+            lines: vec!["line during compaction".to_string()],
+            omitted_lines: 0,
+            suppressed_notifications: 0,
+            note: None,
+        },
+        tc.as_ref(),
+    )
+    .await;
+    sess.deliver_exec_command_completion_notification(
+        ExecCommandCompletionNotification {
+            session_id: 23,
+            command: "build".to_string(),
+            completion: ExecCommandCompletion::Exited { exit_code: 0 },
+            output_may_be_available: true,
+        },
+        tc.as_ref(),
+    )
+    .await;
+    sess.deliver_inter_agent_completion(InterAgentCommunication::new(
+        AgentPath::try_from("/root/worker").expect("worker path should parse"),
+        AgentPath::root(),
+        Vec::new(),
+        "completion during compaction".to_string(),
+        /*trigger_turn*/ false,
+    ))
+    .await;
+    sess.deliver_subagent_completion_item(ContextualUserFragment::into(SubagentNotification::new(
+        "worker",
+        AgentStatus::Completed(Some("legacy completion during compaction".to_string())),
+    )))
+    .await;
+
+    let turn_state = sess
+        .active_turn
+        .lock()
+        .await
+        .as_ref()
+        .map(|turn| Arc::clone(&turn.turn_state))
+        .expect("active turn state");
+    let (pending_inputs, pending_provenance) = sess
+        .input_queue
+        .take_pending_input_batch_for_turn_state(turn_state.as_ref())
+        .await;
+    assert!(pending_inputs.iter().any(|input| {
+        matches!(
+            input,
+            TurnInput::ResponseItem(item) if SubagentNotification::is_response_item(&item.item)
+        )
+    }));
+    sess.input_queue
+        .extend_pending_input_batch_for_turn_state(
+            turn_state.as_ref(),
+            pending_inputs,
+            pending_provenance,
+        )
+        .await;
+
+    let history_before_abort = sess.clone_history().await;
+    assert_eq!(
+        0,
+        history_before_abort
+            .raw_items()
+            .filter(|item| {
+                MonitorNotification::is_response_item(item)
+                    || ExecCommandCompletionNotification::is_response_item(item)
+                    || SubagentNotification::is_response_item(item)
+            })
+            .count(),
+        "compaction must queue background notifications instead of persisting them immediately"
+    );
+    assert!(
+        !sess.input_queue.has_pending_input(&sess.active_turn).await,
+        "successor-only background input must not be actionable while compaction is active"
+    );
+    assert!(!sess.input_queue.background_wake_requested());
+
+    sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+
+    let history_after_abort = sess.clone_history().await;
+    assert_eq!(
+        1,
+        history_after_abort
+            .raw_items()
+            .filter(|item| MonitorNotification::is_response_item(item))
+            .count()
+    );
+    assert_eq!(
+        1,
+        history_after_abort
+            .raw_items()
+            .filter(|item| ExecCommandCompletionNotification::is_response_item(item))
+            .count()
+    );
+    assert!(history_after_abort.raw_items().any(|item| match item {
+        ResponseItem::AgentMessage { content, .. } => content.iter().any(|content| {
+            matches!(content, AgentMessageInputContent::InputText { text } if text.contains("completion during compaction") || text.contains("triggered completion provenance"))
+        }),
+        _ => false,
+    }));
+    assert_eq!(
+        1,
+        history_after_abort
+            .raw_items()
+            .filter(|item| SubagentNotification::is_response_item(item))
+            .count(),
+        "legacy completion must be persisted for the regular successor"
+    );
+    assert!(history_after_abort.raw_items().any(|item| match item {
+        ResponseItem::Message { role, content, .. } if role == "user" => content.iter().any(
+            |content| {
+                matches!(content, ContentItem::InputText { text } if text.contains("legacy completion during compaction"))
+            },
+        ),
+        _ => false,
+    }));
+
+    // Mirror the metadata application performed by the successor's sampling
+    // request. The provenance must survive the pending-input batch round trip
+    // and the durable wake persistence boundary.
+    let background_wake_receipt = sess.input_queue.snapshot_background_wake();
+    let successor_context = sess
+        .new_default_turn_with_sub_id("successor-turn".to_string())
+        .await;
+    successor_context
+        .turn_metadata_state
+        .set_attribute_background_parent_turn(true);
+    background_wake_receipt
+        .apply_to_attributed_turn(successor_context.turn_metadata_state.as_ref());
+    let mut successor_metadata = successor_context.turn_metadata_state.to_responses_metadata(
+        "installation".to_string(),
+        "successor-window".to_string(),
+        CodexResponsesRequestKind::Turn,
+    );
+    background_wake_receipt.apply_parent_turn(&mut successor_metadata);
+    assert_eq!(
+        successor_metadata.parent_turn_id.as_deref(),
+        Some("parent-turn")
+    );
+    assert_eq!(
+        successor_metadata.root_turn_id.as_deref(),
+        Some("root-turn")
+    );
+}
+
+#[tokio::test]
+async fn compact_abort_persists_queued_notifications_after_history_replacement() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    sess.spawn_task(Arc::clone(&tc), Vec::new(), HistoryReplacingAbortTask)
+        .await;
+    sess.deliver_monitor_notification(
+        MonitorNotification {
+            process_id: 17,
+            seq: 1,
+            command: "watch".to_string(),
+            kind: "watcher",
+            terminal_state: None,
+            lines: vec!["line before replacement".to_string()],
+            omitted_lines: 0,
+            suppressed_notifications: 0,
+            note: None,
+        },
+        tc.as_ref(),
+    )
+    .await;
+
+    sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+
+    let history = sess.clone_history().await;
+    assert!(history.raw_items().any(|item| match item {
+        ResponseItem::Message { role, content, .. } if role == "assistant" => {
+            content.iter().any(|content| {
+                matches!(content, ContentItem::OutputText { text } if text == "history replaced during abort")
+            })
+        }
+        _ => false,
+    }));
+    assert_eq!(
+        1,
+        history
+            .raw_items()
+            .filter(|item| MonitorNotification::is_response_item(item))
+            .count(),
+        "queued monitor delivery must be persisted after the compaction replacement"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forced_compact_abort_drops_task_before_persisting_queued_notifications() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let started = Arc::new(Notify::new());
+    let started_wait = started.notified();
+    let dropped = Arc::new(AtomicBool::new(false));
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        ForcedAbortTask {
+            started: Arc::clone(&started),
+            dropped: Arc::clone(&dropped),
+        },
+    )
+    .await;
+    timeout(Duration::from_secs(2), started_wait)
+        .await
+        .expect("forced-abort task should start");
+
+    sess.deliver_monitor_notification(
+        MonitorNotification {
+            process_id: 17,
+            seq: 1,
+            command: "watch".to_string(),
+            kind: "watcher",
+            terminal_state: None,
+            lines: vec!["line during forced abort".to_string()],
+            omitted_lines: 0,
+            suppressed_notifications: 0,
+            note: None,
+        },
+        tc.as_ref(),
+    )
+    .await;
+    assert!(!dropped.load(Ordering::Acquire));
+
+    sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+
+    assert!(
+        dropped.load(Ordering::Acquire),
+        "abort_all_tasks should wait for the forced-abort task future to drop"
+    );
+    assert!(
+        sess.input_queue.background_wake_requested(),
+        "queued monitor delivery should request a background wake after task drop"
+    );
+    let history = sess.clone_history().await;
+    assert_eq!(
+        1,
+        history
+            .raw_items()
+            .filter(|item| MonitorNotification::is_response_item(item))
+            .count(),
+        "queued monitor delivery must be persisted after the forced abort"
+    );
+    assert!(history.raw_items().any(|item| match item {
+        ResponseItem::Message { role, content, .. } if role == "assistant" => {
+            content.iter().any(|content| {
+                matches!(
+                    content,
+                    ContentItem::OutputText { text }
+                        if text == "forced abort history boundary"
+                )
+            })
+        }
+        _ => false,
+    }));
+}
+
+#[tokio::test]
+async fn aborted_active_turn_persists_ordered_mail_and_completion() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let worker = AgentPath::try_from("/root/worker").expect("worker path should parse");
+    let progress = InterAgentCommunication::new(
+        worker.clone(),
+        AgentPath::root(),
+        Vec::new(),
+        "progress before abort".to_string(),
+        /*trigger_turn*/ false,
+    );
+    let completion = InterAgentCommunication::new(
+        worker,
+        AgentPath::root(),
+        Vec::new(),
+        "completion before abort".to_string(),
+        /*trigger_turn*/ false,
+    );
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: true,
+        },
+    )
+    .await;
+    sess.input_queue
+        .enqueue_mailbox_communication(
+            progress, /*parent_turn_id*/ None, /*root_turn_id*/ None,
+        )
+        .await;
+    sess.deliver_inter_agent_completion(completion).await;
+
+    sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+
+    let history = sess.clone_history().await;
+    let texts = history
+        .raw_items()
+        .filter_map(|item| match item {
+            ResponseItem::AgentMessage { content, .. } => content.first(),
+            _ => None,
+        })
+        .filter_map(|content| match content {
+            AgentMessageInputContent::InputText { text } => Some(text.as_str()),
+            AgentMessageInputContent::EncryptedContent { .. } => None,
+        })
+        .filter(|text| text.contains("before abort"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        texts,
+        vec!["progress before abort", "completion before abort"]
+    );
 }
 
 #[tokio::test]

@@ -1188,6 +1188,8 @@ fn config_toml_deserializes_model_availability_nux() {
             notification_settings: TuiNotificationSettings::default(),
             animations: true,
             show_tooltips: true,
+            show_safety_buffering_ui: true,
+            show_prompt_suggestions: true,
             vim_mode_default: false,
             raw_output_mode: false,
             alternate_screen: AltScreenMode::default(),
@@ -1240,6 +1242,80 @@ status_line_use_colors = false
             .expect("tui config should deserialize")
             .status_line_use_colors
     );
+}
+
+/// Both fork presentation settings must resolve to upstream behavior for an
+/// existing user, whether or not the user already has a `[tui]` table.
+///
+/// This deliberately goes through TOML deserialization and `Config` resolution
+/// rather than `Tui::default()`: the derived Rust default does not honor the
+/// serde `default_true` attributes, so it would prove nothing.
+#[tokio::test]
+async fn tui_presentation_defaults_are_enabled_when_unset() {
+    let missing_tui: ConfigToml = toml::from_str("").expect("deserialize config without [tui]");
+    assert!(missing_tui.tui.is_none(), "expected no [tui] table");
+
+    let unrelated_tui: ConfigToml = toml::from_str(
+        r#"
+[tui]
+show_tooltips = false
+"#,
+    )
+    .expect("deserialize unrelated [tui] table");
+    let parsed_tui = unrelated_tui
+        .tui
+        .clone()
+        .expect("config should include tui section");
+    assert!(parsed_tui.show_safety_buffering_ui);
+    assert!(parsed_tui.show_prompt_suggestions);
+
+    for cfg_toml in [missing_tui, unrelated_tui] {
+        let cfg = Config::load_from_base_config_with_overrides(
+            cfg_toml,
+            ConfigOverrides::default(),
+            tempdir().expect("tempdir").abs(),
+        )
+        .await
+        .expect("load config");
+
+        assert!(cfg.tui_show_safety_buffering_ui);
+        assert!(cfg.tui_show_prompt_suggestions);
+    }
+}
+
+#[tokio::test]
+async fn tui_presentation_settings_parse_explicit_false() {
+    let cfg_toml: ConfigToml = toml::from_str(
+        r#"
+[tui]
+show_safety_buffering_ui = false
+show_prompt_suggestions = false
+show_tooltips = true
+"#,
+    )
+    .expect("deserialize explicit presentation settings");
+    let parsed_tui = cfg_toml
+        .tui
+        .clone()
+        .expect("config should include tui section");
+    assert!(!parsed_tui.show_safety_buffering_ui);
+    assert!(!parsed_tui.show_prompt_suggestions);
+    assert!(
+        parsed_tui.show_tooltips,
+        "unrelated tui settings must be untouched"
+    );
+
+    let cfg = Config::load_from_base_config_with_overrides(
+        cfg_toml,
+        ConfigOverrides::default(),
+        tempdir().expect("tempdir").abs(),
+    )
+    .await
+    .expect("load config");
+
+    assert!(!cfg.tui_show_safety_buffering_ui);
+    assert!(!cfg.tui_show_prompt_suggestions);
+    assert!(cfg.show_tooltips);
 }
 
 #[test]
@@ -4267,6 +4343,8 @@ fn tui_config_missing_notifications_field_defaults_to_enabled() {
             notification_settings: TuiNotificationSettings::default(),
             animations: true,
             show_tooltips: true,
+            show_safety_buffering_ui: true,
+            show_prompt_suggestions: true,
             vim_mode_default: false,
             raw_output_mode: false,
             alternate_screen: AltScreenMode::Auto,
@@ -11411,6 +11489,36 @@ enabled = true
             config.effective_agent_max_threads(MultiAgentVersion::V2)
         ),
         (None, Some(3))
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn explicitly_disabled_multi_agent_v2_overrides_model_catalog_v2() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    std::fs::write(
+        codex_home.path().join(CONFIG_TOML_FILE),
+        r#"[features.multi_agent_v2]
+enabled = true
+"#,
+    )?;
+
+    let config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .cli_overrides(vec![(
+            "features.multi_agent_v2".to_string(),
+            toml::Value::Boolean(false),
+        )])
+        .build()
+        .await?;
+
+    assert!(!config.features.enabled(Feature::MultiAgentV2));
+    assert!(!config.multi_agent_v2.allow_model_catalog_v2);
+    assert_eq!(
+        config.multi_agent_version_for_model(Some(MultiAgentVersion::V2)),
+        MultiAgentVersion::V1,
     );
 
     Ok(())

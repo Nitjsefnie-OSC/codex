@@ -89,7 +89,14 @@ impl Handler {
             .await;
 
         let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
-        let outcome = wait_for_activity(&mut activity_rx, pending_activity, deadline).await;
+        let outcome = wait_for_activity(
+            &session.input_queue,
+            turn_state.as_deref(),
+            &mut activity_rx,
+            pending_activity,
+            deadline,
+        )
+        .await;
         let result = WaitAgentResult::from_outcome(outcome, requested_timeout_ms, timeout_ms);
 
         session
@@ -182,6 +189,8 @@ enum WaitOutcome {
 }
 
 async fn wait_for_activity(
+    input_queue: &crate::session::InputQueue,
+    turn_state: Option<&tokio::sync::Mutex<crate::state::TurnState>>,
     activity_rx: &mut tokio::sync::watch::Receiver<InputQueueActivity>,
     pending_activity: Option<InputQueueActivity>,
     deadline: Instant,
@@ -193,10 +202,14 @@ async fn wait_for_activity(
         };
     }
     match timeout_at(deadline, activity_rx.changed()).await {
-        Ok(Ok(())) => match *activity_rx.borrow_and_update() {
-            InputQueueActivity::Mailbox => WaitOutcome::MailboxActivity,
-            InputQueueActivity::Steer => WaitOutcome::Steered,
-        },
+        Ok(Ok(())) => {
+            let observed_activity = *activity_rx.borrow_and_update();
+            let (_, pending_activity) = input_queue.subscribe_activity(turn_state).await;
+            match pending_activity.unwrap_or(observed_activity) {
+                InputQueueActivity::Mailbox => WaitOutcome::MailboxActivity,
+                InputQueueActivity::Steer => WaitOutcome::Steered,
+            }
+        }
         Ok(Err(_)) | Err(_) => WaitOutcome::TimedOut,
     }
 }

@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
@@ -32,6 +33,18 @@ use codex_protocol::protocol::TokenUsage;
 pub(crate) struct ActiveTurn {
     pub(crate) task: Option<RunningTask>,
     pub(crate) turn_state: Arc<Mutex<TurnState>>,
+    pub(crate) finishing: Option<FinishingTurn>,
+    /// Keeps background delivery deferred while an aborted task is being
+    /// cancelled and its cleanup is persisted.
+    pub(crate) aborting: bool,
+    /// Wakes direct task starts waiting for an aborting sentinel to clear.
+    pub(crate) abort_complete: Arc<Notify>,
+}
+
+#[derive(Clone)]
+pub(crate) struct FinishingTurn {
+    pub(crate) turn_context: Arc<TurnContext>,
+    pub(crate) terminal_persisted: watch::Receiver<bool>,
 }
 
 /// Whether mailbox deliveries should still be folded into the current turn.
@@ -60,6 +73,9 @@ impl Default for ActiveTurn {
         Self {
             task: None,
             turn_state: Arc::new(Mutex::new(TurnState::default())),
+            finishing: None,
+            aborting: false,
+            abort_complete: Arc::new(Notify::new()),
         }
     }
 }

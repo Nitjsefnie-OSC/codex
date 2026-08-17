@@ -1,4 +1,6 @@
 use codex_features::Feature;
+use codex_hooks::SkillActivation;
+use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::models::ShellCommandToolCallParams;
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
@@ -8,8 +10,10 @@ use crate::exec::ExecParams;
 use crate::exec_policy::ExecApprovalRequest;
 use crate::function_tool::FunctionCallError;
 use crate::session::step_context::StepContext;
+use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
+use crate::skills::record_skill_activation;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::events::ToolEmitter;
@@ -59,6 +63,7 @@ struct RunExecLikeArgs {
     tracker: crate::tools::context::SharedTurnDiffTracker,
     call_id: String,
     shell_runtime_backend: ShellRuntimeBackend,
+    implicit_skill_activation: Option<SkillActivation>,
 }
 
 async fn run_exec_like(args: RunExecLikeArgs) -> Result<FunctionToolOutput, FunctionCallError> {
@@ -76,6 +81,7 @@ async fn run_exec_like(args: RunExecLikeArgs) -> Result<FunctionToolOutput, Func
         tracker,
         call_id,
         shell_runtime_backend,
+        implicit_skill_activation,
     } = args;
     let turn = Arc::clone(&step_context.turn);
 
@@ -222,6 +228,11 @@ async fn run_exec_like(args: RunExecLikeArgs) -> Result<FunctionToolOutput, Func
         .run(&mut runtime, &req, &tool_ctx, &turn, turn.approval_policy())
         .await
         .map(|result| result.output);
+    settle_classic_shell_implicit_skill_activation(
+        turn.as_ref(),
+        implicit_skill_activation,
+        out.as_ref().ok(),
+    );
     let event_ctx = ToolEventCtx::new(
         session.as_ref(),
         turn.as_ref(),
@@ -245,6 +256,18 @@ async fn run_exec_like(args: RunExecLikeArgs) -> Result<FunctionToolOutput, Func
         success: Some(true),
         post_tool_use_response,
     })
+}
+
+fn settle_classic_shell_implicit_skill_activation(
+    turn: &TurnContext,
+    candidate: Option<SkillActivation>,
+    output: Option<&ExecToolCallOutput>,
+) {
+    if output.is_some_and(|output| output.exit_code == 0)
+        && let Some(candidate) = candidate
+    {
+        record_skill_activation(turn, candidate);
+    }
 }
 
 #[cfg(test)]

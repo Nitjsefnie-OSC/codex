@@ -276,11 +276,11 @@ async fn pending_waiters_receive_owner_decision() {
 
 #[tokio::test]
 async fn dropping_pending_owner_denies_waiters_and_preserves_replacement() {
-    let service = NetworkApprovalService::default();
+    let service = Arc::new(NetworkApprovalService::default());
     let execution_cancellation =
         register_call_with_default_shell_trigger(&service, "execution-1").await;
     let deferred = DeferredNetworkApproval {
-        registration_id: "execution-1".to_string(),
+        registration: registration(&service, "execution-1"),
         cancellation_token: execution_cancellation.clone(),
         finish_outcome: Arc::new(OnceCell::new()),
         _execution_proxy: None,
@@ -497,6 +497,17 @@ async fn register_call_with_default_shell_trigger(
     cancellation_token
 }
 
+fn registration(
+    service: &Arc<NetworkApprovalService>,
+    registration_id: &str,
+) -> Arc<NetworkApprovalRegistration> {
+    Arc::new(NetworkApprovalRegistration {
+        registration_id: registration_id.to_string(),
+        service: Arc::clone(service),
+        runtime_handle: Handle::current(),
+    })
+}
+
 #[tokio::test]
 async fn active_call_preserves_triggering_command_context() {
     let service = NetworkApprovalService::default();
@@ -707,11 +718,11 @@ async fn finish_call_reports_abandoned_network_approval() {
 
 #[tokio::test]
 async fn deferred_finish_reuses_denial_result_after_first_consumer() {
-    let service = NetworkApprovalService::default();
+    let service = Arc::new(NetworkApprovalService::default());
     let cancellation_token =
         register_call_with_default_shell_trigger(&service, "registration-1").await;
     let deferred = DeferredNetworkApproval {
-        registration_id: "registration-1".to_string(),
+        registration: registration(&service, "registration-1"),
         cancellation_token,
         finish_outcome: Arc::new(OnceCell::new()),
         _execution_proxy: None,
@@ -729,6 +740,32 @@ async fn deferred_finish_reuses_denial_result_after_first_consumer() {
 
     assert!(matches!(first, ToolError::Rejected(message) if message == "network denied"));
     assert!(matches!(second, ToolError::Rejected(message) if message == "network denied"));
+}
+
+#[tokio::test]
+async fn dropping_last_registration_owner_unregisters_active_call() {
+    let service = Arc::new(NetworkApprovalService::default());
+    let cancellation_token =
+        register_call_with_default_shell_trigger(&service, "registration-1").await;
+    let deferred = DeferredNetworkApproval {
+        registration: registration(&service, "registration-1"),
+        cancellation_token,
+        finish_outcome: Arc::new(OnceCell::new()),
+        _execution_proxy: None,
+    };
+    let other_owner = deferred.clone();
+
+    drop(deferred);
+    assert!(service.resolve_single_active_call().await.is_some());
+    drop(other_owner);
+
+    timeout(Duration::from_secs(1), async {
+        while service.resolve_single_active_call().await.is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("last registration owner should unregister the active call");
 }
 
 #[tokio::test]

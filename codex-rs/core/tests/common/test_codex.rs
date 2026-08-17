@@ -791,7 +791,6 @@ impl TestCodexBuilder {
                 .await?
             }
         };
-
         Ok(TestCodex {
             home,
             cwd,
@@ -1241,7 +1240,8 @@ impl TestCodexHarness {
     pub async fn submit(&self, prompt: &str) -> Result<()> {
         // Box the submit-and-wait path so callers do not inline the full turn
         // future into their own async state.
-        Box::pin(self.test.submit_turn(prompt)).await
+        let result = Box::pin(self.test.submit_turn(prompt)).await;
+        result
     }
 
     pub async fn submit_with_permission_profile(

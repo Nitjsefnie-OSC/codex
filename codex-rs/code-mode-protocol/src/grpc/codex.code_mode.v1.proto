@@ -50,6 +50,7 @@ message SessionEvent {
     Notification notification = 3;
     NotificationCancelled notification_cancelled = 4;
     CellClosed cell_closed = 5;
+    ToolResultDelivered tool_result_delivered = 6;
   }
 }
 
@@ -121,6 +122,12 @@ message Notification {
 
 message NotificationCancelled {
   string notification_id = 1;
+}
+
+message ToolResultDelivered {
+  string cell_id = 1;
+  string runtime_tool_call_id = 2;
+  bool delivered = 3;
 }
 
 message AcknowledgeNotificationRequest {

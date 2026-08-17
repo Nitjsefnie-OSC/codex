@@ -166,6 +166,66 @@ async fn plan_mode_nudge_shift_tab_uses_existing_mode_cycle_path() {
     assert!(!chat.bottom_pane.plan_mode_nudge_visible());
 }
 
+/// `tui.show_prompt_suggestions = false` must remove the `Create a plan?` nudge
+/// from the rendered footer without taking Plan mode away.
+///
+/// The first half is the non-vacuity control: the same draft renders the nudge
+/// while the setting is enabled.
+#[tokio::test]
+async fn plan_mode_nudge_hidden_when_prompt_suggestions_disabled() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    assert!(
+        chat.config.tui_show_prompt_suggestions,
+        "default must preserve upstream behavior"
+    );
+    set_composer_text(&mut chat, "make a plan");
+    chat.pre_draw_tick();
+    assert!(chat.bottom_pane.plan_mode_nudge_visible());
+    assert!(
+        render_bottom_popup(&chat, /*width*/ 80).contains("Create a plan?"),
+        "control: the nudge renders while prompt suggestions are enabled"
+    );
+
+    chat.config.tui_show_prompt_suggestions = false;
+    chat.sync_prompt_suggestions_enabled();
+    set_composer_text(&mut chat, "make a plan");
+    chat.pre_draw_tick();
+    assert!(!chat.bottom_pane.plan_mode_nudge_visible());
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(
+        !popup.contains("Create a plan?"),
+        "expected no plan nudge when suggestions are disabled, got: {popup:?}"
+    );
+    assert!(
+        popup.contains("make a plan"),
+        "the draft must still render while the nudge is suppressed, got: {popup:?}"
+    );
+    assert_chatwidget_snapshot!(
+        "plan_mode_nudge_prompt_suggestions_disabled",
+        normalize_snapshot_paths(popup),
+    );
+
+    // Rebase guard: forcing visibility through the composer boundary must still
+    // render nothing, so a future call site cannot bypass the setting.
+    chat.bottom_pane
+        .set_plan_mode_nudge_visible(/*visible*/ true);
+    assert!(!chat.bottom_pane.plan_mode_nudge_visible());
+    let forced_popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(
+        !forced_popup.contains("Create a plan?"),
+        "expected forced nudge visibility to stay suppressed, got: {forced_popup:?}"
+    );
+
+    // Explicit mode switching is untouched: Shift-Tab still enters Plan mode.
+    chat.handle_key_event(KeyEvent::from(KeyCode::BackTab));
+    chat.pre_draw_tick();
+    assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Plan);
+    assert!(
+        !render_bottom_popup(&chat, /*width*/ 80).contains("Create a plan?"),
+        "entering Plan mode must not reintroduce the suggestion"
+    );
+}
+
 #[tokio::test]
 async fn plan_mode_nudge_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
