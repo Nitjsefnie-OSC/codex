@@ -117,6 +117,15 @@ fn message_families_use_dedicated_transport_lanes() {
             ClientToHost::DelegateResponse {
                 id: delegate_request_id(/*value*/ 2),
                 result: WireResult::Ok {
+                    value: DelegateResponse::ToolResultDeliveryRecorded,
+                },
+            },
+            TransportLane::Control,
+        ),
+        (
+            ClientToHost::DelegateResponse {
+                id: delegate_request_id(/*value*/ 3),
+                result: WireResult::Ok {
                     value: DelegateResponse::ToolResult {
                         result: json!({ "value": "tool result" }),
                     },
@@ -167,6 +176,18 @@ fn message_families_use_dedicated_transport_lanes() {
         (
             HostToClient::DelegateRequest {
                 id: delegate_request_id(/*value*/ 2),
+                session_id: session_id(),
+                request: DelegateRequest::ToolResultDelivered {
+                    cell_id: cell_id("cell-1"),
+                    runtime_tool_call_id: "runtime-call-1".to_string(),
+                    delivered: true,
+                },
+            },
+            TransportLane::Control,
+        ),
+        (
+            HostToClient::DelegateRequest {
+                id: delegate_request_id(/*value*/ 3),
                 session_id: session_id(),
                 request: DelegateRequest::InvokeTool {
                     invocation: WireNestedToolCall {
@@ -540,6 +561,16 @@ fn client_to_host_v1_variants_are_pinned() {
         ),
         (
             delegate_request_id(/*value*/ 8),
+            WireResult::Ok {
+                value: DelegateResponse::ToolResultDeliveryRecorded,
+            },
+            json!({
+                "status": "ok",
+                "value": { "type": "tool/resultDeliveryRecorded" },
+            }),
+        ),
+        (
+            delegate_request_id(/*value*/ 9),
             WireResult::Err {
                 message: "delegate failed".to_string(),
             },
@@ -754,10 +785,32 @@ fn host_to_client_v1_variants_are_pinned() {
         }),
     );
     assert_wire_round_trip(
-        HostToClient::CancelDelegateRequest {
+        HostToClient::DelegateRequest {
             id: delegate_request_id(/*value*/ 11),
+            session_id: session_id(),
+            request: DelegateRequest::ToolResultDelivered {
+                cell_id: cell_id("cell-1"),
+                runtime_tool_call_id: "runtime-call-1".to_string(),
+                delivered: true,
+            },
         },
-        json!({ "type": "delegate/cancel", "id": 11 }),
+        json!({
+            "type": "delegate/request",
+            "id": 11,
+            "sessionId": "session-1",
+            "request": {
+                "type": "tool/resultDelivered",
+                "cellId": "cell-1",
+                "runtimeToolCallId": "runtime-call-1",
+                "delivered": true,
+            },
+        }),
+    );
+    assert_wire_round_trip(
+        HostToClient::CancelDelegateRequest {
+            id: delegate_request_id(/*value*/ 12),
+        },
+        json!({ "type": "delegate/cancel", "id": 12 }),
     );
     assert_wire_round_trip(
         HostToClient::CellClosed {

@@ -7,6 +7,155 @@
         "string",
         "null"
       ]
+    },
+    "background-state": {
+      "additionalProperties": false,
+      "description": "Everything still outstanding when the turn tried to end.",
+      "properties": {
+        "background_terminals": {
+          "description": "Background terminals held open by `exec_command`, which are processes the session can still write to and read from.",
+          "items": {
+            "$ref": "#/definitions/background-state.background-terminal"
+          },
+          "type": "array"
+        },
+        "monitors": {
+          "description": "Every monitor this session started, running or finished. A finished one still matters: its output may never have been read.",
+          "items": {
+            "$ref": "#/definitions/background-state.monitor"
+          },
+          "type": "array"
+        },
+        "running_background_terminals": {
+          "description": "How many of those there are, so a hook can branch without walking the list.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "running_monitors": {
+          "description": "How many of them are still running.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "unacknowledged_notifications": {
+          "description": "Notifications delivered to the model across all monitors that no `read` has acknowledged. Non-zero means output was produced and not consumed.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "background_terminals",
+        "monitors",
+        "running_background_terminals",
+        "running_monitors",
+        "unacknowledged_notifications"
+      ],
+      "type": "object"
+    },
+    "background-state.background-terminal": {
+      "additionalProperties": false,
+      "description": "One background terminal at the moment the hook fired.",
+      "properties": {
+        "command": {
+          "type": "string"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "process_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "command",
+        "cwd",
+        "process_id"
+      ],
+      "type": "object"
+    },
+    "background-state.monitor": {
+      "additionalProperties": false,
+      "description": "One monitor at the moment the hook fired.",
+      "properties": {
+        "age_seconds": {
+          "format": "double",
+          "type": "number"
+        },
+        "command": {
+          "type": "string"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "exit_code": {
+          "description": "Set when `state` is `exited`.",
+          "format": "int32",
+          "type": "integer"
+        },
+        "failure_message": {
+          "description": "Set when `state` is `failed`.",
+          "type": "string"
+        },
+        "kind": {
+          "description": "`job` for something expected to finish, `watcher` for something that runs until stopped. A watcher left running is normal; a job left running usually is not.",
+          "type": "string"
+        },
+        "notifications_delivered": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "notifications_suppressed": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "owner_call_id": {
+          "type": "string"
+        },
+        "owner_model_slug": {
+          "description": "The turn that started the monitor, so a hook can tell a subagent's watcher from its parent's.",
+          "type": "string"
+        },
+        "owner_turn_id": {
+          "type": "string"
+        },
+        "process_id": {
+          "format": "int32",
+          "type": "integer"
+        },
+        "running": {
+          "type": "boolean"
+        },
+        "state": {
+          "description": "`running`, `exited`, `failed`, `stopped`, or `timed_out`.",
+          "type": "string"
+        },
+        "unacknowledged_notifications": {
+          "description": "Delivered notifications this monitor's output has not been read back for.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "age_seconds",
+        "command",
+        "cwd",
+        "kind",
+        "notifications_delivered",
+        "notifications_suppressed",
+        "owner_call_id",
+        "owner_model_slug",
+        "owner_turn_id",
+        "process_id",
+        "running",
+        "state",
+        "unacknowledged_notifications"
+      ],
+      "type": "object"
     }
   },
   "properties": {
@@ -18,6 +167,14 @@
     },
     "agent_type": {
       "type": "string"
+    },
+    "background": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/background-state"
+        }
+      ],
+      "description": "Codex extension: as on `stop.command.input`. A subagent leaving a monitor running is the case this exists for — its parent has no other way to find out."
     },
     "cwd": {
       "type": "string"
@@ -60,6 +217,7 @@
     "agent_id",
     "agent_transcript_path",
     "agent_type",
+    "background",
     "cwd",
     "hook_event_name",
     "last_assistant_message",

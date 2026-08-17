@@ -18,6 +18,7 @@ use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::ResponseItemId;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::mcp::MCP_APP_UI_EXTENSION_ID;
 use codex_protocol::mcp::OPENAI_FORM_EXTENSION_ID;
@@ -674,6 +675,304 @@ async fn shutdown_all_threads_bounded_submits_shutdown_to_every_thread() {
     assert!(report.submit_failed.is_empty());
     assert!(report.timed_out.is_empty());
     assert!(manager.list_thread_ids().await.is_empty());
+}
+
+struct BlockingThreadLifecycle {
+    block_next_start: AtomicBool,
+    block_next_stop: AtomicBool,
+    start_entered: tokio::sync::Notify,
+    start_release: tokio::sync::Notify,
+    stop_entered: tokio::sync::Notify,
+    stop_release: tokio::sync::Notify,
+    stop_completed: tokio::sync::Notify,
+}
+
+impl BlockingThreadLifecycle {
+    fn start() -> Self {
+        Self {
+            block_next_start: AtomicBool::new(true),
+            block_next_stop: AtomicBool::new(false),
+            start_entered: tokio::sync::Notify::new(),
+            start_release: tokio::sync::Notify::new(),
+            stop_entered: tokio::sync::Notify::new(),
+            stop_release: tokio::sync::Notify::new(),
+            stop_completed: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn stop() -> Self {
+        Self {
+            block_next_start: AtomicBool::new(false),
+            block_next_stop: AtomicBool::new(true),
+            start_entered: tokio::sync::Notify::new(),
+            start_release: tokio::sync::Notify::new(),
+            stop_entered: tokio::sync::Notify::new(),
+            stop_release: tokio::sync::Notify::new(),
+            stop_completed: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+impl codex_extension_api::ThreadLifecycleContributor<Config> for BlockingThreadLifecycle {
+    fn on_thread_start<'a>(
+        &'a self,
+        _input: codex_extension_api::ThreadStartInput<'a, Config>,
+    ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+        Box::pin(async move {
+            if self.block_next_start.swap(false, Ordering::AcqRel) {
+                self.start_entered.notify_one();
+                self.start_release.notified().await;
+            }
+        })
+    }
+
+    fn on_thread_stop<'a>(
+        &'a self,
+        _input: codex_extension_api::ThreadStopInput<'a>,
+    ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+        Box::pin(async move {
+            if self.block_next_stop.swap(false, Ordering::AcqRel) {
+                self.stop_entered.notify_one();
+                self.stop_release.notified().await;
+                self.stop_completed.notify_one();
+            }
+        })
+    }
+}
+
+async fn manager_with_blocking_thread_lifecycle(
+    lifecycle: Arc<BlockingThreadLifecycle>,
+) -> (Arc<ThreadManager>, Config, tempfile::TempDir) {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+
+    let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
+    extensions.thread_lifecycle_contributor(lifecycle);
+    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
+    let manager = Arc::new(ThreadManager::new(
+        &config,
+        Arc::clone(&auth_manager),
+        build_models_manager(&config, auth_manager),
+        crate::CodexAppsToolsCache::default(),
+        SessionSource::Exec,
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::new(extensions.build()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+        /*analytics_events_client*/ None,
+        thread_store_from_config(&config, /*state_db*/ None),
+        /*agent_graph_store*/ None,
+        TEST_INSTALLATION_ID.to_string(),
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
+    ));
+    (manager, config, temp_dir)
+}
+
+fn assert_manager_shutdown_rejection<T>(result: CodexResult<T>) {
+    let error = result
+        .err()
+        .expect("thread start should be rejected while manager shutdown is fenced");
+    assert!(matches!(
+        error.details(),
+        CodexErrorDetails::UnsupportedOperation(message)
+            if message == "thread manager is shutting down"
+    ));
+}
+
+async fn wait_for_lifecycle_notification(notification: &tokio::sync::Notify, message: &str) {
+    tokio::time::timeout(Duration::from_secs(5), notification.notified())
+        .await
+        .expect(message);
+}
+
+#[tokio::test]
+async fn thread_prepared_before_shutdown_is_rejected_after_manager_reopens() {
+    let lifecycle = Arc::new(BlockingThreadLifecycle::start());
+    let (manager, config, _temp_dir) =
+        manager_with_blocking_thread_lifecycle(Arc::clone(&lifecycle)).await;
+    let starting = tokio::spawn({
+        let manager = Arc::clone(&manager);
+        async move { manager.start_thread(StartThreadOptions::new(config)).await }
+    });
+    wait_for_lifecycle_notification(&lifecycle.start_entered, "thread should enter startup").await;
+
+    assert_eq!(
+        manager
+            .shutdown_all_threads_bounded(Duration::from_secs(10))
+            .await,
+        ThreadShutdownReport::default()
+    );
+    assert!(!manager.state.shutdown_started.load(Ordering::Acquire));
+
+    lifecycle.start_release.notify_one();
+    assert_manager_shutdown_rejection(starting.await.expect("thread start task should finish"));
+    assert!(manager.state.threads.read().await.is_empty());
+}
+
+#[tokio::test]
+async fn thread_start_is_rejected_while_shutdown_is_in_progress() {
+    let lifecycle = Arc::new(BlockingThreadLifecycle::stop());
+    let (manager, config, _temp_dir) =
+        manager_with_blocking_thread_lifecycle(Arc::clone(&lifecycle)).await;
+    let existing = manager
+        .start_thread(StartThreadOptions::new(config.clone()))
+        .await
+        .expect("start existing thread");
+    let shutdown = tokio::spawn({
+        let manager = Arc::clone(&manager);
+        async move {
+            manager
+                .shutdown_all_threads_bounded(Duration::from_secs(10))
+                .await
+        }
+    });
+    wait_for_lifecycle_notification(&lifecycle.stop_entered, "thread should enter shutdown").await;
+
+    assert_manager_shutdown_rejection(manager.start_thread(StartThreadOptions::new(config)).await);
+    assert_eq!(
+        manager
+            .state
+            .threads
+            .read()
+            .await
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![existing.thread_id]
+    );
+
+    lifecycle.stop_release.notify_one();
+    assert_eq!(
+        shutdown.await.expect("shutdown task should finish"),
+        ThreadShutdownReport {
+            completed: vec![existing.thread_id],
+            submit_failed: Vec::new(),
+            timed_out: Vec::new(),
+        }
+    );
+}
+
+#[tokio::test]
+async fn successful_shutdown_reopens_manager_for_fresh_thread_start() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let original = manager
+        .start_thread(StartThreadOptions::new(config.clone()))
+        .await
+        .expect("start original thread");
+
+    assert_eq!(
+        manager
+            .shutdown_all_threads_bounded(Duration::from_secs(10))
+            .await,
+        ThreadShutdownReport {
+            completed: vec![original.thread_id],
+            submit_failed: Vec::new(),
+            timed_out: Vec::new(),
+        }
+    );
+    let fresh = manager
+        .start_thread(StartThreadOptions::new(config))
+        .await
+        .expect("successful shutdown should reopen thread admission");
+
+    assert_ne!(fresh.thread_id, original.thread_id);
+    assert_eq!(manager.list_thread_ids().await, vec![fresh.thread_id]);
+    assert_eq!(
+        manager
+            .shutdown_all_threads_bounded(Duration::from_secs(10))
+            .await
+            .completed,
+        vec![fresh.thread_id]
+    );
+}
+
+#[tokio::test]
+async fn incomplete_shutdown_keeps_thread_start_fenced() {
+    let shutdown_timeout = Duration::from_secs(60 * 60);
+    let lifecycle = Arc::new(BlockingThreadLifecycle::stop());
+    let (manager, config, _temp_dir) =
+        manager_with_blocking_thread_lifecycle(Arc::clone(&lifecycle)).await;
+    let existing = manager
+        .start_thread(StartThreadOptions::new(config.clone()))
+        .await
+        .expect("start existing thread");
+    let shutdown = tokio::spawn({
+        let manager = Arc::clone(&manager);
+        async move { manager.shutdown_all_threads_bounded(shutdown_timeout).await }
+    });
+    wait_for_lifecycle_notification(&lifecycle.stop_entered, "thread should enter shutdown").await;
+    tokio::time::pause();
+    tokio::time::advance(shutdown_timeout + Duration::from_secs(1)).await;
+
+    assert_eq!(
+        shutdown.await.expect("bounded shutdown should finish"),
+        ThreadShutdownReport {
+            completed: Vec::new(),
+            submit_failed: Vec::new(),
+            timed_out: vec![existing.thread_id],
+        }
+    );
+    assert!(manager.state.shutdown_started.load(Ordering::Acquire));
+    assert_manager_shutdown_rejection(manager.start_thread(StartThreadOptions::new(config)).await);
+
+    tokio::time::resume();
+    lifecycle.stop_release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), lifecycle.stop_completed.notified())
+        .await
+        .expect("timed-out thread shutdown should finish after release");
+}
+
+#[tokio::test]
+async fn overlapping_shutdown_calls_are_serialized() {
+    let lifecycle = Arc::new(BlockingThreadLifecycle::stop());
+    let (manager, config, _temp_dir) =
+        manager_with_blocking_thread_lifecycle(Arc::clone(&lifecycle)).await;
+    let existing = manager
+        .start_thread(StartThreadOptions::new(config))
+        .await
+        .expect("start existing thread");
+    let initial_epoch = manager.state.thread_spawn_epoch.load(Ordering::Acquire);
+    let first_shutdown = tokio::spawn({
+        let manager = Arc::clone(&manager);
+        async move {
+            manager
+                .shutdown_all_threads_bounded(Duration::from_secs(10))
+                .await
+        }
+    });
+    wait_for_lifecycle_notification(&lifecycle.stop_entered, "thread should enter shutdown").await;
+    let second_shutdown = manager.shutdown_all_threads_bounded(Duration::from_secs(10));
+    tokio::pin!(second_shutdown);
+    assert!(futures::poll!(second_shutdown.as_mut()).is_pending());
+
+    lifecycle.stop_release.notify_one();
+    assert_eq!(
+        first_shutdown.await.expect("first shutdown should finish"),
+        ThreadShutdownReport {
+            completed: vec![existing.thread_id],
+            submit_failed: Vec::new(),
+            timed_out: Vec::new(),
+        }
+    );
+    assert_eq!(second_shutdown.await, ThreadShutdownReport::default());
+    assert_eq!(
+        manager.state.thread_spawn_epoch.load(Ordering::Acquire),
+        initial_epoch + 2
+    );
+    assert!(!manager.state.shutdown_started.load(Ordering::Acquire));
 }
 
 #[tokio::test]

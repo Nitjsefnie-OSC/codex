@@ -51,14 +51,55 @@ impl ConnectionDriver {
                 }
                 return false;
             }
+            if !self.deferred_outgoing.is_empty() {
+                for wait in deferred {
+                    self.requests.push_deferred_wait(wait);
+                }
+                break;
+            }
         }
         true
     }
 
     pub(super) fn handle_host_message(&mut self, message: HostToClient) -> bool {
         if self.should_defer_host_message(&message) {
-            if self.deferred_host_messages.len()
-                >= codex_code_mode_protocol::host::MAX_PENDING_DELEGATE_CALLS
+            let is_delivery_receipt = matches!(
+                &message,
+                HostToClient::DelegateRequest {
+                    request: codex_code_mode_protocol::host::DelegateRequest::ToolResultDelivered { .. },
+                    ..
+                }
+            );
+            let ordinary_delegates = self
+                .deferred_host_messages
+                .iter()
+                .filter(|message| {
+                    matches!(
+                        message,
+                        HostToClient::DelegateRequest { request, .. }
+                            if !matches!(
+                                request,
+                                codex_code_mode_protocol::host::DelegateRequest::ToolResultDelivered { .. }
+                            )
+                    )
+                })
+                .count();
+            let receipt_deferred = self.deferred_host_messages.iter().any(|message| {
+                matches!(
+                    message,
+                    HostToClient::DelegateRequest {
+                        request: codex_code_mode_protocol::host::DelegateRequest::ToolResultDelivered { .. },
+                        ..
+                    }
+                )
+            });
+            if (is_delivery_receipt
+                && (receipt_deferred
+                    || self.deferred_host_messages.len()
+                        >= codex_code_mode_protocol::host::MAX_PENDING_DELEGATE_CALLS + 1))
+                || (!is_delivery_receipt
+                    && ordinary_delegates
+                        >= codex_code_mode_protocol::host::MAX_PENDING_DELEGATE_CALLS)
             {
                 self.fail(
                     "code-mode host exceeded deferred cross-socket message limit".to_string(),
@@ -98,6 +139,10 @@ impl ConnectionDriver {
                     codex_code_mode_protocol::host::DelegateRequest::Notify { cell_id, .. } => {
                         cell_id
                     }
+                    codex_code_mode_protocol::host::DelegateRequest::ToolResultDelivered {
+                        cell_id,
+                        ..
+                    } => cell_id,
                 };
                 !self.sessions.contains_cell(session_id, cell_id)
                     && self.requests.has_pending_execute_for_session(session_id)
@@ -334,7 +379,10 @@ impl ConnectionDriver {
     }
 
     pub(super) fn cancel_dropped_callers(&mut self) -> bool {
-        for action in self.requests.collect_cancellations() {
+        while self.deferred_outgoing.is_empty() {
+            let Some(action) = self.requests.take_cancellation() else {
+                break;
+            };
             if !self.apply_cancellation(action) {
                 return false;
             }

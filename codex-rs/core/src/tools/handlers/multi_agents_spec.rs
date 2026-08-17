@@ -120,7 +120,7 @@ pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec {
     properties.insert(
         "task_name".to_string(),
         JsonSchema::string(Some(
-            "Task name for the new agent. Use lowercase letters, digits, and underscores."
+            "Task name for the new agent. Use lowercase letters, digits, and underscores; the resulting canonical agent path must not exceed 256 bytes."
                 .to_string(),
         )),
     );

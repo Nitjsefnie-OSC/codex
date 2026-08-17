@@ -177,6 +177,32 @@ async fn start_only_rejects_active_turn_without_injecting() {
 }
 
 #[tokio::test]
+async fn start_only_rejects_session_shutdown_without_injecting() {
+    let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
+    session
+        .shutdown_started
+        .store(true, std::sync::atomic::Ordering::Release);
+
+    let input = SubmittedTurnInput::ResponseItem(user_message("synthetic shutdown input"));
+    let submission = submit_start_only(&session, input).await;
+
+    assert_eq!(
+        TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::NotIdle,
+        },
+        submission
+    );
+    assert!(session.active_turn.lock().await.is_none());
+    assert_eq!(
+        (Vec::<TurnInput>::new(), None, None),
+        session
+            .input_queue
+            .get_pending_input(&session.active_turn)
+            .await
+    );
+}
+
+#[tokio::test]
 async fn recovery_rejects_active_turn_without_injecting_or_applying_settings() {
     let (session, turn_context, _rx) = make_session_and_context_with_rx().await;
     let original_approval_policy = session

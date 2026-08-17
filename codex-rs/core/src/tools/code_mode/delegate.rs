@@ -9,13 +9,14 @@ use codex_code_mode::NotificationFuture;
 use codex_code_mode::ToolInvocationFuture;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
-use serde_json::Value as JsonValue;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use super::ExecContext;
+use super::NestedToolCallResult;
 use super::PUBLIC_TOOL_NAME;
+use super::YieldedExecDelivery;
 use super::call_nested_tool;
 use crate::session::step_context::StepContext;
 use crate::tools::context::SharedTurnDiffTracker;
@@ -25,6 +26,7 @@ pub(super) struct CodeModeDispatchBroker {
     dispatch_tx: async_channel::Sender<DispatchMessage>,
     dispatch_rx: async_channel::Receiver<DispatchMessage>,
     dispatch_gates: Arc<Mutex<HashMap<CellId, watch::Sender<bool>>>>,
+    pending_tool_deliveries: Mutex<HashMap<(CellId, String), YieldedExecDelivery>>,
 }
 
 impl CodeModeDispatchBroker {
@@ -34,6 +36,7 @@ impl CodeModeDispatchBroker {
             dispatch_tx,
             dispatch_rx,
             dispatch_gates: Arc::new(Mutex::new(HashMap::new())),
+            pending_tool_deliveries: Mutex::new(HashMap::new()),
         }
     }
 
@@ -52,6 +55,26 @@ impl CodeModeDispatchBroker {
             .keys()
             .cloned()
             .collect()
+    }
+
+    async fn complete_tool_delivery(
+        &self,
+        cell_id: CellId,
+        runtime_tool_call_id: String,
+        delivered: bool,
+    ) {
+        let delivery = self
+            .pending_tool_deliveries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&(cell_id, runtime_tool_call_id));
+        if let Some(delivery) = delivery {
+            if delivered {
+                delivery.acknowledge().await;
+            } else {
+                delivery.discard().await;
+            }
+        }
     }
 
     pub(super) fn start_turn_worker(
@@ -122,7 +145,27 @@ impl CodeModeDispatchBroker {
                                 _ = cancellation_token.cancelled() => invocation.await,
                                 response = &mut invocation => response,
                             };
-                            let _ = response_tx.send(response);
+                            match response {
+                                Ok(mut result) => {
+                                    let tracked_delivery = result.track_delivery();
+                                    match response_tx.send(Ok(result)) {
+                                        Ok(()) => {
+                                            if let Some((delivery, receipt_rx)) = tracked_delivery
+                                                && receipt_rx.await.is_err()
+                                            {
+                                                delivery.discard().await;
+                                            }
+                                        }
+                                        Err(Ok(result)) => result.discard().await,
+                                        Err(Err(_)) => unreachable!(
+                                            "sending an Ok nested tool result returned an Err"
+                                        ),
+                                    }
+                                }
+                                Err(error) => {
+                                    let _ = response_tx.send(Err(error));
+                                }
+                            }
                         });
                     }
                 }
@@ -193,6 +236,10 @@ impl CodeModeSessionDelegate for CodeModeDispatchBroker {
             if cancellation_token.is_cancelled() {
                 return Err("code mode nested tool call cancelled".to_string());
             }
+            let delivery_key = (
+                invocation.cell_id.clone(),
+                invocation.runtime_tool_call_id.clone(),
+            );
             let (response_tx, response_rx) = oneshot::channel();
             self.dispatch_tx
                 .send(DispatchMessage::InvokeTool {
@@ -203,8 +250,29 @@ impl CodeModeSessionDelegate for CodeModeDispatchBroker {
                 .await
                 .map_err(|_| "code mode nested tool dispatcher is unavailable".to_string())?;
             tokio::select! {
-                response = response_rx => response
-                    .map_err(|_| "code mode nested tool dispatcher stopped".to_string())?,
+                biased;
+                response = response_rx => match response
+                    .map_err(|_| "code mode nested tool dispatcher stopped".to_string())?
+                {
+                    Ok(result) => {
+                        let (result, delivery, receipt_tx) = result.into_delivery_parts();
+                        if let Some(delivery) = delivery {
+                            let replaced = self
+                                .pending_tool_deliveries
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .insert(delivery_key, delivery);
+                            if let Some(replaced) = replaced {
+                                replaced.discard().await;
+                            }
+                        }
+                        if let Some(receipt_tx) = receipt_tx {
+                            let _ = receipt_tx.send(());
+                        }
+                        Ok(result)
+                    },
+                    Err(error) => Err(error),
+                },
                 _ = cancellation_token.cancelled() => {
                     Err("code mode nested tool call cancelled".to_string())
                 }
@@ -244,8 +312,40 @@ impl CodeModeSessionDelegate for CodeModeDispatchBroker {
         })
     }
 
+    fn tool_result_delivered<'a>(
+        &'a self,
+        cell_id: CellId,
+        runtime_tool_call_id: String,
+        delivered: bool,
+    ) -> NotificationFuture<'a> {
+        Box::pin(async move {
+            self.complete_tool_delivery(cell_id, runtime_tool_call_id, delivered)
+                .await;
+            Ok(())
+        })
+    }
+
     fn cell_closed(&self, cell_id: &CellId) {
         self.close_cell(cell_id);
+        let deliveries = {
+            let mut pending = self
+                .pending_tool_deliveries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let keys = pending
+                .keys()
+                .filter(|(pending_cell_id, _)| pending_cell_id == cell_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .filter_map(|key| pending.remove(&key))
+                .collect::<Vec<_>>()
+        };
+        for delivery in deliveries {
+            tokio::spawn(async move {
+                delivery.discard().await;
+            });
+        }
     }
 }
 
@@ -253,7 +353,7 @@ enum DispatchMessage {
     InvokeTool {
         invocation: CodeModeNestedToolCall,
         cancellation_token: CancellationToken,
-        response_tx: oneshot::Sender<Result<JsonValue, String>>,
+        response_tx: oneshot::Sender<Result<NestedToolCallResult, String>>,
     },
     Notify {
         call_id: String,
@@ -286,7 +386,7 @@ impl CoreTurnHost {
         &self,
         invocation: CodeModeNestedToolCall,
         cancellation_token: CancellationToken,
-    ) -> Result<JsonValue, String> {
+    ) -> Result<NestedToolCallResult, String> {
         call_nested_tool(
             self.exec.clone(),
             self.tool_runtime.clone(),

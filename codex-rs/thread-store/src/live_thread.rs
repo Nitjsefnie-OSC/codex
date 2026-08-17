@@ -201,7 +201,19 @@ impl LiveThread {
         fields(item_count = raw_items.len())
     )]
     pub async fn append_items(&self, raw_items: &[RolloutItem]) -> ThreadStoreResult<()> {
-        let items = self.persist_appended_items(raw_items).await?;
+        self.append_items_with_post_commit(raw_items, || {}).await
+    }
+
+    /// Appends rollout items and invokes `post_commit` synchronously after the
+    /// canonical append succeeds, before derived metadata is updated.
+    pub async fn append_items_with_post_commit(
+        &self,
+        raw_items: &[RolloutItem],
+        post_commit: impl FnOnce() + Send,
+    ) -> ThreadStoreResult<()> {
+        let items = self
+            .persist_appended_items_with_post_commit(raw_items, post_commit)
+            .await?;
         if items.is_empty() {
             return Ok(());
         }
@@ -230,8 +242,18 @@ impl LiveThread {
         &self,
         raw_items: &[RolloutItem],
     ) -> ThreadStoreResult<Vec<RolloutItem>> {
+        self.persist_appended_items_with_post_commit(raw_items, || {})
+            .await
+    }
+
+    async fn persist_appended_items_with_post_commit(
+        &self,
+        raw_items: &[RolloutItem],
+        post_commit: impl FnOnce() + Send,
+    ) -> ThreadStoreResult<Vec<RolloutItem>> {
         // Empty appends are intentionally ignored rather than represented as zero-sized batches.
         if raw_items.is_empty() {
+            post_commit();
             return Ok(Vec::new());
         }
         let (items, measurement) = if self.persistence_telemetry.is_enabled() {
@@ -247,6 +269,7 @@ impl LiveThread {
                 items: raw_items.to_vec(),
             })
             .await?;
+        post_commit();
         if let Some(measurement) = measurement.as_ref() {
             self.persistence_telemetry
                 .record_batch(raw_items, measurement);

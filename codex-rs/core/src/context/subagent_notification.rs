@@ -1,3 +1,5 @@
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentStatus;
 
 use super::ContextualUserFragment;
@@ -14,6 +16,19 @@ impl SubagentNotification {
             agent_reference: agent_reference.into(),
             status,
         }
+    }
+
+    pub(crate) fn is_response_item(item: &ResponseItem) -> bool {
+        let ResponseItem::Message { role, content, .. } = item else {
+            return false;
+        };
+        role == "user"
+            && content.iter().any(|item| match item {
+                ContentItem::InputText { text } => Self::matches_text(text),
+                ContentItem::InputImage { .. }
+                | ContentItem::InputAudio { .. }
+                | ContentItem::OutputText { .. } => false,
+            })
     }
 }
 

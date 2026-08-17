@@ -19,6 +19,7 @@ use crate::engine::output_parser;
 use crate::output_spill::AdditionalContext;
 use crate::schema::PostToolUseCommandInput;
 use crate::schema::SubagentCommandInputFields;
+use crate::skill_activation::SkillActivation;
 
 #[derive(Debug, Clone)]
 pub struct PostToolUseRequest {
@@ -34,6 +35,7 @@ pub struct PostToolUseRequest {
     pub tool_use_id: String,
     pub tool_input: Value,
     pub tool_response: Value,
+    pub skill_activations: Vec<SkillActivation>,
 }
 
 #[derive(Debug)]
@@ -149,6 +151,13 @@ pub(crate) async fn run(
 /// `tool_input`; MCP tools pass their resolved JSON arguments.
 fn command_input_json(request: &PostToolUseRequest) -> Result<String, serde_json::Error> {
     let subagent = SubagentCommandInputFields::from(request.subagent.as_ref());
+    let mut skill_activations = request.skill_activations.clone();
+    skill_activations.sort_by(|left, right| {
+        left.path()
+            .cmp(right.path())
+            .then_with(|| left.invocation().cmp(&right.invocation()))
+            .then_with(|| left.content_sha256().cmp(right.content_sha256()))
+    });
     serde_json::to_string(&PostToolUseCommandInput {
         session_id: request.session_id.to_string(),
         turn_id: request.turn_id.clone(),
@@ -163,6 +172,7 @@ fn command_input_json(request: &PostToolUseRequest) -> Result<String, serde_json
         tool_input: request.tool_input.clone(),
         tool_response: request.tool_response.clone(),
         tool_use_id: request.tool_use_id.clone(),
+        skill_activations,
     })
 }
 
@@ -336,6 +346,9 @@ mod tests {
     use crate::events::common;
     use crate::output_spill::AdditionalContext;
     use crate::output_spill::AdditionalContextLimit;
+    use crate::skill_activation::SkillActivation;
+    use crate::skill_activation::SkillActivationKind;
+    use crate::skill_activation::SkillActivationScope;
 
     #[test]
     fn command_input_uses_request_tool_name() {
@@ -347,6 +360,52 @@ mod tests {
             serde_json::from_str(&input_json).expect("parse command input");
 
         assert_eq!(input["tool_name"], "apply_patch");
+    }
+
+    #[test]
+    fn command_input_exposes_an_empty_skill_activation_list() {
+        let request = request_for_tool_use("call-before-skill");
+
+        let input_json = command_input_json(&request).expect("serialize command input");
+        let input: serde_json::Value =
+            serde_json::from_str(&input_json).expect("parse command input");
+
+        assert_eq!(input["skill_activations"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn command_input_sorts_and_exposes_request_skill_activations() {
+        let mut request = request_for_tool_use("call-after-skills");
+        request.skill_activations = vec![
+            activation("implicit", SkillActivationKind::Implicit, 'b'),
+            activation("explicit", SkillActivationKind::Explicit, 'a'),
+        ];
+
+        let input_json = command_input_json(&request).expect("serialize command input");
+        let input: serde_json::Value =
+            serde_json::from_str(&input_json).expect("parse command input");
+
+        assert_eq!(
+            input["skill_activations"],
+            serde_json::json!([
+                {
+                    "name": "explicit",
+                    "path": "/skills/review/SKILL.md",
+                    "scope": "user",
+                    "invocation": "explicit",
+                    "turn_id": "turn-1",
+                    "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                },
+                {
+                    "name": "implicit",
+                    "path": "/skills/review/SKILL.md",
+                    "scope": "user",
+                    "invocation": "implicit",
+                    "turn_id": "turn-1",
+                    "content_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                },
+            ])
+        );
     }
 
     #[test]
@@ -631,6 +690,23 @@ mod tests {
             tool_use_id: tool_use_id.to_string(),
             tool_input: json!({ "command": "echo hello" }),
             tool_response: json!({"ok": true}),
+            skill_activations: Vec::new(),
         }
+    }
+
+    fn activation(
+        name: &str,
+        invocation: SkillActivationKind,
+        digest_character: char,
+    ) -> SkillActivation {
+        SkillActivation::new(
+            name.to_string(),
+            "/skills/review/SKILL.md".to_string(),
+            SkillActivationScope::User,
+            invocation,
+            "turn-1".to_string(),
+            digest_character.to_string().repeat(64),
+        )
+        .expect("valid activation")
     }
 }

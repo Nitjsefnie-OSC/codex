@@ -6,6 +6,7 @@ use crate::realtime_conversation::handle_text as handle_realtime_conversation_te
 use async_channel::Receiver;
 use codex_otel::set_parent_from_w3c_trace_context;
 use codex_protocol::protocol::Submission;
+use futures::future::BoxFuture;
 use tracing::Instrument;
 use tracing::debug_span;
 use tracing::info_span;
@@ -53,6 +54,7 @@ use codex_rmcp_client::ElicitationAction;
 use codex_rmcp_client::ElicitationResponse;
 use serde_json::Value;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tracing::debug;
 use tracing::info;
 use tracing::warn;
@@ -87,13 +89,19 @@ pub async fn inter_agent_communication(
     root_turn_id: Option<String>,
 ) {
     let trigger_turn = communication.trigger_turn;
+    let _delivery_guard = sess
+        .input_queue
+        .lock_background_notification_delivery()
+        .await;
     sess.input_queue
-        .enqueue_mailbox_communication(
+        .enqueue_or_inject_mailbox_communication(
+            &sess.active_turn,
             communication,
             parent_turn_id.filter(|_| trigger_turn),
             root_turn_id.filter(|_| trigger_turn),
         )
         .await;
+    drop(_delivery_guard);
     crate::agent_communication::emit_agent_communication_receive(&sub_id);
     if trigger_turn || sess.has_outstanding_durable_sleep() {
         sess.maybe_start_turn_for_pending_work_with_sub_id(sub_id)
@@ -395,6 +403,12 @@ pub async fn set_thread_memory_mode(sess: &Arc<Session>, sub_id: String, mode: T
 }
 
 async fn shutdown_session_runtime(sess: &Arc<Session>) {
+    {
+        let _turn_start_guard = sess.input_queue.lock_turn_start().await;
+        sess.shutdown_started
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    sess.services.unified_exec_manager.begin_shutdown().await;
     if let Some(startup_prewarm) = sess.take_session_startup_prewarm().await {
         startup_prewarm.abort().await;
     }
@@ -519,160 +533,24 @@ pub(super) async fn submission_loop(
 ) {
     // To break out of this loop, send Op::Shutdown.
     let mut shutdown_received = false;
-    while let Ok(sub) = rx_sub.recv().await {
+    loop {
+        let sub = tokio::select! {
+            biased;
+            sub = rx_sub.recv() => match sub {
+                Ok(sub) => sub,
+                Err(_) => break,
+            },
+            _ = sess.input_queue.background_wake_notified(),
+                if !sess.shutdown_started.load(Ordering::Acquire) =>
+            {
+                sess.maybe_start_background_notification_turn_if_idle().await;
+                continue;
+            }
+        };
         debug!(?sub, "Submission");
         let dispatch_span = submission_dispatch_span(&sub);
-        let should_exit = async {
-            match sub.op {
-                Op::Interrupt => {
-                    interrupt(&sess).await;
-                    false
-                }
-                Op::CleanBackgroundTerminals => {
-                    clean_background_terminals(&sess).await;
-                    false
-                }
-                Op::RealtimeConversationStart(params) => {
-                    if let Err(err) =
-                        handle_realtime_conversation_start(&sess, sub.id.clone(), params).await
-                    {
-                        sess.send_event_raw(Event {
-                            id: sub.id.clone(),
-                            msg: EventMsg::Error(ErrorEvent {
-                                message: err.to_string(),
-                                codex_error_info: Some(CodexErrorInfo::Other),
-                            }),
-                        })
-                        .await;
-                    }
-                    false
-                }
-                Op::RealtimeConversationAudio(params) => {
-                    handle_realtime_conversation_audio(&sess, sub.id.clone(), params).await;
-                    false
-                }
-                Op::RealtimeConversationText(params) => {
-                    handle_realtime_conversation_text(&sess, sub.id.clone(), params).await;
-                    false
-                }
-                Op::RealtimeConversationSpeech(params) => {
-                    handle_realtime_conversation_speech(&sess, sub.id.clone(), params).await;
-                    false
-                }
-                Op::RealtimeConversationClose => {
-                    handle_realtime_conversation_close(&sess, sub.id.clone()).await;
-                    false
-                }
-                Op::RealtimeConversationListVoices => {
-                    realtime_conversation_list_voices(&sess, sub.id.clone()).await;
-                    false
-                }
-                Op::TurnInput {
-                    request,
-                    mode,
-                    reply,
-                } => {
-                    let result = turn_input::handle(&sess, *request, mode, sub.id.clone()).await;
-                    let _ = reply.send(result);
-                    false
-                }
-                Op::RecoverTurn {
-                    thread_settings,
-                    reply,
-                } => {
-                    let result =
-                        turn_input::handle_recovery(&sess, thread_settings, sub.id.clone()).await;
-                    let _ = reply.send(result);
-                    false
-                }
-                Op::ThreadSettings { thread_settings } => {
-                    thread_settings::update(&sess, sub.id.clone(), thread_settings).await;
-                    false
-                }
-                Op::InterAgentCommunication { communication } => {
-                    inter_agent_communication(
-                        &sess,
-                        sub.id.clone(),
-                        communication,
-                        sub.parent_turn_id,
-                        sub.root_turn_id,
-                    )
-                    .await;
-                    false
-                }
-                Op::ExecApproval {
-                    id: approval_id,
-                    turn_id,
-                    decision,
-                } => {
-                    exec_approval(&sess, approval_id, turn_id, decision).await;
-                    false
-                }
-                Op::PatchApproval { id, decision } => {
-                    patch_approval(&sess, id, decision).await;
-                    false
-                }
-                Op::UserInputAnswer { id, response } => {
-                    request_user_input_response(&sess, id, response).await;
-                    false
-                }
-                Op::RequestPermissionsResponse { id, response } => {
-                    request_permissions_response(&sess, id, response).await;
-                    false
-                }
-                Op::DynamicToolResponse { id, response } => {
-                    dynamic_tool_response(&sess, id, response).await;
-                    false
-                }
-                Op::RefreshMcpServers => {
-                    refresh_mcp_servers(&sess);
-                    false
-                }
-                Op::ReloadUserConfig => {
-                    reload_user_config(&sess).await;
-                    false
-                }
-                Op::Compact => {
-                    compact(&sess, sub.id.clone()).await;
-                    false
-                }
-                Op::ThreadRollback { num_turns } => {
-                    thread_rollback(&sess, sub.id.clone(), num_turns).await;
-                    false
-                }
-                Op::SetThreadMemoryMode { mode } => {
-                    set_thread_memory_mode(&sess, sub.id.clone(), mode).await;
-                    false
-                }
-                Op::RunUserShellCommand { command } => {
-                    run_user_shell_command(&sess, sub.id.clone(), command).await;
-                    false
-                }
-                Op::ResolveElicitation {
-                    server_name,
-                    request_id,
-                    decision,
-                    content,
-                    meta,
-                } => {
-                    resolve_elicitation(&sess, server_name, request_id, decision, content, meta)
-                        .await;
-                    false
-                }
-                Op::Shutdown => shutdown(&sess, sub.id.clone()).await,
-                Op::Review { review_request } => {
-                    review(&sess, &config, sub.id.clone(), review_request).await;
-                    false
-                }
-                Op::ApproveGuardianDeniedAction { event } => {
-                    approve_guardian_denied_action(&sess, event).await;
-                    false
-                }
-                _ => false, // Ignore unknown ops; enum is non_exhaustive to allow extensions.
-            }
-        }
-        .instrument(dispatch_span)
-        .await;
+        let should_exit =
+            dispatch_submission(Arc::clone(&sess), Arc::clone(&config), sub, dispatch_span).await;
         if should_exit {
             shutdown_received = true;
             break;
@@ -690,6 +568,180 @@ pub(super) async fn submission_loop(
         }
     }
     debug!("Agent loop exited");
+}
+
+fn dispatch_submission(
+    sess: Arc<Session>,
+    config: Arc<Config>,
+    sub: Submission,
+    dispatch_span: tracing::Span,
+) -> BoxFuture<'static, bool> {
+    let dispatch: BoxFuture<'static, bool> = Box::pin(async move {
+        match sub.op {
+            Op::Interrupt => {
+                interrupt(&sess).await;
+                false
+            }
+            Op::CleanBackgroundTerminals => {
+                clean_background_terminals(&sess).await;
+                false
+            }
+            Op::RealtimeConversationStart(params) => {
+                if let Err(err) =
+                    handle_realtime_conversation_start(&sess, sub.id.clone(), params).await
+                {
+                    sess.send_event_raw(Event {
+                        id: sub.id.clone(),
+                        msg: EventMsg::Error(ErrorEvent {
+                            message: err.to_string(),
+                            codex_error_info: Some(CodexErrorInfo::Other),
+                        }),
+                    })
+                    .await;
+                }
+                false
+            }
+            Op::RealtimeConversationAudio(params) => {
+                handle_realtime_conversation_audio(&sess, sub.id.clone(), params).await;
+                false
+            }
+            Op::RealtimeConversationText(params) => {
+                handle_realtime_conversation_text(&sess, sub.id.clone(), params).await;
+                false
+            }
+            Op::RealtimeConversationSpeech(params) => {
+                handle_realtime_conversation_speech(&sess, sub.id.clone(), params).await;
+                false
+            }
+            Op::RealtimeConversationClose => {
+                handle_realtime_conversation_close(&sess, sub.id.clone()).await;
+                false
+            }
+            Op::RealtimeConversationListVoices => {
+                realtime_conversation_list_voices(&sess, sub.id.clone()).await;
+                false
+            }
+            Op::TurnInput {
+                request,
+                mode,
+                reply,
+            } => {
+                let result = turn_input::handle(&sess, *request, mode, sub.id.clone()).await;
+                let _ = reply.send(result);
+                false
+            }
+            Op::RecoverTurn {
+                thread_settings,
+                reply,
+            } => {
+                let result =
+                    turn_input::handle_recovery(&sess, thread_settings, sub.id.clone()).await;
+                let _ = reply.send(result);
+                false
+            }
+            Op::ThreadSettings { thread_settings } => {
+                thread_settings::update(&sess, sub.id.clone(), thread_settings).await;
+                false
+            }
+            Op::InterAgentCommunication { communication } => {
+                inter_agent_communication(
+                    &sess,
+                    sub.id.clone(),
+                    communication,
+                    sub.parent_turn_id,
+                    sub.root_turn_id,
+                )
+                .await;
+                false
+            }
+            Op::InterAgentCompletion { communication } => {
+                sess.deliver_inter_agent_completion(communication).await;
+                crate::agent_communication::emit_agent_communication_receive(&sub.id);
+                false
+            }
+            Op::SubagentCompletion {
+                agent_reference,
+                status,
+                turn_id,
+            } => {
+                let mut item = crate::context::ContextualUserFragment::into(
+                    crate::context::SubagentNotification::new(agent_reference, status),
+                );
+                item.set_turn_id_if_missing(&turn_id);
+                sess.deliver_subagent_completion_item(item).await;
+                false
+            }
+            Op::ExecApproval {
+                id: approval_id,
+                turn_id,
+                decision,
+            } => {
+                exec_approval(&sess, approval_id, turn_id, decision).await;
+                false
+            }
+            Op::PatchApproval { id, decision } => {
+                patch_approval(&sess, id, decision).await;
+                false
+            }
+            Op::UserInputAnswer { id, response } => {
+                request_user_input_response(&sess, id, response).await;
+                false
+            }
+            Op::RequestPermissionsResponse { id, response } => {
+                request_permissions_response(&sess, id, response).await;
+                false
+            }
+            Op::DynamicToolResponse { id, response } => {
+                dynamic_tool_response(&sess, id, response).await;
+                false
+            }
+            Op::RefreshMcpServers => {
+                refresh_mcp_servers(&sess);
+                false
+            }
+            Op::ReloadUserConfig => {
+                reload_user_config(&sess).await;
+                false
+            }
+            Op::Compact => {
+                compact(&sess, sub.id.clone()).await;
+                false
+            }
+            Op::ThreadRollback { num_turns } => {
+                thread_rollback(&sess, sub.id.clone(), num_turns).await;
+                false
+            }
+            Op::SetThreadMemoryMode { mode } => {
+                set_thread_memory_mode(&sess, sub.id.clone(), mode).await;
+                false
+            }
+            Op::RunUserShellCommand { command } => {
+                run_user_shell_command(&sess, sub.id.clone(), command).await;
+                false
+            }
+            Op::ResolveElicitation {
+                server_name,
+                request_id,
+                decision,
+                content,
+                meta,
+            } => {
+                resolve_elicitation(&sess, server_name, request_id, decision, content, meta).await;
+                false
+            }
+            Op::Shutdown => shutdown(&sess, sub.id.clone()).await,
+            Op::Review { review_request } => {
+                review(&sess, &config, sub.id.clone(), review_request).await;
+                false
+            }
+            Op::ApproveGuardianDeniedAction { event } => {
+                approve_guardian_denied_action(&sess, event).await;
+                false
+            }
+            _ => false, // Ignore unknown ops; enum is non_exhaustive to allow extensions.
+        }
+    });
+    Box::pin(dispatch.instrument(dispatch_span))
 }
 
 async fn approve_guardian_denied_action(sess: &Arc<Session>, event: GuardianAssessmentEvent) {
