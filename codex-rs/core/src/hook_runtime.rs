@@ -5,6 +5,9 @@ use std::time::Duration;
 use codex_analytics::CompactionTrigger;
 use codex_analytics::HookRunFact;
 use codex_analytics::build_track_events_context;
+use codex_hooks::BackgroundState;
+use codex_hooks::BackgroundTerminalSnapshot;
+use codex_hooks::MonitorSnapshot;
 use codex_hooks::PermissionRequestDecision;
 use codex_hooks::PermissionRequestOutcome;
 use codex_hooks::PermissionRequestRequest;
@@ -49,8 +52,12 @@ use crate::event_mapping::parse_turn_item;
 use crate::session::TurnInput;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
+use crate::skills::skill_activation_snapshot;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::sandboxing::PermissionRequestPayload;
+use crate::unified_exec::MonitorInfo;
+use crate::unified_exec::MonitorKind;
+use crate::unified_exec::MonitorState;
 
 pub(crate) struct HookRuntimeOutcome {
     pub should_stop: bool,
@@ -184,6 +191,7 @@ pub(crate) async fn run_pre_tool_use_hooks(
         matcher_aliases: tool_name.matcher_aliases().to_vec(),
         tool_use_id,
         tool_input: tool_input.clone(),
+        skill_activations: skill_activation_snapshot(turn_context),
     };
     let hooks = sess.hooks();
     let preview_runs = hooks.preview_pre_tool_use(&request);
@@ -288,6 +296,7 @@ pub(crate) async fn run_post_tool_use_hooks(
         tool_use_id,
         tool_input,
         tool_response,
+        skill_activations: skill_activation_snapshot(turn_context),
     };
     let hooks = sess.hooks();
     let preview_runs = hooks.preview_post_tool_use(&request);
@@ -359,6 +368,7 @@ pub(crate) async fn run_turn_stop_hooks(
         permission_mode: hook_permission_mode(turn_context),
         stop_hook_active,
         last_assistant_message,
+        background: background_state_snapshot(sess).await,
         target,
     };
     let hooks = sess.hooks();
@@ -367,6 +377,81 @@ pub(crate) async fn run_turn_stop_hooks(
     let mut outcome = hooks.run_stop(request).await;
     emit_hook_completed_events(sess, turn_context, std::mem::take(&mut outcome.hook_events)).await;
     outcome
+}
+
+/// Reads live background work off the process manager for a stop hook.
+///
+/// Taken at the moment the hook fires rather than accumulated during the turn:
+/// a monitor can exit between the last tool call and the stop, and a hook that
+/// blocked on a stale "still running" would be wrong in the direction that
+/// costs the most.
+pub(crate) async fn background_state_snapshot(sess: &Arc<Session>) -> BackgroundState {
+    let monitors: Vec<MonitorSnapshot> = sess
+        .list_monitors()
+        .await
+        .into_iter()
+        .map(monitor_snapshot)
+        .collect();
+    let background_terminals: Vec<BackgroundTerminalSnapshot> = sess
+        .list_background_terminals()
+        .await
+        .into_iter()
+        .map(|terminal| BackgroundTerminalSnapshot {
+            process_id: terminal.process_id,
+            command: terminal.command,
+            // A filesystem path, not the `file://` URI `Display` would give:
+            // a hook shells out with this, and `cwd` on every other hook
+            // payload is a plain path.
+            cwd: terminal.cwd.to_path_buf().display().to_string(),
+        })
+        .collect();
+
+    let running_monitors = monitors.iter().filter(|monitor| monitor.running).count();
+    let unacknowledged_notifications = monitors
+        .iter()
+        .map(|monitor| monitor.unacknowledged_notifications)
+        .sum();
+
+    BackgroundState {
+        running_monitors: u32::try_from(running_monitors).unwrap_or(u32::MAX),
+        running_background_terminals: u32::try_from(background_terminals.len()).unwrap_or(u32::MAX),
+        unacknowledged_notifications,
+        monitors,
+        background_terminals,
+    }
+}
+
+fn monitor_snapshot(info: MonitorInfo) -> MonitorSnapshot {
+    // `state` is flattened into a name plus the one payload that name carries,
+    // so a hook can branch on a string without parsing a tagged union.
+    let (state, exit_code, failure_message) = match info.state {
+        MonitorState::Running => ("running", None, None),
+        MonitorState::Exited { exit_code } => ("exited", Some(exit_code), None),
+        MonitorState::Failed { message } => ("failed", None, Some(message)),
+        MonitorState::Stopped => ("stopped", None, None),
+        MonitorState::TimedOut => ("timed_out", None, None),
+    };
+
+    MonitorSnapshot {
+        process_id: info.process_id,
+        command: info.command,
+        cwd: info.cwd,
+        kind: match info.kind {
+            MonitorKind::Job => "job".to_string(),
+            MonitorKind::Watcher => "watcher".to_string(),
+        },
+        running: state == "running",
+        state: state.to_string(),
+        exit_code,
+        failure_message,
+        age_seconds: info.age_seconds,
+        notifications_delivered: info.notifications_delivered,
+        notifications_suppressed: info.notifications_suppressed,
+        unacknowledged_notifications: info.unacknowledged_notifications,
+        owner_model_slug: info.owner.model_slug,
+        owner_turn_id: info.owner.sub_id,
+        owner_call_id: info.owner.call_id,
+    }
 }
 
 #[instrument(level = "trace", skip_all)]
@@ -565,10 +650,12 @@ pub(crate) async fn inspect_pending_input(
             should_stop: false,
             additional_contexts: Vec::new(),
         },
-        TurnInput::InterAgentCommunication(_) => HookRuntimeOutcome {
-            should_stop: false,
-            additional_contexts: Vec::new(),
-        },
+        TurnInput::InterAgentCommunication(_) | TurnInput::AgentCompletion(_) => {
+            HookRuntimeOutcome {
+                should_stop: false,
+                additional_contexts: Vec::new(),
+            }
+        }
     }
 }
 
@@ -593,7 +680,8 @@ pub(crate) async fn record_pending_input(
             sess.record_annotated_conversation_items(turn_context, vec![item])
                 .await;
         }
-        TurnInput::InterAgentCommunication(communication) => {
+        TurnInput::InterAgentCommunication(communication)
+        | TurnInput::AgentCompletion(communication) => {
             sess.record_inter_agent_communication(turn_context, communication)
                 .await;
         }
@@ -865,6 +953,14 @@ fn compaction_trigger_label(value: CompactionTrigger) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use codex_hooks::HooksConfig;
+    use codex_hooks::SkillActivation;
+    use codex_hooks::SkillActivationKind;
+    use codex_hooks::SkillActivationScope;
     use codex_protocol::models::ContentItem;
     use codex_protocol::protocol::HookEventName;
     use codex_protocol::protocol::HookExecutionMode;
@@ -879,12 +975,18 @@ mod tests {
     use super::emit_hook_started_events;
     use super::hook_run_analytics_payload;
     use super::hook_run_metric_tags;
+    use crate::session::session::Session;
     use crate::session::tests::make_session_and_context;
     use crate::session::tests::make_session_and_context_with_rx;
+    use crate::session::turn_context::TurnContext;
+    use crate::skills::record_skill_activation;
+    use crate::skills::skill_activation_snapshot;
+    use crate::tools::hook_names::HookToolName;
     use codex_protocol::protocol::HookCompletedEvent;
     use codex_protocol::protocol::HookRunSummary;
     use codex_utils_absolute_path::test_support::PathBufExt;
     use codex_utils_absolute_path::test_support::test_path_buf;
+    use core_test_support::hooks::trusted_config_layer_stack;
 
     #[test]
     fn additional_context_messages_stay_separate_and_ordered() {
@@ -1046,6 +1148,221 @@ mod tests {
                 ("status", "completed"),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn production_pre_tool_use_hook_receives_turn_local_skill_activation_snapshot() {
+        let (mut session_a, mut turn_a) = make_session_and_context().await;
+        let (mut session_b, mut turn_b) = make_session_and_context().await;
+        turn_a.sub_id = "turn-a".to_string();
+        turn_b.sub_id = "turn-b".to_string();
+        let log_a = install_tool_hooks(&mut session_a, &turn_a);
+        let log_b = install_tool_hooks(&mut session_b, &turn_b);
+
+        let activation_a = activation("alpha", &turn_a.sub_id, 'a');
+        let activation_b = activation("beta", &turn_b.sub_id, 'b');
+        record_skill_activation(&turn_a, activation_a.clone());
+        record_skill_activation(&turn_b, activation_b.clone());
+
+        let session_a = Arc::new(session_a);
+        let turn_a = Arc::new(turn_a);
+        let session_b = Arc::new(session_b);
+        let turn_b = Arc::new(turn_b);
+
+        assert!(matches!(
+            super::run_pre_tool_use_hooks(
+                &session_a,
+                &turn_a,
+                "pre-a".to_string(),
+                &HookToolName::bash(),
+                &serde_json::json!({"command": "echo alpha"}),
+            )
+            .await,
+            super::PreToolUseHookResult::Continue { .. }
+        ));
+        assert!(matches!(
+            super::run_pre_tool_use_hooks(
+                &session_b,
+                &turn_b,
+                "pre-b".to_string(),
+                &HookToolName::bash(),
+                &serde_json::json!({"command": "echo beta"}),
+            )
+            .await,
+            super::PreToolUseHookResult::Continue { .. }
+        ));
+
+        let inputs_a = read_hook_inputs(&log_a);
+        let inputs_b = read_hook_inputs(&log_b);
+        assert_eq!(inputs_a.len(), 1);
+        assert_eq!(inputs_b.len(), 1);
+        assert_eq!(
+            inputs_a[0]["skill_activations"],
+            serde_json::to_value(vec![activation_a]).expect("serialize turn A activation")
+        );
+        assert_eq!(
+            inputs_b[0]["skill_activations"],
+            serde_json::to_value(vec![activation_b]).expect("serialize turn B activation")
+        );
+        assert_eq!(inputs_a[0]["turn_id"], "turn-a");
+        assert_eq!(inputs_b[0]["turn_id"], "turn-b");
+
+        let activation_a_later = activation("later", &turn_a.sub_id, 'c');
+        record_skill_activation(&turn_a, activation_a_later);
+        super::run_pre_tool_use_hooks(
+            &session_a,
+            &turn_a,
+            "pre-a-later".to_string(),
+            &HookToolName::bash(),
+            &serde_json::json!({"command": "echo later"}),
+        )
+        .await;
+        let inputs_a = read_hook_inputs(&log_a);
+        assert_eq!(inputs_a.len(), 2);
+        assert_eq!(
+            inputs_a[1]["skill_activations"],
+            serde_json::to_value(skill_activation_snapshot(&turn_a))
+                .expect("serialize current turn A snapshot")
+        );
+    }
+
+    #[tokio::test]
+    async fn production_post_tool_use_hook_receives_turn_local_skill_activation_snapshot() {
+        let (mut session_a, mut turn_a) = make_session_and_context().await;
+        let (mut session_b, mut turn_b) = make_session_and_context().await;
+        turn_a.sub_id = "turn-a-post".to_string();
+        turn_b.sub_id = "turn-b-post".to_string();
+        let log_a = install_tool_hooks(&mut session_a, &turn_a);
+        let log_b = install_tool_hooks(&mut session_b, &turn_b);
+
+        let activation_a = activation("alpha", &turn_a.sub_id, 'd');
+        let activation_b = activation("beta", &turn_b.sub_id, 'e');
+        record_skill_activation(&turn_a, activation_a.clone());
+        record_skill_activation(&turn_b, activation_b.clone());
+
+        let session_a = Arc::new(session_a);
+        let turn_a = Arc::new(turn_a);
+        let session_b = Arc::new(session_b);
+        let turn_b = Arc::new(turn_b);
+
+        super::run_post_tool_use_hooks(
+            &session_a,
+            &turn_a,
+            "post-a".to_string(),
+            "Bash".to_string(),
+            Vec::new(),
+            serde_json::json!({"command": "echo alpha"}),
+            serde_json::json!({"stdout": "alpha"}),
+        )
+        .await;
+        super::run_post_tool_use_hooks(
+            &session_b,
+            &turn_b,
+            "post-b".to_string(),
+            "Bash".to_string(),
+            Vec::new(),
+            serde_json::json!({"command": "echo beta"}),
+            serde_json::json!({"stdout": "beta"}),
+        )
+        .await;
+
+        let inputs_a = read_hook_inputs(&log_a);
+        let inputs_b = read_hook_inputs(&log_b);
+        assert_eq!(inputs_a.len(), 1);
+        assert_eq!(inputs_b.len(), 1);
+        assert_eq!(inputs_a[0]["turn_id"], "turn-a-post");
+        assert_eq!(inputs_b[0]["turn_id"], "turn-b-post");
+        assert_eq!(
+            inputs_a[0]["skill_activations"],
+            serde_json::to_value(vec![activation_a]).expect("serialize post turn A activation")
+        );
+        assert_eq!(
+            inputs_b[0]["skill_activations"],
+            serde_json::to_value(vec![activation_b]).expect("serialize post turn B activation")
+        );
+    }
+
+    fn activation(name: &str, turn_id: &str, digest_character: char) -> SkillActivation {
+        SkillActivation::new(
+            name.to_string(),
+            format!("/skills/{name}/SKILL.md"),
+            SkillActivationScope::Repo,
+            SkillActivationKind::Explicit,
+            turn_id.to_string(),
+            digest_character.to_string().repeat(64),
+        )
+        .expect("valid skill activation")
+    }
+
+    fn install_tool_hooks(session: &mut Session, turn_context: &TurnContext) -> PathBuf {
+        let codex_home = turn_context.config.codex_home.as_path();
+        std::fs::create_dir_all(codex_home).expect("create codex home");
+        let script_path = codex_home.join("tool_activation_hook.py");
+        let log_path = codex_home.join("tool_activation_hook_log.jsonl");
+        std::fs::write(
+            &script_path,
+            format!(
+                "import json\nfrom pathlib import Path\nimport sys\npayload = json.load(sys.stdin)\nwith Path(r\"{}\").open(\"a\", encoding=\"utf-8\") as handle:\n    handle.write(json.dumps(payload) + \"\\n\")\n",
+                log_path.display()
+            ),
+        )
+        .expect("write tool activation hook script");
+        std::fs::write(
+            codex_home.join("hooks.json"),
+            serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": "Bash",
+                        "hooks": [{
+                            "type": "command",
+                            "command": format!("python3 {}", script_path.display()),
+                        }]
+                    }],
+                    "PostToolUse": [{
+                        "matcher": "Bash",
+                        "hooks": [{
+                            "type": "command",
+                            "command": format!("python3 {}", script_path.display()),
+                        }]
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .expect("write tool activation hooks config");
+
+        let listed = codex_hooks::list_hooks(HooksConfig {
+            feature_enabled: true,
+            config_layer_stack: Some(turn_context.config.config_layer_stack.clone()),
+            ..HooksConfig::default()
+        });
+        assert_eq!(listed.hooks.len(), 2);
+        let trusted_config_layer_stack = trusted_config_layer_stack(
+            &turn_context.config.config_layer_stack,
+            &turn_context.config.codex_home,
+            listed.hooks,
+        );
+        let hooks = session.hooks().reconfigured(HooksConfig {
+            feature_enabled: true,
+            config_layer_stack: Some(trusted_config_layer_stack),
+            shell_program: (!cfg!(windows)).then_some("/bin/sh".to_string()),
+            shell_args: if cfg!(windows) {
+                Vec::new()
+            } else {
+                vec!["-c".to_string()]
+            },
+            ..HooksConfig::default()
+        });
+        session.services.hooks.store(Arc::new(hooks));
+        log_path
+    }
+
+    fn read_hook_inputs(path: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .expect("read tool activation hook log")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("parse tool activation hook input"))
+            .collect()
     }
 
     fn sample_hook_run(status: HookRunStatus, source: HookSource) -> HookRunSummary {

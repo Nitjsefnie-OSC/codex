@@ -10,6 +10,8 @@ pub(crate) mod list_available_plugins_to_install_spec;
 mod mcp;
 mod mcp_resource;
 pub(crate) mod mcp_resource_spec;
+mod monitor;
+pub(crate) mod monitor_spec;
 pub(crate) mod multi_agents;
 pub(crate) mod multi_agents_common;
 pub(crate) mod multi_agents_spec;
@@ -34,6 +36,8 @@ pub(crate) mod unified_exec;
 mod view_image;
 pub(crate) mod view_image_spec;
 mod wait_for_environment;
+mod whoami;
+pub(crate) mod whoami_spec;
 
 use codex_sandboxing::policy_transforms::intersect_permission_profiles;
 use codex_sandboxing::policy_transforms::merge_permission_profiles;
@@ -63,6 +67,7 @@ pub use mcp::McpHandler;
 pub use mcp_resource::ListMcpResourceTemplatesHandler;
 pub use mcp_resource::ListMcpResourcesHandler;
 pub use mcp_resource::ReadMcpResourceHandler;
+pub use monitor::MonitorHandler;
 pub use new_context_window::NewContextWindowHandler;
 pub use plan::PlanHandler;
 pub use request_permissions::RequestPermissionsHandler;
@@ -79,6 +84,7 @@ pub use unified_exec::WriteStdinHandler;
 pub use view_image::ViewImageHandler;
 pub(crate) use wait_for_environment::WaitForEnvironmentHandler;
 pub use wait_for_environment::WaitForEnvironmentToolConfig;
+pub use whoami::WhoamiHandler;
 
 pub(crate) fn parse_arguments<T>(arguments: &str) -> Result<T, FunctionCallError>
 where

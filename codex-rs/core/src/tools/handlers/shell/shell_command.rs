@@ -208,7 +208,7 @@ impl ShellCommandHandler {
         })?;
         let cwd = resolve_workdir_base_path(&arguments, &environment_cwd)?;
         let params: ShellCommandToolCallParams = parse_arguments_with_base_path(&arguments, &cwd)?;
-        maybe_emit_implicit_skill_invocation(
+        let implicit_skill_activation = maybe_emit_implicit_skill_invocation(
             session.as_ref(),
             turn.as_ref(),
             &params.command,
@@ -245,6 +245,7 @@ impl ShellCommandHandler {
             tracker,
             call_id,
             shell_runtime_backend: self.shell_runtime_backend(),
+            implicit_skill_activation,
         })
         .await
         .map(boxed_tool_output)
@@ -302,5 +303,61 @@ impl CoreToolRuntime for ShellCommandHandler {
             tool_input: serde_json::json!({ "command": command }),
             tool_response,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use codex_protocol::models::PermissionProfile;
+    use codex_protocol::protocol::SkillScope;
+    use serde_json::json;
+    use tokio::sync::Mutex;
+
+    use super::*;
+    use crate::session::step_context::StepContext;
+    use crate::skills::skill_activation_snapshot;
+    use crate::skills::tests::configure_implicit_skill_fixture_for_exec;
+    use crate::skills::tests::implicit_skill_fixture;
+    use crate::skills::tests::quote_skill_test_path;
+    use crate::tools::context::ToolCallSource;
+    use crate::turn_diff_tracker::TurnDiffTracker;
+
+    #[tokio::test]
+    async fn classic_shell_implicit_skill_activation_uses_rewritten_pre_tool_command() {
+        let mut fixture = implicit_skill_fixture(SkillScope::Admin).await;
+        configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::Disabled);
+        let turn = Arc::new(fixture.turn);
+        let handler = ShellCommandHandler::from(ShellCommandBackendConfig::Classic);
+        let original = ToolInvocation {
+            session: Arc::new(fixture.session),
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn: Arc::clone(&turn),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "rewritten-skill-read".to_string(),
+            tool_name: ToolName::plain("shell_command"),
+            source: ToolCallSource::Direct,
+            payload: ToolPayload::Function {
+                arguments: json!({ "command": "echo not-a-skill-read" }).to_string(),
+            },
+        };
+        let rewritten_command = format!("cat {}", quote_skill_test_path(&fixture.skill_path));
+        let rewritten = handler
+            .with_updated_hook_input(original, json!({ "command": rewritten_command }))
+            .expect("rewrite tool input");
+        handler
+            .handle(rewritten)
+            .await
+            .expect("rewritten command should execute successfully");
+
+        let activations = skill_activation_snapshot(&turn);
+        assert_eq!(activations.len(), 1);
+        assert_eq!(activations[0].name(), "audit-skill");
+        assert_eq!(
+            activations[0].scope(),
+            codex_hooks::SkillActivationScope::Admin
+        );
     }
 }

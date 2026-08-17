@@ -28,6 +28,7 @@ use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnEnvironmentSelections;
 use codex_skills::SkillError;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
 use tokio::sync::Semaphore;
 
 /// Context for an initialized model agent
@@ -58,6 +59,8 @@ pub(crate) struct Session {
     pub(crate) conversation: Arc<RealtimeConversationManager>,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
     pub(crate) async_hook_results: async_channel::Receiver<HookCompletedEvent>,
+    /// Blocks extension-initiated idle turns once session teardown begins.
+    pub(crate) shutdown_started: AtomicBool,
     pub(crate) input_queue: InputQueue,
     pub(crate) guardian_review_session: GuardianReviewSessionManager,
     pub(crate) services: SessionServices,
@@ -1336,6 +1339,7 @@ impl Session {
                 conversation: Arc::new(RealtimeConversationManager::new()),
                 active_turn: Mutex::new(None),
                 async_hook_results,
+                shutdown_started: AtomicBool::new(false),
                 input_queue: InputQueue::new(),
                 guardian_review_session: GuardianReviewSessionManager::default(),
                 services,

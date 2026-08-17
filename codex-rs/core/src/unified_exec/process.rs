@@ -12,6 +12,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+use codex_exec_server::ExecOutputStream;
 use codex_exec_server::ExecProcess;
 use codex_exec_server::ExecProcessEvent;
 use codex_exec_server::ProcessSignal as ExecServerProcessSignal;
@@ -57,6 +58,7 @@ pub(crate) struct NoopSpawnLifecycle;
 impl SpawnLifecycle for NoopSpawnLifecycle {}
 
 pub(crate) type OutputBuffer = Arc<Mutex<HeadTailBuffer>>;
+pub(super) type MonitorOutputBuffer = Arc<Mutex<Option<HeadTailBuffer>>>;
 /// Shared output state exposed to polling and streaming consumers.
 #[derive(Clone)]
 pub(crate) struct OutputHandles {
@@ -90,6 +92,8 @@ enum ProcessHandle {
 pub(crate) struct UnifiedExecProcess {
     process_handle: ProcessHandle,
     output_tx: broadcast::Sender<Vec<u8>>,
+    monitor_output_tx: broadcast::Sender<Vec<u8>>,
+    monitor_output_buffer: MonitorOutputBuffer,
     output: OutputHandles,
     output_drained: Arc<Notify>,
     interaction_lock: Arc<Mutex<()>>,
@@ -125,11 +129,14 @@ impl UnifiedExecProcess {
         };
         let output_drained = Arc::new(Notify::new());
         let (output_tx, _) = broadcast::channel(64);
+        let (monitor_output_tx, _) = broadcast::channel(64);
         let (state_tx, state_rx) = watch::channel(ProcessState::default());
 
         Self {
             process_handle,
             output_tx,
+            monitor_output_tx,
+            monitor_output_buffer: Arc::new(Mutex::new(Some(HeadTailBuffer::default()))),
             output,
             output_drained,
             interaction_lock: Arc::new(Mutex::new(())),
@@ -172,6 +179,14 @@ impl UnifiedExecProcess {
 
     pub(super) fn output_receiver(&self) -> tokio::sync::broadcast::Receiver<Vec<u8>> {
         self.output_tx.subscribe()
+    }
+
+    pub(super) fn monitor_output_receiver(&self) -> tokio::sync::broadcast::Receiver<Vec<u8>> {
+        self.monitor_output_tx.subscribe()
+    }
+
+    pub(super) fn monitor_output_buffer(&self) -> &MonitorOutputBuffer {
+        &self.monitor_output_buffer
     }
 
     pub(super) fn cancellation_token(&self) -> CancellationToken {
@@ -338,16 +353,18 @@ impl UnifiedExecProcess {
             stderr_rx,
             mut exit_rx,
         } = spawned;
-        let output_rx = codex_utils_pty::combine_output_receivers(stdout_rx, stderr_rx);
         let mut managed = Self::new(
             ProcessHandle::Local(Box::new(process_handle)),
             sandbox_type,
             Some(spawn_lifecycle),
         );
         managed.output_task = Some(Self::spawn_local_output_task(
-            output_rx,
+            stdout_rx,
+            stderr_rx,
             managed.output_handles().clone(),
             managed.output_tx.clone(),
+            Arc::clone(&managed.monitor_output_buffer),
+            managed.monitor_output_tx.clone(),
         ));
 
         match exit_rx.try_recv() {
@@ -397,6 +414,8 @@ impl UnifiedExecProcess {
             started,
             output_handles,
             managed.output_tx.clone(),
+            Arc::clone(&managed.monitor_output_buffer),
+            managed.monitor_output_tx.clone(),
             managed.state_tx.clone(),
         ));
 
@@ -425,6 +444,8 @@ impl UnifiedExecProcess {
         started: StartedExecProcess,
         output_handles: OutputHandles,
         output_tx: broadcast::Sender<Vec<u8>>,
+        monitor_output_buffer: MonitorOutputBuffer,
+        monitor_output_tx: broadcast::Sender<Vec<u8>>,
         state_tx: watch::Sender<ProcessState>,
     ) -> JoinHandle<()> {
         let OutputHandles {
@@ -503,11 +524,17 @@ impl UnifiedExecProcess {
                         sandbox_denied,
                     } = response;
                     for chunk in chunks.into_iter().filter(|chunk| chunk.seq > last_seq) {
+                        let visibility = MonitorOutputVisibility::from(chunk.stream);
                         let bytes = chunk.chunk.into_inner();
-                        let mut guard = output_buffer.lock().await;
-                        guard.push_chunk(bytes.clone());
-                        drop(guard);
-                        let _ = output_tx.send(bytes);
+                        publish_output_chunk(
+                            &output_buffer,
+                            &output_tx,
+                            &monitor_output_buffer,
+                            &monitor_output_tx,
+                            bytes,
+                            visibility,
+                        )
+                        .await;
                         output_notify.notify_waiters();
                     }
                     last_seq = last_seq.max(next_seq.saturating_sub(1));
@@ -546,11 +573,17 @@ impl UnifiedExecProcess {
                             continue;
                         }
                         last_seq = chunk.seq;
+                        let visibility = MonitorOutputVisibility::from(chunk.stream);
                         let bytes = chunk.chunk.into_inner();
-                        let mut guard = output_buffer.lock().await;
-                        guard.push_chunk(bytes.clone());
-                        drop(guard);
-                        let _ = output_tx.send(bytes);
+                        publish_output_chunk(
+                            &output_buffer,
+                            &output_tx,
+                            &monitor_output_buffer,
+                            &monitor_output_tx,
+                            bytes,
+                            visibility,
+                        )
+                        .await;
                         output_notify.notify_waiters();
                     }
                     ExecProcessEvent::Exited {
@@ -589,9 +622,12 @@ impl UnifiedExecProcess {
     }
 
     fn spawn_local_output_task(
-        mut receiver: tokio::sync::broadcast::Receiver<Vec<u8>>,
+        mut stdout_receiver: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        mut stderr_receiver: tokio::sync::mpsc::Receiver<Vec<u8>>,
         output_handles: OutputHandles,
         output_tx: broadcast::Sender<Vec<u8>>,
+        monitor_output_buffer: MonitorOutputBuffer,
+        monitor_output_tx: broadcast::Sender<Vec<u8>>,
     ) -> JoinHandle<()> {
         let OutputHandles {
             output_buffer,
@@ -605,22 +641,42 @@ impl UnifiedExecProcess {
                 output_closed: Arc::clone(&output_closed),
                 output_closed_notify: Arc::clone(&output_closed_notify),
             };
+            let mut stdout_open = true;
+            let mut stderr_open = true;
             loop {
-                match receiver.recv().await {
-                    Ok(chunk) => {
-                        let mut guard = output_buffer.lock().await;
-                        guard.push_chunk(chunk.clone());
-                        drop(guard);
-                        let _ = output_tx.send(chunk);
-                        output_notify.notify_waiters();
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        output_closed.store(true, Ordering::Release);
-                        output_closed_notify.notify_waiters();
-                        break;
-                    }
-                };
+                tokio::select! {
+                    chunk = stdout_receiver.recv(), if stdout_open => match chunk {
+                        Some(chunk) => {
+                            publish_output_chunk(
+                                &output_buffer,
+                                &output_tx,
+                                &monitor_output_buffer,
+                                &monitor_output_tx,
+                                chunk,
+                                MonitorOutputVisibility::Visible,
+                            )
+                            .await;
+                            output_notify.notify_waiters();
+                        }
+                        None => stdout_open = false,
+                    },
+                    chunk = stderr_receiver.recv(), if stderr_open => match chunk {
+                        Some(chunk) => {
+                            publish_output_chunk(
+                                &output_buffer,
+                                &output_tx,
+                                &monitor_output_buffer,
+                                &monitor_output_tx,
+                                chunk,
+                                MonitorOutputVisibility::Silent,
+                            )
+                            .await;
+                            output_notify.notify_waiters();
+                        }
+                        None => stderr_open = false,
+                    },
+                    else => break,
+                }
             }
         })
     }
@@ -629,6 +685,39 @@ impl UnifiedExecProcess {
         let state = self.state_rx.borrow().clone();
         let _ = self.state_tx.send_replace(state.exited(exit_code));
         self.output.cancellation_token.cancel();
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MonitorOutputVisibility {
+    Visible,
+    Silent,
+}
+
+impl From<ExecOutputStream> for MonitorOutputVisibility {
+    fn from(stream: ExecOutputStream) -> Self {
+        match stream {
+            ExecOutputStream::Stdout | ExecOutputStream::Pty => Self::Visible,
+            ExecOutputStream::Stderr => Self::Silent,
+        }
+    }
+}
+
+async fn publish_output_chunk(
+    output_buffer: &OutputBuffer,
+    output_tx: &broadcast::Sender<Vec<u8>>,
+    monitor_output_buffer: &MonitorOutputBuffer,
+    monitor_output_tx: &broadcast::Sender<Vec<u8>>,
+    chunk: Vec<u8>,
+    visibility: MonitorOutputVisibility,
+) {
+    output_buffer.lock().await.push_chunk(chunk.clone());
+    let _ = output_tx.send(chunk.clone());
+    if matches!(visibility, MonitorOutputVisibility::Visible) {
+        if let Some(buffer) = monitor_output_buffer.lock().await.as_mut() {
+            buffer.push_chunk(chunk.clone());
+        }
+        let _ = monitor_output_tx.send(chunk);
     }
 }
 

@@ -12,7 +12,9 @@ use codex_diagnostics::Gauge;
 use codex_extension_api::ThreadIdleCause;
 use futures::future::BoxFuture;
 use tokio::select;
+use tokio::sync::Mutex;
 use tokio::sync::Notify;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
@@ -26,13 +28,21 @@ use tracing::warn;
 use crate::codex_thread::BackgroundTerminalInfo;
 use crate::config::Config;
 use crate::context::ContextualUserFragment;
+use crate::session::PendingInputBatch;
+use crate::session::PendingTurnProvenance;
 use crate::session::TurnInput;
 use crate::session::session::Session;
 use crate::session::turn::run_hooks_and_record_inputs;
 use crate::session::turn_context::TurnContext;
 use crate::state::ActiveTurn;
+use crate::state::FinishingTurn;
 use crate::state::RunningTask;
 use crate::state::TaskKind;
+use crate::state::TurnState;
+use crate::unified_exec::MonitorAcknowledgement;
+use crate::unified_exec::MonitorInfo;
+use crate::unified_exec::MonitorOutput;
+use crate::unified_exec::MonitorWaitOutcome;
 use codex_analytics::TurnProfileFact;
 use codex_analytics::TurnTokenUsageFact;
 use codex_otel::SessionTelemetry;
@@ -192,6 +202,13 @@ pub(crate) trait SessionTask: Send + Sync + 'static {
     /// Returns the tracing name for a spawned task span.
     fn span_name(&self) -> &'static str;
 
+    /// Whether background notifications can be consumed as model-turn input by
+    /// this task. Standalone command tasks share the regular task kind but do
+    /// not sample a model, so they must leave durable wakes intact.
+    fn accepts_background_notifications(&self) -> bool {
+        true
+    }
+
     /// Executes the task until completion or cancellation.
     ///
     /// Implementations typically stream protocol events using `session` and
@@ -231,6 +248,8 @@ pub(crate) trait AnySessionTask: Send + Sync + 'static {
 
     fn span_name(&self) -> &'static str;
 
+    fn accepts_background_notifications(&self) -> bool;
+
     fn run(
         self: Arc<Self>,
         session: Arc<Session>,
@@ -252,6 +271,10 @@ where
 
     fn span_name(&self) -> &'static str {
         SessionTask::span_name(self)
+    }
+
+    fn accepts_background_notifications(&self) -> bool {
+        SessionTask::accepts_background_notifications(self)
     }
 
     fn run(
@@ -282,22 +305,66 @@ impl Session {
         input: Vec<TurnInput>,
         task: T,
     ) {
+        let _turn_start_guard = self.input_queue.lock_turn_start().await;
         self.abort_all_tasks(TurnAbortReason::Replaced).await;
         self.clear_connector_selection().await;
         self.start_task(turn_context, input, task, MailboxParentProvenance::Ignore)
             .await;
     }
 
-    pub(crate) async fn start_task<T: SessionTask>(
+    pub(crate) fn start_task<T: SessionTask>(
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
         input: Vec<TurnInput>,
         task: T,
         mailbox_parent_provenance: MailboxParentProvenance,
+    ) -> BoxFuture<'static, ()> {
+        let session = Arc::clone(self);
+        Box::pin(async move {
+            session
+                .start_task_inner(
+                    turn_context,
+                    input,
+                    task,
+                    mailbox_parent_provenance,
+                    /*preserve_pending_input*/ false,
+                )
+                .await;
+        })
+    }
+
+    async fn start_task_inner<T: SessionTask>(
+        self: Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        input: Vec<TurnInput>,
+        task: T,
+        mailbox_parent_provenance: MailboxParentProvenance,
+        preserve_pending_input: bool,
     ) {
         let task: Arc<dyn AnySessionTask> = Arc::new(task);
         let task_kind = task.kind();
         let span_name = task.span_name();
+        let background_delivery_guard = loop {
+            let guard = self
+                .input_queue
+                .lock_background_notification_delivery()
+                .await;
+            let abort_complete = self
+                .active_turn
+                .lock()
+                .await
+                .as_ref()
+                .filter(|active_turn| active_turn.aborting)
+                .map(|active_turn| Arc::clone(&active_turn.abort_complete));
+            let Some(abort_complete) = abort_complete else {
+                break guard;
+            };
+            let notified = abort_complete.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            drop(guard);
+            notified.await;
+        };
         let started_at = Instant::now();
         let turn_started_at_unix_ms = turn_context
             .turn_timing_state
@@ -306,10 +373,17 @@ impl Session {
         turn_context
             .turn_metadata_state
             .set_turn_started_at_unix_ms(turn_started_at_unix_ms);
+        turn_context
+            .turn_metadata_state
+            .set_attribute_background_parent_turn(matches!(
+                mailbox_parent_provenance,
+                MailboxParentProvenance::Attribute
+            ));
         let token_usage_at_turn_start = self.total_token_usage().await.unwrap_or_default();
 
         let cancellation_token = CancellationToken::new();
         let done = Arc::new(Notify::new());
+        let (startup_tx, startup_rx) = oneshot::channel();
 
         self.services
             .guardian_rejection_circuit_breaker
@@ -317,23 +391,61 @@ impl Session {
             .await
             .clear_turn(&turn_context.sub_id);
 
-        let (pending_items, parent_turn_id, root_turn_id) =
-            self.input_queue.get_pending_input(&self.active_turn).await;
-        if let MailboxParentProvenance::Attribute = mailbox_parent_provenance {
-            if let Some(id) = parent_turn_id {
-                turn_context.turn_metadata_state.set_parent_turn_id(id);
+        let (mut pending_items, provenance) = if preserve_pending_input {
+            (Vec::new(), PendingTurnProvenance::default())
+        } else {
+            match self
+                .input_queue
+                .take_next_pending_input_batch(&self.active_turn)
+                .await
+            {
+                PendingInputBatch::Foreground(items) => (items, PendingTurnProvenance::default()),
+                PendingInputBatch::Background { items, provenance } => (items, provenance),
             }
-            if let Some(id) = root_turn_id {
-                turn_context.turn_metadata_state.set_root_turn_id(id);
-            }
-        } else if pending_items.iter().any(|item| {
-            matches!(
-                item,
-                TurnInput::InterAgentCommunication(communication) if communication.trigger_turn
+        };
+        let mut input = input;
+        if task_kind == TaskKind::Regular && !input.is_empty() && !pending_items.is_empty() {
+            pending_items.append(&mut input);
+            input = std::mem::take(&mut pending_items);
+        } else if task_kind != TaskKind::Regular && !pending_items.is_empty() {
+            let requests_background_wake = pending_items.iter().any(|input| {
+                matches!(input, TurnInput::AgentCompletion(_))
+                    || matches!(input, TurnInput::InterAgentCommunication(communication) if communication.trigger_turn)
+                    || matches!(input, TurnInput::ResponseItem(item) if crate::context::is_background_notification(&item.item))
+            });
+            let publishes_agent_completion_activity = pending_items.iter().any(|input| {
+                matches!(input, TurnInput::AgentCompletion(_))
+                    || matches!(input, TurnInput::ResponseItem(item) if crate::context::SubagentNotification::is_response_item(&item.item))
+            });
+            run_hooks_and_record_inputs(
+                &self,
+                &turn_context,
+                &pending_items,
+                PersistContext::Standard,
             )
-        }) && turn_context.turn_metadata_state.root_turn_id() != root_turn_id
-        {
-            turn_context.turn_metadata_state.mark_root_turn_ambiguous();
+            .await;
+            if let Err(err) = self.flush_rollout().await {
+                warn!("failed to flush queued input before starting non-regular task: {err}");
+            }
+            if requests_background_wake {
+                self.input_queue.request_background_wake(
+                    provenance.clone(),
+                    publishes_agent_completion_activity,
+                );
+                if publishes_agent_completion_activity {
+                    self.input_queue.request_agent_completion_activity();
+                }
+                self.input_queue.notify_background_wake();
+            }
+            pending_items.clear();
+        }
+        if matches!(
+            mailbox_parent_provenance,
+            MailboxParentProvenance::Attribute
+        ) {
+            provenance.apply_to_attributed_turn(turn_context.turn_metadata_state.as_ref());
+        } else {
+            provenance.mark_root_ambiguity_for_existing(turn_context.turn_metadata_state.as_ref());
         }
         let turn_state = {
             let mut active = self.active_turn.lock().await;
@@ -343,11 +455,12 @@ impl Session {
         };
         turn_state.lock().await.token_usage_at_turn_start = token_usage_at_turn_start.clone();
         self.input_queue
-            .extend_pending_input_for_turn_state(turn_state.as_ref(), pending_items)
+            .extend_pending_input_batch_for_turn_state(
+                turn_state.as_ref(),
+                pending_items,
+                provenance,
+            )
             .await;
-        self.emit_turn_start_lifecycle(turn_context.as_ref(), &token_usage_at_turn_start)
-            .await;
-
         let mut active = self.active_turn.lock().await;
         let turn = active.get_or_insert_with(ActiveTurn::default);
         debug_assert!(turn.task.is_none());
@@ -356,11 +469,12 @@ impl Session {
             &turn_context.session_source,
         );
         let done_clone = Arc::clone(&done);
-        let session = Arc::clone(self);
+        let session = Arc::clone(&self);
         let ctx = Arc::clone(&turn_context);
         let task_for_run = Arc::clone(&task);
         let task_input = input;
         let task_cancellation_token = cancellation_token.child_token();
+        let token_usage_for_lifecycle = token_usage_at_turn_start.clone();
         // Task-owned turn spans keep a core-owned span open for the
         // full task lifecycle after the submission dispatch span ends.
         let reasoning_effort = turn_context.effective_reasoning_effort_for_tracing();
@@ -381,6 +495,15 @@ impl Session {
         );
         let handle = tokio::spawn(
             async move {
+                // The active task must be published before the model can
+                // clone history. Monitor delivery uses that publication as
+                // its startup barrier, avoiding a history/wake race.
+                if startup_rx.await.is_err() {
+                    return;
+                }
+                session
+                    .emit_turn_start_lifecycle(ctx.as_ref(), &token_usage_for_lifecycle)
+                    .await;
                 let ctx_for_finish = Arc::clone(&ctx);
                 let task_result = task_for_run
                     .run(
@@ -429,6 +552,27 @@ impl Session {
             _timer: timer,
         };
         turn.task = Some(running_task);
+        let _ = startup_tx.send(());
+        drop(active);
+        drop(background_delivery_guard);
+    }
+
+    fn start_regular_task_preserving_pending(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+    ) -> BoxFuture<'static, ()> {
+        let session = Arc::clone(self);
+        Box::pin(async move {
+            session
+                .start_task_inner(
+                    turn_context,
+                    Vec::new(),
+                    RegularTask::new(),
+                    MailboxParentProvenance::Attribute,
+                    /*preserve_pending_input*/ true,
+                )
+                .await;
+        })
     }
 
     /// Returns whether an extension has marked this thread as durably asleep.
@@ -464,6 +608,12 @@ impl Session {
         self: &Arc<Self>,
         sub_id: String,
     ) {
+        if self
+            .shutdown_started
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
         if !self.input_queue.has_pending_mailbox_items().await
             || (!self.input_queue.has_trigger_turn_mailbox_items().await
                 && !self.has_outstanding_durable_sleep())
@@ -471,17 +621,23 @@ impl Session {
             return;
         }
 
+        let _turn_start_guard = self.input_queue.lock_turn_start().await;
+        if self
+            .shutdown_started
+            .load(std::sync::atomic::Ordering::Acquire)
         {
-            let mut active_turn = self.active_turn.lock().await;
-            if active_turn.is_some() {
-                return;
-            }
-            *active_turn = Some(ActiveTurn::default());
+            return;
+        }
+        if self.active_turn.lock().await.is_some() {
+            return;
         }
 
         let turn_context = self.new_default_turn_with_sub_id(sub_id).await;
         self.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
             .await;
+        if self.active_turn.lock().await.is_some() {
+            return;
+        }
         self.start_task(
             turn_context,
             Vec::new(),
@@ -491,33 +647,179 @@ impl Session {
         .await;
     }
 
-    pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {
-        let mut aborted_turn = false;
-        let mut active_turn_to_clear = None;
-        let mut turn_context = None;
-        if let Some(mut active_turn) = self.take_active_turn(&reason).await {
-            let task = active_turn.task.take();
-            aborted_turn = task.is_some();
-            turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
-            if let Some(task) = task {
-                self.handle_task_abort(task, reason.clone()).await;
+    async fn abort_active_task_in_transaction(
+        self: &Arc<Self>,
+        reason: TurnAbortReason,
+        turn_id: Option<&str>,
+    ) -> Option<Arc<TurnContext>> {
+        let delivery_guard = self
+            .input_queue
+            .lock_background_notification_delivery()
+            .await;
+        let detached = {
+            let mut active = self.active_turn.lock().await;
+            let active_turn = active.as_mut()?;
+            let task = active_turn.task.as_ref()?;
+            if turn_id.is_some_and(|turn_id| task.turn_context.sub_id != turn_id) {
+                return None;
             }
-            if aborted_turn {
-                active_turn_to_clear = Some(active_turn);
+            if matches!(
+                reason,
+                TurnAbortReason::Interrupted | TurnAbortReason::BudgetLimited
+            ) {
+                self.mark_interrupted();
             }
-        }
+            let task = active_turn.task.take().expect("active task was checked");
+            active_turn.aborting = true;
+            (
+                task,
+                Arc::clone(&active_turn.turn_state),
+                Arc::clone(&active_turn.abort_complete),
+            )
+        };
+        drop(delivery_guard);
 
-        if let Some(turn_context) = turn_context.as_deref() {
-            self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
-                .await;
+        let (task, turn_state, abort_complete) = detached;
+        let turn_context = self.cancel_task_for_abort(task, reason.clone()).await;
+
+        let delivery_guard = self
+            .input_queue
+            .lock_background_notification_delivery()
+            .await;
+        let (pending_input, pending_parent_turn) = self
+            .input_queue
+            .take_pending_background_inputs_for_turn_state(turn_state.as_ref())
+            .await;
+        let persisted = self
+            .persist_background_input_batch_without_wake(
+                Arc::clone(&turn_context),
+                pending_input,
+                pending_parent_turn,
+                &delivery_guard,
+            )
+            .await;
+        if let Err(err) = self.flush_rollout().await {
+            warn!("failed to flush abort cleanup before terminal event: {err}");
         }
-        if let Some(active_turn) = active_turn_to_clear {
-            // Let interrupted tasks observe cancellation before dropping pending approvals, or an
-            // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
+        self.emit_aborted_turn(&turn_context, reason.clone()).await;
+
+        let active_turn = {
+            let mut active = self.active_turn.lock().await;
+            if active.as_ref().is_some_and(|active_turn| {
+                active_turn.aborting && Arc::ptr_eq(&active_turn.turn_state, &turn_state)
+            }) {
+                active.take()
+            } else {
+                None
+            }
+        };
+        if let Some(active_turn) = active_turn {
             self.input_queue.clear_pending(&active_turn).await;
         }
-        if reason == TurnAbortReason::Interrupted && aborted_turn {
-            self.maybe_start_turn_for_pending_work().await;
+        if reason == TurnAbortReason::Interrupted {
+            let interrupt_boundary = self.input_queue.snapshot_background_wake();
+            self.input_queue
+                .cancel_background_wake_at_interrupt_boundary(interrupt_boundary);
+            drop(delivery_guard);
+        } else {
+            drop(delivery_guard);
+            persisted.publish(&self.input_queue);
+        }
+        abort_complete.notify_waiters();
+        Some(turn_context)
+    }
+
+    pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {
+        if let Some(turn_context) = self
+            .abort_active_task_in_transaction(reason.clone(), None)
+            .await
+        {
+            self.services
+                .unified_exec_manager
+                .discard_unrecorded_initial_exec_command_outputs()
+                .await;
+            self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
+                .await;
+            if reason == TurnAbortReason::Interrupted {
+                self.maybe_start_turn_for_pending_work().await;
+                self.input_queue.notify_background_wake();
+            }
+            return;
+        }
+
+        let delivery_guard = self
+            .input_queue
+            .lock_background_notification_delivery()
+            .await;
+        let mut publish_background_wake = false;
+        if let Some(active_turn) = self.take_active_turn(&reason).await {
+            if let Some(finishing) = active_turn.finishing.as_ref() {
+                let mut terminal_persisted = finishing.terminal_persisted.clone();
+                let terminal_is_persisted = *terminal_persisted.borrow();
+                if !terminal_is_persisted && terminal_persisted.changed().await.is_err() {
+                    warn!("finishing turn ended before terminal persistence completed");
+                }
+                let (pending_input, pending_parent_turn) = self
+                    .input_queue
+                    .take_pending_input_and_mailbox_for_turn_state(active_turn.turn_state.as_ref())
+                    .await;
+                let has_background = pending_input.iter().any(|input| {
+                    matches!(input, TurnInput::AgentCompletion(_))
+                        || matches!(input, TurnInput::InterAgentCommunication(communication) if communication.trigger_turn)
+                        || matches!(input, TurnInput::ResponseItem(item) if crate::context::is_background_notification(&item.item))
+                });
+                run_hooks_and_record_inputs(
+                    self,
+                    &finishing.turn_context,
+                    &pending_input,
+                    PersistContext::Standard,
+                )
+                .await;
+                let publish_agent_completion_activity = pending_input.iter().any(|input| {
+                    matches!(input, TurnInput::AgentCompletion(_))
+                        || matches!(input, TurnInput::ResponseItem(item) if crate::context::SubagentNotification::is_response_item(&item.item))
+                });
+                if has_background {
+                    self.input_queue.request_background_wake(
+                        pending_parent_turn,
+                        publish_agent_completion_activity,
+                    );
+                }
+                if let Err(err) = self.flush_rollout().await {
+                    warn!("failed to flush taskless turn input during abort: {err}");
+                }
+                publish_background_wake = has_background;
+                if publish_agent_completion_activity {
+                    self.input_queue.request_agent_completion_activity();
+                }
+                if reason == TurnAbortReason::Interrupted {
+                    let interrupt_boundary = self.input_queue.snapshot_background_wake();
+                    self.input_queue
+                        .cancel_background_wake_at_interrupt_boundary(interrupt_boundary);
+                }
+                drop(delivery_guard);
+            } else {
+                self.input_queue
+                    .materialize_monitor_drafts_for_turn_state(active_turn.turn_state.as_ref())
+                    .await;
+                if reason == TurnAbortReason::Interrupted {
+                    let interrupt_boundary = self.input_queue.snapshot_background_wake();
+                    self.input_queue
+                        .cancel_background_wake_at_interrupt_boundary(interrupt_boundary);
+                }
+                drop(delivery_guard);
+            }
+        } else {
+            if reason == TurnAbortReason::Interrupted {
+                let interrupt_boundary = self.input_queue.snapshot_background_wake();
+                self.input_queue
+                    .cancel_background_wake_at_interrupt_boundary(interrupt_boundary);
+            }
+            drop(delivery_guard);
+        }
+
+        if reason == TurnAbortReason::Interrupted && publish_background_wake {
+            self.input_queue.notify_background_wake();
         }
     }
 
@@ -526,43 +828,23 @@ impl Session {
         turn_id: &str,
         reason: TurnAbortReason,
     ) -> bool {
-        let active_turn = {
-            let mut active = self.active_turn.lock().await;
-            if active
-                .as_ref()
-                .and_then(|active_turn| active_turn.task.as_ref())
-                .is_some_and(|task| task.turn_context.sub_id == turn_id)
-            {
-                if matches!(
-                    reason,
-                    TurnAbortReason::Interrupted | TurnAbortReason::BudgetLimited
-                ) {
-                    self.mark_interrupted();
-                }
-                active.take()
-            } else {
-                None
-            }
-        };
-        let Some(mut active_turn) = active_turn else {
+        let Some(turn_context) = self
+            .abort_active_task_in_transaction(reason.clone(), Some(turn_id))
+            .await
+        else {
             return false;
         };
 
-        let task = active_turn.task.take();
-        let turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
-        if let Some(task) = task {
-            self.handle_task_abort(task, reason.clone()).await;
-        }
-        if let Some(turn_context) = turn_context.as_deref() {
-            self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
-                .await;
-        }
-        // Let interrupted tasks observe cancellation before dropping pending approvals, or an
-        // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
-        self.input_queue.clear_pending(&active_turn).await;
+        self.services
+            .unified_exec_manager
+            .discard_unrecorded_initial_exec_command_outputs()
+            .await;
+        self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
+            .await;
 
         if reason == TurnAbortReason::Interrupted {
             self.maybe_start_turn_for_pending_work().await;
+            self.input_queue.notify_background_wake();
         }
 
         true
@@ -598,20 +880,37 @@ impl Session {
             .turn_metadata_state
             .cancel_git_enrichment_task();
 
+        // Reserve background delivery before detaching the active task. A
+        // notification already queued on this turn must be recorded before a
+        // later watcher observes the taskless turn and falls back to durable
+        // delivery.
+        let background_delivery_guard = self
+            .input_queue
+            .lock_background_notification_delivery()
+            .await;
+        let (terminal_persisted_tx, terminal_persisted_rx) = tokio::sync::watch::channel(false);
         let turn_state = {
             let mut active = self.active_turn.lock().await;
             active.as_mut().and_then(|active_turn| {
                 let task = active_turn.task.take()?;
                 task.handle.detach();
+                active_turn.finishing = Some(FinishingTurn {
+                    turn_context: Arc::clone(&turn_context),
+                    terminal_persisted: terminal_persisted_rx.clone(),
+                });
                 Some(Arc::clone(&active_turn.turn_state))
             })
         };
         let Some(turn_state) = turn_state else {
             return;
         };
-        let pending_input = self
-            .input_queue
-            .take_pending_input_for_turn_state(turn_state.as_ref())
+        self.input_queue
+            .materialize_monitor_drafts_for_turn_state(turn_state.as_ref())
+            .await;
+        drop(background_delivery_guard);
+        self.services
+            .unified_exec_manager
+            .discard_unrecorded_initial_exec_command_outputs()
             .await;
         let (turn_had_memory_citation, turn_tool_calls, token_usage_at_turn_start) = {
             let ts = turn_state.lock().await;
@@ -621,13 +920,6 @@ impl Session {
                 ts.token_usage_at_turn_start.clone(),
             )
         };
-        run_hooks_and_record_inputs(
-            self,
-            &turn_context,
-            &pending_input,
-            PersistContext::Standard,
-        )
-        .await;
         // Emit token usage metrics.
         {
             // TODO(jif): drop this
@@ -814,39 +1106,114 @@ impl Session {
             })
         };
         self.send_event(turn_context.as_ref(), event).await;
+        if let Err(err) = self.flush_rollout().await {
+            warn!("failed to flush rollout after emitting terminal turn event: {err}");
+        }
+        terminal_persisted_tx.send_replace(true);
         self.services
             .guardian_rejection_circuit_breaker
             .lock()
             .await
             .clear_turn(&turn_context.sub_id);
 
-        let cleared_active_turn = {
-            let mut active = self.active_turn.lock().await;
-            if let Some(active_turn) = active.as_ref()
-                && active_turn.task.is_none()
-                && Arc::ptr_eq(&active_turn.turn_state, &turn_state)
+        let _turn_start_guard = self.input_queue.lock_turn_start().await;
+        let background_delivery_guard = self
+            .input_queue
+            .lock_background_notification_delivery()
+            .await;
+        let (has_pending_input, has_user_input, has_foreground_input) = self
+            .input_queue
+            .pending_input_summary_for_turn_state(turn_state.as_ref())
+            .await;
+        let shutdown_started = self
+            .shutdown_started
+            .load(std::sync::atomic::Ordering::Acquire);
+        let background_successor_allowed =
+            self.collaboration_mode().await.mode != codex_protocol::config_types::ModeKind::Plan;
+        let cleared_active_turn = if has_pending_input
+            && !shutdown_started
+            && (has_user_input || background_successor_allowed)
+        {
+            let next_turn_context = self
+                .new_default_turn_with_sub_id(uuid::Uuid::new_v4().to_string())
+                .await;
+            if !has_user_input
+                && next_turn_context.mode == codex_protocol::config_types::ModeKind::Plan
             {
-                *active = None;
-                true
+                let (pending_input, pending_parent_turn) = self
+                    .input_queue
+                    .take_pending_input_batch_for_turn_state(turn_state.as_ref())
+                    .await;
+                let cleared = self.clear_taskless_active_turn(&turn_state).await;
+                self.persist_background_input_batch(
+                    Arc::clone(&turn_context),
+                    pending_input,
+                    pending_parent_turn,
+                    background_delivery_guard,
+                )
+                .await;
+                cleared
             } else {
+                drop(background_delivery_guard);
+                self.start_regular_task_preserving_pending(next_turn_context)
+                    .await;
                 false
             }
+        } else if has_pending_input && has_foreground_input {
+            let (pending_input, _) = self
+                .input_queue
+                .take_pending_input_batch_for_turn_state(turn_state.as_ref())
+                .await;
+            let cleared = self.clear_taskless_active_turn(&turn_state).await;
+            run_hooks_and_record_inputs(
+                self,
+                &turn_context,
+                &pending_input,
+                PersistContext::Standard,
+            )
+            .await;
+            if let Err(err) = self.flush_rollout().await {
+                warn!("failed to flush pending input during shutdown: {err}");
+            }
+            drop(background_delivery_guard);
+            cleared
+        } else if has_pending_input {
+            let (pending_input, pending_parent_turn) = self
+                .input_queue
+                .take_pending_input_batch_for_turn_state(turn_state.as_ref())
+                .await;
+            let cleared = self.clear_taskless_active_turn(&turn_state).await;
+            self.persist_background_input_batch(
+                Arc::clone(&turn_context),
+                pending_input,
+                pending_parent_turn,
+                background_delivery_guard,
+            )
+            .await;
+            cleared
+        } else {
+            let cleared = self.clear_taskless_active_turn(&turn_state).await;
+            drop(background_delivery_guard);
+            cleared
         };
         if cleared_active_turn {
             self.emit_thread_idle_lifecycle_if_idle(idle_cause).await;
         }
-        // Regular items were flushed before this terminal event was appended; buffering
-        // thread writers may not flush it without another explicit barrier.
-        if let Err(err) = self.flush_rollout().await {
-            warn!("failed to flush rollout after emitting terminal turn event: {err}");
-        }
+        drop(_turn_start_guard);
         if cleared_active_turn {
             self.maybe_start_turn_for_pending_work().await;
+            self.input_queue.notify_background_wake();
         }
     }
 
     async fn take_active_turn(&self, reason: &TurnAbortReason) -> Option<ActiveTurn> {
         let mut active = self.active_turn.lock().await;
+        if active
+            .as_ref()
+            .is_some_and(|active_turn| active_turn.aborting)
+        {
+            return None;
+        }
         if matches!(
             reason,
             TurnAbortReason::Interrupted | TurnAbortReason::BudgetLimited
@@ -857,6 +1224,19 @@ impl Session {
             self.mark_interrupted();
         }
         active.take()
+    }
+
+    async fn clear_taskless_active_turn(&self, turn_state: &Arc<Mutex<TurnState>>) -> bool {
+        let mut active = self.active_turn.lock().await;
+        if let Some(active_turn) = active.as_ref()
+            && active_turn.task.is_none()
+            && Arc::ptr_eq(&active_turn.turn_state, turn_state)
+        {
+            *active = None;
+            true
+        } else {
+            false
+        }
     }
 
     pub(crate) async fn close_unified_exec_processes(&self) {
@@ -877,11 +1257,99 @@ impl Session {
             .await
     }
 
-    async fn handle_task_abort(self: &Arc<Self>, task: RunningTask, reason: TurnAbortReason) {
-        let sub_id = task.turn_context.sub_id.clone();
-        if task.cancellation_token.is_cancelled() {
-            return;
+    pub(crate) async fn list_monitors(&self) -> Vec<MonitorInfo> {
+        self.services.unified_exec_manager.list_monitors().await
+    }
+
+    pub(crate) async fn read_monitor_output(
+        &self,
+        process_id: i32,
+        acknowledgement: MonitorAcknowledgement,
+    ) -> Option<MonitorOutput> {
+        self.services
+            .unified_exec_manager
+            .read_monitor_output(process_id, acknowledgement)
+            .await
+    }
+
+    pub(crate) async fn stop_monitor(&self, process_id: i32) -> Option<bool> {
+        self.services
+            .unified_exec_manager
+            .stop_monitor(process_id)
+            .await
+    }
+
+    pub(crate) async fn wait_for_monitor(
+        &self,
+        process_id: i32,
+        timeout: std::time::Duration,
+    ) -> Option<MonitorWaitOutcome> {
+        self.services
+            .unified_exec_manager
+            .wait_for_monitor(process_id, timeout)
+            .await
+    }
+
+    async fn emit_aborted_turn(
+        self: &Arc<Self>,
+        turn_context: &Arc<TurnContext>,
+        reason: TurnAbortReason,
+    ) {
+        if reason == TurnAbortReason::Interrupted
+            && let Some(marker) = interrupted_turn_history_marker(
+                InterruptedTurnHistoryMarker::from_config_and_version(
+                    turn_context.config.as_ref(),
+                    turn_context.multi_agent_version,
+                ),
+            )
+        {
+            self.record_conversation_items(turn_context.as_ref(), std::slice::from_ref(&marker))
+                .await;
+            // Ensure the marker is durably visible before emitting TurnAborted: some clients
+            // synchronously re-read the rollout on receipt of the abort event.
+            if let Err(err) = self.flush_rollout().await {
+                warn!("failed to flush interrupted-turn marker before emitting TurnAborted: {err}");
+            }
         }
+
+        let started_at = turn_context.turn_timing_state.started_at_unix_secs().await;
+        let (completed_at, duration_ms, profile) = turn_context
+            .turn_timing_state
+            .complete_profile_and_duration_ms()
+            .await;
+        self.services
+            .analytics_events_client
+            .track_turn_profile(TurnProfileFact {
+                turn_id: turn_context.sub_id.clone(),
+                profile,
+            });
+        let event = EventMsg::TurnAborted(TurnAbortedEvent {
+            turn_id: Some(turn_context.sub_id.clone()),
+            reason,
+            started_at,
+            completed_at,
+            duration_ms,
+        });
+        self.send_event(turn_context.as_ref(), event).await;
+        self.services
+            .guardian_rejection_circuit_breaker
+            .lock()
+            .await
+            .clear_turn(&turn_context.sub_id);
+        // Regular items were flushed before this terminal event was appended; buffering
+        // thread writers may not flush it without another explicit barrier.
+        if let Err(err) = self.flush_rollout().await {
+            warn!("failed to flush rollout after emitting terminal turn event: {err}");
+        }
+    }
+
+    async fn cancel_task_for_abort(
+        self: &Arc<Self>,
+        task: RunningTask,
+        reason: TurnAbortReason,
+    ) -> Arc<TurnContext> {
+        let sub_id = task.turn_context.sub_id.clone();
+        let turn_context = Arc::clone(&task.turn_context);
 
         trace!(task_kind = ?task.kind, sub_id, "aborting running task");
         task.cancellation_token.cancel();
@@ -911,65 +1379,16 @@ impl Session {
         }
 
         task.handle.abort();
+        if let Err(err) = task.handle.await
+            && !err.is_cancelled()
+        {
+            warn!(%err, sub_id, "session task failed while aborting");
+        }
 
         session_task
             .abort(Arc::clone(self), Arc::clone(&task.turn_context))
             .await;
-
-        if reason == TurnAbortReason::Interrupted
-            && let Some(marker) = interrupted_turn_history_marker(
-                InterruptedTurnHistoryMarker::from_config_and_version(
-                    task.turn_context.config.as_ref(),
-                    task.turn_context.multi_agent_version,
-                ),
-            )
-        {
-            self.record_conversation_items(
-                task.turn_context.as_ref(),
-                std::slice::from_ref(&marker),
-            )
-            .await;
-            // Ensure the marker is durably visible before emitting TurnAborted: some clients
-            // synchronously re-read the rollout on receipt of the abort event.
-            if let Err(err) = self.flush_rollout().await {
-                warn!("failed to flush interrupted-turn marker before emitting TurnAborted: {err}");
-            }
-        }
-
-        let started_at = task
-            .turn_context
-            .turn_timing_state
-            .started_at_unix_secs()
-            .await;
-        let (completed_at, duration_ms, profile) = task
-            .turn_context
-            .turn_timing_state
-            .complete_profile_and_duration_ms()
-            .await;
-        self.services
-            .analytics_events_client
-            .track_turn_profile(TurnProfileFact {
-                turn_id: task.turn_context.sub_id.clone(),
-                profile,
-            });
-        let event = EventMsg::TurnAborted(TurnAbortedEvent {
-            turn_id: Some(task.turn_context.sub_id.clone()),
-            reason,
-            started_at,
-            completed_at,
-            duration_ms,
-        });
-        self.send_event(task.turn_context.as_ref(), event).await;
-        self.services
-            .guardian_rejection_circuit_breaker
-            .lock()
-            .await
-            .clear_turn(&task.turn_context.sub_id);
-        // Regular items were flushed before this terminal event was appended; buffering
-        // thread writers may not flush it without another explicit barrier.
-        if let Err(err) = self.flush_rollout().await {
-            warn!("failed to flush rollout after emitting terminal turn event: {err}");
-        }
+        turn_context
     }
 }
 

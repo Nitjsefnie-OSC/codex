@@ -51,6 +51,15 @@ pub(crate) trait CellHost: Send + Sync + 'static {
         cancellation_token: CancellationToken,
     ) -> impl Future<Output = Result<(), String>> + Send;
 
+    /// Records whether a nested tool result reached its JavaScript promise.
+    fn tool_result_delivered(
+        &self,
+        _runtime_tool_call_id: String,
+        _delivered: bool,
+    ) -> impl Future<Output = Result<(), String>> + Send {
+        async { Ok(()) }
+    }
+
     fn commit_completion(
         &self,
         stored_value_writes: HashMap<String, JsonValue>,

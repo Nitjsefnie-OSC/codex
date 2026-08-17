@@ -630,6 +630,9 @@
             "mentions_v2": {
               "type": "boolean"
             },
+            "monitor_tool": {
+              "type": "boolean"
+            },
             "multi_agent": {
               "type": "boolean"
             },
@@ -3667,6 +3670,16 @@
           "default": null,
           "description": "Preferred layout for resume/fork session picker results."
         },
+        "show_prompt_suggestions": {
+          "default": true,
+          "description": "Show composer prompt suggestions, such as the `Create a plan?` nudge.\n\nPlan mode itself and explicit mode switching stay available when this is `false`. This is unrelated to `features.tool_suggest`, which controls plugin and connector installation suggestions. Defaults to `true`.",
+          "type": "boolean"
+        },
+        "show_safety_buffering_ui": {
+          "default": true,
+          "description": "Show the safety-buffering status detail and choice menu while a turn is waiting on the model.\n\nWhen `false` the TUI keeps waiting on the same in-flight turn and only suppresses the local presentation; it never retries, changes model or effort, cancels the request, or alters the server-side safeguard. Defaults to `true`.",
+          "type": "boolean"
+        },
         "show_tooltips": {
           "default": true,
           "description": "Show startup tooltips in the TUI welcome screen. Defaults to `true`.",
@@ -5402,6 +5415,9 @@
           "type": "boolean"
         },
         "mentions_v2": {
+          "type": "boolean"
+        },
+        "monitor_tool": {
           "type": "boolean"
         },
         "multi_agent": {

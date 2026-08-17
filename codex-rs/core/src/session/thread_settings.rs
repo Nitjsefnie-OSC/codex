@@ -90,6 +90,14 @@ pub(super) async fn apply_update(
     updates: SessionSettingsUpdate,
 ) -> ConstraintResult<()> {
     session.update_settings(updates).await?;
+    // A background wake may have been held back by Plan mode. The settings
+    // submission is serialized ahead of the internal wake, so retry it after
+    // any concurrent background notification delivery finishes.
+    let _background_delivery_guard = session
+        .input_queue
+        .lock_background_notification_delivery()
+        .await;
+    session.input_queue.notify_background_wake();
     emit_applied(session, submission_id).await;
     Ok(())
 }

@@ -696,6 +696,18 @@ pub struct Config {
     /// Show startup tooltips in the TUI welcome screen.
     pub show_tooltips: bool,
 
+    /// Show the TUI safety-buffering status detail and choice menu.
+    ///
+    /// When `false`, the TUI suppresses only that local presentation and keeps
+    /// waiting on the same in-flight turn.
+    pub tui_show_safety_buffering_ui: bool,
+
+    /// Show TUI composer prompt suggestions, such as the `Create a plan?` nudge.
+    ///
+    /// Unrelated to `tool_suggest`, which controls plugin and connector
+    /// installation suggestions.
+    pub tui_show_prompt_suggestions: bool,
+
     /// Persisted startup availability NUX state for model tooltips.
     pub model_availability_nux: ModelAvailabilityNuxConfig,
 
@@ -1228,6 +1240,11 @@ pub struct MultiAgentV2Config {
     pub expose_spawn_agent_model_overrides: bool,
     pub wait_agent_enabled: bool,
     pub non_code_mode_only: bool,
+    /// Whether model-catalog metadata may select V2 when the feature was not
+    /// otherwise enabled. An explicit `features.multi_agent_v2 = false`
+    /// disables this fallback while preserving the stable V1 surface.
+    #[serde(skip_serializing)]
+    pub allow_model_catalog_v2: bool,
 }
 
 impl MultiAgentV2Config {
@@ -1247,6 +1264,7 @@ impl MultiAgentV2Config {
             expose_spawn_agent_model_overrides: true,
             wait_agent_enabled: true,
             non_code_mode_only: true,
+            allow_model_catalog_v2: true,
         }
     }
 }
@@ -1474,6 +1492,12 @@ impl Config {
             Some(MultiAgentVersion::V2)
         } else if !self.agents_enabled {
             Some(MultiAgentVersion::Disabled)
+        } else if !self.multi_agent_v2.allow_model_catalog_v2 {
+            Some(if self.features.enabled(Feature::Collab) {
+                MultiAgentVersion::V1
+            } else {
+                MultiAgentVersion::Disabled
+            })
         } else {
             None
         }
@@ -2626,6 +2650,12 @@ fn resolve_code_mode_config(config_toml: &ConfigToml) -> CodeModeConfig {
 
 fn resolve_multi_agent_v2_config(config_toml: &ConfigToml) -> MultiAgentV2Config {
     let base = multi_agent_v2_toml_config(config_toml.features.as_ref());
+    let allow_model_catalog_v2 = config_toml
+        .features
+        .as_ref()
+        .and_then(|features| features.multi_agent_v2.as_ref())
+        .and_then(FeatureToml::enabled)
+        != Some(false);
     let max_concurrent_threads_per_session = base
         .and_then(|config| config.max_concurrent_threads_per_session)
         .or_else(|| {
@@ -2696,6 +2726,7 @@ fn resolve_multi_agent_v2_config(config_toml: &ConfigToml) -> MultiAgentV2Config
         expose_spawn_agent_model_overrides,
         wait_agent_enabled,
         non_code_mode_only,
+        allow_model_catalog_v2,
     }
 }
 
@@ -4160,6 +4191,16 @@ impl Config {
                 .unwrap_or_default(),
             animations: cfg.tui.as_ref().map(|t| t.animations).unwrap_or(true),
             show_tooltips: cfg.tui.as_ref().map(|t| t.show_tooltips).unwrap_or(true),
+            tui_show_safety_buffering_ui: cfg
+                .tui
+                .as_ref()
+                .map(|t| t.show_safety_buffering_ui)
+                .unwrap_or(true),
+            tui_show_prompt_suggestions: cfg
+                .tui
+                .as_ref()
+                .map(|t| t.show_prompt_suggestions)
+                .unwrap_or(true),
             model_availability_nux: cfg
                 .tui
                 .as_ref()

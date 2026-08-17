@@ -6,7 +6,9 @@ use codex_protocol::config_types::EnvironmentVariablePattern;
 use codex_protocol::config_types::ShellEnvironmentPolicy;
 use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
 use codex_protocol::models::ActivePermissionProfile;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ShellCommandToolCallParams;
+use codex_protocol::protocol::SkillScope;
 use pretty_assertions::assert_eq;
 
 use crate::config::PermissionProfileSnapshot;
@@ -21,6 +23,11 @@ use crate::session::tests::make_session_and_context;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::Shell;
 use crate::shell::ShellType;
+use crate::skills::skill_activation_snapshot;
+use crate::skills::tests::assert_implicit_skill_candidate;
+use crate::skills::tests::configure_implicit_skill_fixture_for_exec;
+use crate::skills::tests::implicit_skill_fixture;
+use crate::skills::tests::quote_skill_test_path;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
@@ -28,6 +35,7 @@ use crate::tools::context::ToolPayload;
 use crate::tools::handlers::ShellCommandHandler;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::registry::CoreToolRuntime;
+use crate::tools::registry::ToolExecutor;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_protocol::protocol::EnvironmentConfig;
 use codex_protocol::protocol::EnvironmentConfigState;
@@ -377,4 +385,164 @@ async fn build_post_tool_use_payload_uses_tool_output_wire_value() {
             tool_response: json!("shell output"),
         })
     );
+}
+
+#[tokio::test]
+async fn classic_shell_implicit_skill_activation_actual_nonzero_does_not_record() {
+    let mut fixture = implicit_skill_fixture(SkillScope::Repo).await;
+    configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::Disabled);
+    let command = format!(
+        "cat {} ; exit 9",
+        quote_skill_test_path(&fixture.skill_path)
+    );
+    assert_implicit_skill_candidate(&fixture, &command).await;
+    let turn = Arc::new(fixture.turn);
+    let invocation = classic_shell_invocation(
+        Arc::new(fixture.session),
+        Arc::clone(&turn),
+        &command,
+        "failed-skill-read",
+    );
+
+    let Err(error) = ShellCommandHandler::from(codex_tools::ShellCommandBackendConfig::Classic)
+        .handle(invocation)
+        .await
+    else {
+        panic!("classic nonzero shell exit should be returned to the model as an error");
+    };
+
+    assert!(error.to_string().contains("Exit code: 9"));
+    // This assertion happens in a fresh turn, before any successful read can
+    // insert an equal activation and mask a false positive in the set.
+    assert_eq!(skill_activation_snapshot(&turn), Vec::new());
+}
+
+#[tokio::test]
+async fn classic_shell_implicit_skill_activation_actual_escalation_rejection_does_not_record() {
+    let mut fixture = implicit_skill_fixture(SkillScope::System).await;
+    configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::Disabled);
+    let command = format!("cat {}", quote_skill_test_path(&fixture.skill_path));
+    assert_implicit_skill_candidate(&fixture, &command).await;
+    let turn = Arc::new(fixture.turn);
+    let invocation = ToolInvocation {
+        payload: ToolPayload::Function {
+            arguments: json!({
+                "command": command,
+                "sandbox_permissions": "require_escalated",
+                "justification": "exercise approval rejection"
+            })
+            .to_string(),
+        },
+        ..classic_shell_invocation(
+            Arc::new(fixture.session),
+            Arc::clone(&turn),
+            "true",
+            "denied-skill-read",
+        )
+    };
+
+    let Err(error) = ShellCommandHandler::from(codex_tools::ShellCommandBackendConfig::Classic)
+        .handle(invocation)
+        .await
+    else {
+        panic!("Never policy must reject explicit escalation");
+    };
+
+    assert!(error.to_string().contains("approval policy is Never"));
+    assert_eq!(skill_activation_snapshot(&turn), Vec::new());
+}
+
+#[tokio::test]
+async fn classic_shell_implicit_skill_activation_actual_sandbox_denial_does_not_record() {
+    let mut fixture = implicit_skill_fixture(SkillScope::Repo).await;
+    configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::read_only());
+    let denied_path = fixture.workdir.join("sandbox-denied.txt");
+    let command = format!(
+        "cat {} ; echo denied > {}",
+        quote_skill_test_path(&fixture.skill_path),
+        quote_skill_test_path(&denied_path)
+    );
+    assert_implicit_skill_candidate(&fixture, &command).await;
+    let turn = Arc::new(fixture.turn);
+
+    let Err(error) = ShellCommandHandler::from(codex_tools::ShellCommandBackendConfig::Classic)
+        .handle(classic_shell_invocation(
+            Arc::new(fixture.session),
+            Arc::clone(&turn),
+            &command,
+            "sandbox-denied-skill-read",
+        ))
+        .await
+    else {
+        panic!("classic sandbox denial should be returned to the model as an error");
+    };
+    let message = error.to_string().to_ascii_lowercase();
+
+    assert!(
+        message.contains("permission denied")
+            || message.contains("operation not permitted")
+            || message.contains("read-only file system")
+            || message.contains("sandbox"),
+        "unexpected sandbox-denial output: {message}"
+    );
+    assert!(!denied_path.exists());
+    assert_eq!(skill_activation_snapshot(&turn), Vec::new());
+}
+
+#[tokio::test]
+async fn classic_shell_implicit_skill_activation_actual_apply_patch_intercept_does_not_record() {
+    let mut fixture = implicit_skill_fixture(SkillScope::Repo).await;
+    configure_implicit_skill_fixture_for_exec(&mut fixture, PermissionProfile::Disabled);
+    let patch_dir = tempfile::tempdir_in(&fixture.turn.config.cwd)
+        .expect("create patch directory inside session workspace");
+    let workdir = patch_dir.path().to_path_buf();
+    let command = "apply_patch <<'PATCH'\n*** Begin Patch\n*** Add File: intercepted.txt\n+intercepted\n*** End Patch\nPATCH";
+    let turn = Arc::new(fixture.turn);
+    let invocation = ToolInvocation {
+        payload: ToolPayload::Function {
+            arguments: json!({ "command": command, "workdir": workdir }).to_string(),
+        },
+        ..classic_shell_invocation(
+            Arc::new(fixture.session),
+            Arc::clone(&turn),
+            "true",
+            "intercepted-apply-patch",
+        )
+    };
+
+    ShellCommandHandler::from(codex_tools::ShellCommandBackendConfig::Classic)
+        .handle(invocation)
+        .await
+        .expect("pure apply_patch should be intercepted successfully");
+
+    assert_eq!(
+        std::fs::read_to_string(workdir.join("intercepted.txt"))
+            .expect("intercept should create patched file"),
+        "intercepted\n"
+    );
+    // The interceptor only accepts a pure apply_patch command, while implicit
+    // activation requires a skill read/run in that same command. Those input
+    // shapes cannot overlap, so the actual handler is the closest valid seam.
+    assert_eq!(skill_activation_snapshot(&turn), Vec::new());
+}
+
+fn classic_shell_invocation(
+    session: Arc<crate::session::session::Session>,
+    turn: Arc<crate::session::turn_context::TurnContext>,
+    command: &str,
+    call_id: &str,
+) -> ToolInvocation {
+    ToolInvocation {
+        session,
+        step_context: StepContext::for_test(Arc::clone(&turn)),
+        turn,
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
+        tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+        call_id: call_id.to_string(),
+        tool_name: codex_tools::ToolName::plain("shell_command"),
+        source: ToolCallSource::Direct,
+        payload: ToolPayload::Function {
+            arguments: json!({ "command": command }).to_string(),
+        },
+    }
 }
