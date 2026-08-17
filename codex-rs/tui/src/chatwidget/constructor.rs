@@ -263,6 +263,7 @@ impl ChatWidget {
         widget
             .bottom_pane
             .set_vim_enabled(widget.config.tui_vim_mode_default);
+        widget.sync_prompt_suggestions_enabled();
         widget
             .bottom_pane
             .set_status_line_enabled(!widget.configured_status_line_items().is_empty());

@@ -13,6 +13,47 @@ use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
+use tokio::sync::Mutex;
+
+/// Response-scoped server identity observed while a sampling step is in flight.
+///
+/// A new generation is created for every sampling attempt. This prevents a
+/// late event from a cancelled/retried response from overwriting the identity
+/// of the current response before a tool call reads it.
+#[derive(Debug, Default)]
+pub(crate) struct ResponseIdentityState {
+    state: Mutex<ResponseIdentitySnapshot>,
+}
+
+#[derive(Debug, Default)]
+struct ResponseIdentitySnapshot {
+    generation: u64,
+    latest_server_model: Option<String>,
+}
+
+impl ResponseIdentityState {
+    pub(crate) async fn begin_response(&self) -> u64 {
+        let mut state = self.state.lock().await;
+        state.generation = state.generation.wrapping_add(1);
+        state.latest_server_model = None;
+        state.generation
+    }
+
+    pub(crate) async fn record_server_model_for_response(
+        &self,
+        response_generation: u64,
+        server_model: String,
+    ) {
+        let mut state = self.state.lock().await;
+        if state.generation == response_generation {
+            state.latest_server_model = Some(server_model);
+        }
+    }
+
+    pub(crate) async fn latest_server_model(&self) -> Option<String> {
+        self.state.lock().await.latest_server_model.clone()
+    }
+}
 
 /// Request-scoped state that may change between model sampling requests.
 pub(crate) struct StepContext {
@@ -33,6 +74,7 @@ pub(crate) struct StepContext {
     pub(crate) approvals_reviewer: ApprovalsReviewer,
     /// Telemetry context tagged with this sampling request's model.
     pub(crate) session_telemetry: SessionTelemetry,
+    pub(crate) response_identity: Arc<ResponseIdentityState>,
     pub(crate) environments: TurnEnvironmentSnapshot,
     /// Capability roots bound to ready environments in this exact step.
     pub(crate) selected_capability_roots: Vec<ResolvedSelectedCapabilityRoot>,

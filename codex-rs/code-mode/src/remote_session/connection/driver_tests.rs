@@ -36,6 +36,7 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
+use super::super::CallerCancellation;
 use super::super::Connection;
 use super::super::DEFAULT_HOST_WAIT_TRANSPORT_TIMEOUT;
 use super::ConnectionDriver;
@@ -49,6 +50,7 @@ struct DriverHarness {
     command_tx: mpsc::Sender<DriverCommand>,
     event_tx: mpsc::Sender<DriverEvent>,
     execute_claim_tx: mpsc::UnboundedSender<RequestId>,
+    outgoing_tx: mpsc::Sender<codex_code_mode_protocol::host::EncodedFrame>,
     outgoing_rx: mpsc::Receiver<codex_code_mode_protocol::host::EncodedFrame>,
     cancellation: CancellationToken,
     alive: Arc<AtomicBool>,
@@ -58,9 +60,13 @@ struct DriverHarness {
 
 impl DriverHarness {
     fn start() -> Self {
+        Self::start_with_outgoing_capacity(/*outgoing_capacity*/ 16)
+    }
+
+    fn start_with_outgoing_capacity(outgoing_capacity: usize) -> Self {
         let (command_tx, command_rx) = mpsc::channel(/*max_capacity*/ 16);
         let (event_tx, event_rx) = mpsc::channel(/*max_capacity*/ 16);
-        let (outgoing_tx, outgoing_rx) = mpsc::channel(/*max_capacity*/ 16);
+        let (outgoing_tx, outgoing_rx) = mpsc::channel(outgoing_capacity);
         let cancellation = CancellationToken::new();
         let alive = Arc::new(AtomicBool::new(true));
         let failure = Arc::new(StdMutex::new(None));
@@ -68,7 +74,7 @@ impl DriverHarness {
             command_rx,
             event_rx,
             event_tx.clone(),
-            outgoing_tx,
+            outgoing_tx.clone(),
             DriverLifecycle {
                 alive: Arc::clone(&alive),
                 failure: Arc::clone(&failure),
@@ -80,6 +86,7 @@ impl DriverHarness {
             command_tx,
             event_tx,
             execute_claim_tx,
+            outgoing_tx,
             outgoing_rx,
             cancellation,
             alive,
@@ -244,6 +251,7 @@ struct RecordingDelegate {
     closed_cells: StdMutex<Vec<CellId>>,
     invocations: AtomicUsize,
     notifications: AtomicUsize,
+    tool_result_deliveries: AtomicUsize,
 }
 
 struct PanickingDelegate;
@@ -392,6 +400,16 @@ impl CodeModeSessionDelegate for RecordingDelegate {
         _cancellation_token: CancellationToken,
     ) -> NotificationFuture<'a> {
         self.notifications.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async { Ok(()) })
+    }
+
+    fn tool_result_delivered<'a>(
+        &'a self,
+        _cell_id: CellId,
+        _runtime_tool_call_id: String,
+        _delivered: bool,
+    ) -> NotificationFuture<'a> {
+        self.tool_result_deliveries.fetch_add(1, Ordering::Relaxed);
         Box::pin(async { Ok(()) })
     }
 
@@ -707,7 +725,7 @@ async fn concurrent_large_delegate_results_do_not_disconnect_a_backpressured_bul
         command_rx,
         event_rx,
         event_tx.clone(),
-        outgoing_tx,
+        outgoing_tx.clone(),
         DriverLifecycle {
             alive: Arc::clone(&alive),
             failure: Arc::clone(&failure),
@@ -719,6 +737,7 @@ async fn concurrent_large_delegate_results_do_not_disconnect_a_backpressured_bul
         command_tx,
         event_tx,
         execute_claim_tx,
+        outgoing_tx,
         outgoing_rx,
         cancellation,
         alive,
@@ -785,7 +804,7 @@ async fn concurrent_large_delegate_results_do_not_disconnect_a_backpressured_bul
 
 #[tokio::test]
 async fn delegate_limit_returns_an_error_without_disconnecting() {
-    let mut harness = DriverHarness::start();
+    let mut harness = DriverHarness::start_with_outgoing_capacity(/*outgoing_capacity*/ 1);
     let session = remote_session();
     let delegate = Arc::new(RecordingDelegate::default());
     harness.open(session.clone(), delegate.clone()).await;
@@ -798,8 +817,67 @@ async fn delegate_limit_returns_an_error_without_disconnecting() {
             .start_tool_delegate(&session, DelegateRequestId::new(value as i64))
             .await;
     }
+    harness
+        .outgoing_tx
+        .try_send(
+            EncodedFrame::encode(&ClientToHost::CancelRequest {
+                id: RequestId::new(/*value*/ 99),
+            })
+            .expect("encode saturated control frame"),
+        )
+        .expect("saturate control writer");
 
-    let overflow_id = DelegateRequestId::new(MAX_PENDING_DELEGATE_CALLS as i64 + 1);
+    let receipt_id = DelegateRequestId::new(MAX_PENDING_DELEGATE_CALLS as i64 + 1);
+    harness
+        .event_tx
+        .send(DriverEvent::HostMessage(HostToClient::DelegateRequest {
+            id: receipt_id,
+            session_id: session.id.clone(),
+            request: DelegateRequest::ToolResultDelivered {
+                cell_id: CellId::new("1".to_string()).into(),
+                runtime_tool_call_id: "tool-1".to_string(),
+                delivered: true,
+            },
+        }))
+        .await
+        .expect("tool-result delivery receipt");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while delegate.tool_result_deliveries.load(Ordering::Relaxed) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("tool-result delivery should reach the delegate while the writer is saturated");
+    assert!(harness.alive.load(Ordering::Acquire));
+    let saturated = harness
+        .outgoing_rx
+        .recv()
+        .await
+        .expect("saturated control frame");
+    assert_eq!(
+        EncodedFrame::decode_framed::<ClientToHost>(&saturated.into_framed_bytes())
+            .expect("decode saturated control frame"),
+        ClientToHost::CancelRequest {
+            id: RequestId::new(/*value*/ 99),
+        }
+    );
+    let receipt_response = tokio::time::timeout(Duration::from_secs(5), harness.outgoing_rx.recv())
+        .await
+        .expect("tool-result delivery receipt response timeout")
+        .expect("tool-result delivery receipt response frame");
+    assert_eq!(
+        EncodedFrame::decode_framed::<ClientToHost>(&receipt_response.into_framed_bytes())
+            .expect("decode tool-result delivery receipt response"),
+        ClientToHost::DelegateResponse {
+            id: receipt_id,
+            result: WireResult::Ok {
+                value: DelegateResponse::ToolResultDeliveryRecorded,
+            },
+        }
+    );
+    assert_eq!(delegate.tool_result_deliveries.load(Ordering::Relaxed), 1);
+
+    let overflow_id = DelegateRequestId::new(MAX_PENDING_DELEGATE_CALLS as i64 + 2);
     harness.start_tool_delegate(&session, overflow_id).await;
     let response = tokio::time::timeout(Duration::from_secs(5), harness.outgoing_rx.recv())
         .await
@@ -832,7 +910,7 @@ async fn delegate_limit_returns_an_error_without_disconnecting() {
     harness
         .start_tool_delegate(
             &session,
-            DelegateRequestId::new(MAX_PENDING_DELEGATE_CALLS as i64 + 2),
+            DelegateRequestId::new(MAX_PENDING_DELEGATE_CALLS as i64 + 3),
         )
         .await;
 
@@ -846,6 +924,141 @@ async fn delegate_limit_returns_an_error_without_disconnecting() {
     assert_eq!(
         delegate.invocations.load(Ordering::Relaxed),
         MAX_PENDING_DELEGATE_CALLS + 1
+    );
+    assert!(harness.alive.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn ordinary_response_backpressure_cannot_cancel_delivery_receipt_response() {
+    const ORDINARY_RESPONSES: usize = 130;
+
+    let mut harness = DriverHarness::start_with_outgoing_capacity(/*outgoing_capacity*/ 128);
+    let session = remote_session();
+    let delegate = Arc::new(RecordingDelegate::default());
+    harness.open(session.clone(), delegate.clone()).await;
+    let _started = harness
+        .start_cell(session.clone(), /*request_id*/ 2, "1")
+        .await;
+
+    for value in 1..=ORDINARY_RESPONSES {
+        harness
+            .event_tx
+            .send(DriverEvent::HostMessage(HostToClient::DelegateRequest {
+                id: DelegateRequestId::new(value as i64),
+                session_id: session.id.clone(),
+                request: DelegateRequest::Notify {
+                    call_id: format!("notify-{value}"),
+                    cell_id: CellId::new("1".to_string()).into(),
+                    text: "pending".to_string(),
+                },
+            }))
+            .await
+            .expect("ordinary notification request");
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while delegate.notifications.load(Ordering::Relaxed) < ORDINARY_RESPONSES
+            || harness.outgoing_tx.capacity() != 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("ordinary responses should saturate the control writer");
+
+    let receipt_id = DelegateRequestId::new(ORDINARY_RESPONSES as i64 + 1);
+    harness
+        .event_tx
+        .send(DriverEvent::HostMessage(HostToClient::DelegateRequest {
+            id: receipt_id,
+            session_id: session.id.clone(),
+            request: DelegateRequest::ToolResultDelivered {
+                cell_id: CellId::new("1".to_string()).into(),
+                runtime_tool_call_id: "tool-1".to_string(),
+                delivered: true,
+            },
+        }))
+        .await
+        .expect("delivery receipt request");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while delegate.tool_result_deliveries.load(Ordering::Relaxed) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("delivery callback should complete behind the saturated writer");
+
+    let caller_cancellation = CallerCancellation::new();
+    let (wait_response_tx, _wait_response_rx) = oneshot::channel();
+    let available_command_capacity = harness.command_tx.capacity();
+    harness
+        .command_tx
+        .send(DriverCommand::Wait {
+            session,
+            request: WaitRequest {
+                cell_id: CellId::new("1".to_string()),
+                yield_time_ms: 1,
+            },
+            caller_cancellation: caller_cancellation.token(),
+            response_tx: wait_response_tx,
+        })
+        .await
+        .expect("wait command behind saturated writer");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while harness.command_tx.capacity() != available_command_capacity {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("driver should admit the wait behind the saturated writer");
+    drop(caller_cancellation);
+    tokio::task::yield_now().await;
+    assert!(harness.alive.load(Ordering::Acquire));
+
+    let mut ordinary_seen = 0;
+    let mut receipt_seen = false;
+    let mut wait_position = None;
+    let mut cancellation_position = None;
+    for position in 0..ORDINARY_RESPONSES + 3 {
+        let frame = harness.outgoing_rx.recv().await.expect("control frame");
+        match EncodedFrame::decode_framed::<ClientToHost>(&frame.into_framed_bytes())
+            .expect("decode control frame")
+        {
+            ClientToHost::DelegateResponse {
+                result:
+                    WireResult::Ok {
+                        value: DelegateResponse::NotificationDelivered,
+                    },
+                ..
+            } => ordinary_seen += 1,
+            ClientToHost::DelegateResponse {
+                id,
+                result:
+                    WireResult::Ok {
+                        value: DelegateResponse::ToolResultDeliveryRecorded,
+                    },
+            } => {
+                assert_eq!(id, receipt_id);
+                receipt_seen = true;
+            }
+            ClientToHost::Request {
+                id,
+                request: HostRequest::Wait { .. },
+            } => {
+                assert_eq!(id, RequestId::new(/*value*/ 3));
+                wait_position = Some(position);
+            }
+            ClientToHost::CancelRequest { id } => {
+                assert_eq!(id, RequestId::new(/*value*/ 3));
+                cancellation_position = Some(position);
+            }
+            other => panic!("unexpected control frame: {other:?}"),
+        }
+    }
+    assert_eq!(ordinary_seen, ORDINARY_RESPONSES);
+    assert!(receipt_seen);
+    assert!(
+        wait_position.expect("wait request frame")
+            < cancellation_position.expect("wait cancellation frame")
     );
     assert!(harness.alive.load(Ordering::Acquire));
 }

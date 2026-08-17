@@ -40,7 +40,7 @@ use crate::OUTGOING_CHANNEL_CAPACITY;
 pub(super) struct GrpcHostState {
     sessions: Mutex<HashMap<Uuid, Arc<GrpcSession>>>,
     limits: HostLimits,
-    delegate_permits: Arc<Semaphore>,
+    pub(super) delegate_permits: Arc<Semaphore>,
     control_permits: Arc<Semaphore>,
 }
 
@@ -63,6 +63,7 @@ pub(super) struct SessionState {
     pub(super) subscriptions: Vec<ToolSubscription>,
     pub(super) next_subscription: usize,
     pub(super) pending_invocations: HashMap<Uuid, PendingInvocation>,
+    pub(super) pending_notifications: HashMap<Uuid, OwnedSemaphorePermit>,
     pub(super) seen_invocations: BoundedIds<Uuid>,
     pub(super) waits: HashMap<String, ActiveWait>,
     pub(super) seen_waits: BoundedIds,
@@ -246,6 +247,7 @@ impl GrpcSession {
                 wait.cancellation.cancel();
             }
             state.pending_invocations.clear();
+            state.pending_notifications.clear();
             state.subscriptions.clear();
         }
         let result = self.runtime.shutdown().await.map_err(Status::internal);
@@ -403,6 +405,52 @@ impl GrpcSession {
         Arc::clone(&self.delegate_permits)
             .try_acquire_owned()
             .map_err(|_| "code-mode host has too many pending delegate calls".to_string())
+    }
+
+    pub(super) fn reserve_notification(
+        &self,
+        notification_id: Uuid,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<(), String> {
+        use std::collections::hash_map::Entry;
+
+        match self
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pending_notifications
+            .entry(notification_id)
+        {
+            Entry::Vacant(entry) => {
+                entry.insert(permit);
+                Ok(())
+            }
+            Entry::Occupied(_) => {
+                Err("code-mode host reused a pending notification ID".to_string())
+            }
+        }
+    }
+
+    pub(super) fn cancel_notification(&self, notification_id: Uuid) {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pending_notifications
+            .remove(&notification_id);
+    }
+
+    pub(super) fn acknowledge_notification(&self, notification_id: Uuid) -> Result<(), Status> {
+        let permit = self
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pending_notifications
+            .remove(&notification_id)
+            .ok_or_else(|| {
+                Status::not_found(format!("unknown code-mode notification {notification_id}"))
+            })?;
+        drop(permit);
+        Ok(())
     }
 
     pub(super) async fn send_event(

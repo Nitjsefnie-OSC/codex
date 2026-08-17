@@ -302,6 +302,89 @@ async fn safety_buffering_ignores_hidden_stale_and_historical_updates() {
     assert!(!render_bottom_popup(&chat, /*width*/ 80).contains(SAFETY_BUFFERING_HEADER_TEXT));
 }
 
+/// `tui.show_safety_buffering_ui = false` must suppress only the local
+/// presentation: the same in-flight turn keeps waiting, and the suppressed
+/// update still runs the established cleanup that drops a stale popup and
+/// restores the reasoning status header.
+///
+/// The first half is the non-vacuity control: the identical notification renders
+/// the full safety UI while the setting is enabled.
+#[tokio::test]
+async fn safety_buffering_ui_disabled_clears_stale_ui_and_keeps_turn_waiting() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    assert!(
+        chat.config.tui_show_safety_buffering_ui,
+        "default must preserve upstream behavior"
+    );
+    let (thread_id, turn_id, _) = start_safety_buffering_test_turn(&mut chat, &mut op_rx);
+
+    let notification = safety_buffering_notification(thread_id, turn_id, Some("faster-model"));
+    chat.handle_server_notification(
+        ServerNotification::ModelSafetyBufferingUpdated(notification.clone()),
+        /*replay_kind*/ None,
+    );
+    assert!(
+        render_bottom_popup(&chat, /*width*/ 80).contains(SAFETY_BUFFERING_HEADER_TEXT),
+        "control: the safety UI shows while the setting is enabled"
+    );
+    assert!(chat.can_retry_safety_buffered_turn(turn_id));
+
+    // Only observe what the suppressed update itself produces.
+    while rx.try_recv().is_ok() {}
+    while op_rx.try_recv().is_ok() {}
+
+    chat.config.tui_show_safety_buffering_ui = false;
+    chat.handle_server_notification(
+        ServerNotification::ModelSafetyBufferingUpdated(notification),
+        /*replay_kind*/ None,
+    );
+
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    for suppressed in [
+        SAFETY_BUFFERING_HEADER_TEXT,
+        "Retry with a faster model",
+        "Dismiss and keep waiting",
+        "Learn more",
+    ] {
+        assert!(
+            !popup.contains(suppressed),
+            "expected {suppressed:?} to be suppressed, got: {popup:?}"
+        );
+    }
+    assert_eq!(
+        chat.bottom_pane
+            .status_widget()
+            .and_then(|status| status.details()),
+        None,
+        "the stale status detail must be cleared, not stranded"
+    );
+
+    // Snapshot the post-cleanup presentation state: the safety popup is gone
+    // and the reasoning status header is restored while the turn keeps waiting.
+    let disabled_render = normalize_snapshot_paths(render_bottom_popup(&chat, /*width*/ 80));
+    assert!(
+        disabled_render.contains("Working"),
+        "the restored status header must render in the disabled state, got: {disabled_render:?}"
+    );
+    assert_chatwidget_snapshot!("safety_buffering_ui_disabled_presentation", disabled_render,);
+
+    // The same request continues waiting on the same model.
+    assert!(chat.turn_lifecycle.agent_turn_running);
+    assert_eq!(chat.turn_lifecycle.last_turn_id.as_deref(), Some(turn_id));
+    assert!(!chat.can_retry_safety_buffered_turn(turn_id));
+
+    let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(
+        events.is_empty(),
+        "suppressing the safety UI must not emit any AppEvent; events: {events:?}"
+    );
+    let ops = std::iter::from_fn(|| op_rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(
+        ops.is_empty(),
+        "suppressing the safety UI must not emit any Op; ops: {ops:?}"
+    );
+}
+
 #[tokio::test]
 async fn invalid_url_elicitation_is_declined() {
     let (mut chat, _app_event_tx, mut rx, _op_rx) = make_chatwidget_manual_with_sender().await;

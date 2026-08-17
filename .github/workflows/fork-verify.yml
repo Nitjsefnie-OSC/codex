@@ -1,0 +1,782 @@
+name: fork-verify
+
+# Verifies that fork main — upstream/main plus our whoami and monitor tools —
+# type-checks across the whole workspace. Runs on GitHub's runners because a
+# full codex-rs target tree is ~45G, which is not something to put on a dev box.
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Select the verification path to run
+        required: true
+        default: full
+        type: choice
+        options:
+          - full
+          - stack-diagnostics
+          - whoami-regression
+
+concurrency:
+  group: fork-verify-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'stack-diagnostics' && 'stack-diagnostics' || github.event_name == 'workflow_dispatch' && inputs.mode == 'whoami-regression' && 'whoami-regression' || 'full' }}
+  cancel-in-progress: true
+
+jobs:
+  yielded-exec-idle-wake:
+    if: github.event_name == 'push' || inputs.mode == '' || inputs.mode == 'full'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Reclaim runner disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc "$AGENT_TOOLSDIRECTORY" || true
+
+      - name: System build deps
+        run: sudo apt-get update -qq && sudo apt-get install -y libcap-dev
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs
+          shared-key: yielded-exec-idle-wake
+
+      - name: Configure Codex rusty_v8 artifacts
+        uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: x86_64-unknown-linux-gnu
+
+      - name: Yielded exec completion wake regression
+        working-directory: codex-rs
+        run: |
+          # Swatinem/rust-cache can restore v8's Cargo fingerprint after its
+          # externally supplied static archive was evicted. Rebuild only that
+          # package so the verified archive above is unpacked for this runner.
+          cargo clean -p v8
+          run_exact() {
+            set +e
+            output=$("$@" 2>&1)
+            status=$?
+            set -e
+            printf '%s\n' "$output"
+            if [ "$status" -ne 0 ] \
+              || printf '%s\n' "$output" | grep -Fq 'Skipping test because it cannot execute when network is disabled in a Codex sandbox.' \
+              || ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+              return 1
+            fi
+          }
+          cargo check -p codex-code-mode-host -p codex-code-mode-runtime
+          cargo test -p codex-code-mode-host --lib
+          cargo test -p codex-code-mode --lib
+          run_exact cargo test -p codex-code-mode-host --test grpc \
+            nested_tool_delivery_precedes_grpc_cell_closure \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --test all \
+            suite::unified_exec_idle_wake::yielded_exec_completion_after_compaction_wakes_idle_session_once_and_remains_pollable \
+            -- --exact --nocapture --test-threads=1
+          run_exact cargo test -p codex-core --test all \
+            suite::unified_exec_idle_wake::yielded_exec_completion_during_compaction_wakes_successor_once \
+            -- --exact --nocapture --test-threads=1
+          run_exact cargo test -p codex-core --test all \
+            suite::unified_exec_idle_wake::monitor_notification_window_resets_after_compaction_and_wakes_idle_session_once \
+            -- --exact --nocapture --test-threads=1
+          run_exact cargo test -p codex-core --test all \
+            suite::unified_exec_idle_wake::code_mode_nested_yield_survives_outer_turn_completion_and_wakes_idle_session \
+            -- --exact --nocapture --test-threads=1
+          run_exact cargo test -p codex-core --test all \
+            suite::subagent_notifications::multi_agent_v2_completion_wakes_idle_parent_without_wait_or_user_turn \
+            -- --exact --nocapture --test-threads=1
+          run_exact cargo test -p codex-core --test all \
+            suite::subagent_notifications::legacy_completion_wakes_idle_parent_without_wait_or_user_turn \
+            -- --exact --nocapture --test-threads=1
+          run_exact cargo test -p codex-core --test all \
+            suite::notification_interrupt::interrupt_does_not_resume_after_outstanding_completion_wake \
+            -- --exact --nocapture --test-threads=1
+          run_exact cargo test -p codex-core --test all \
+            suite::notification_interrupt::interrupt_does_not_resume_after_completion_buffered_on_finishing_turn \
+            -- --exact --nocapture --test-threads=1
+          run_exact cargo test -p codex-core --lib \
+            session_prefix::tests::successful_completion_messages_are_bounded \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session_prefix::tests::completion_item_is_bounded_with_maximum_path_and_status \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::input_queue::tests::background_notifications_can_be_recovered_before_turn_state_cleanup \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::input_queue::tests::pending_agent_completion_is_reported_as_mailbox_activity \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::input_queue::tests::pending_agent_completion_activity_is_reported_as_mailbox_activity \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::input_queue::tests::pending_legacy_completion_is_reported_as_mailbox_activity \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::input_queue::tests::pending_process_notification_is_not_reported_as_mailbox_activity \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::input_queue::tests::injected_agent_completion_publishes_mailbox_activity \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::input_queue::tests::completion_batch_preserves_earlier_mailbox_order_and_parent \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::input_queue::tests::background_wake_receipts_partition_parent_provenance \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::input_queue::tests::interrupt_cancellation_preserves_later_background_wake_generation \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::input_queue::tests::represented_empty_parent_clears_only_that_request_metadata \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::input_queue::tests::foreground_input_remains_ahead_of_later_completion \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::input_queue::tests::interleaved_background_batches_keep_separate_parent_turns \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::tests::active_completion_preserves_earlier_mailbox_order \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::tests::active_mailbox_precedes_later_steer \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::tests::deferred_mailbox_precedes_later_injected_context \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::tests::idle_mailbox_precedes_later_history_injection \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::tests::non_regular_task_persists_older_idle_mailbox_before_start \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::tests::non_regular_task_preserves_older_trigger_mail_wake \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::tests::interrupted_finishing_turn_persists_completion_without_wake \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::tests::interrupted_finishing_turn_does_not_wake_for_queue_only_mail \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::tests::replaced_finishing_turn_persists_older_mailbox_input \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::tests::active_exec_completion_does_not_publish_agent_mailbox_activity \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::tests::compact_task_queues_background_notifications_until_it_finishes \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::tests::abort_cleanup_delivery_is_persisted_before_turn_aborted \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::tests::aborting_sentinel_blocks_direct_task_start_until_cleanup_finishes \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::tests::abort_cleanup_history_is_durable_before_turn_aborted \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::tests::compact_abort_persists_queued_notifications_after_history_replacement \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            session::tests::forced_compact_abort_drops_task_before_persisting_queued_notifications \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            unified_exec::monitors::tests::compaction_starts_a_new_notification_window_without_resetting_lifetime_stats \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --test all \
+            suite::compact::native_agent_completion_during_manual_compact_reaches_regular_successor \
+            -- --exact --nocapture --test-threads=1
+          run_exact cargo test -p codex-core --test all \
+            suite::compact::legacy_agent_completion_during_manual_compact_reaches_regular_successor \
+            -- --exact --nocapture --test-threads=1
+          run_exact cargo test -p codex-core --lib \
+            session::tests::aborted_active_turn_persists_ordered_mail_and_completion \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            agent::control::residency::tests::residency_evicts_completed_children_before_their_completed_parent \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            agent::control::tests::ensure_v2_agent_loaded_reloads_registered_unloaded_agent \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            agent::control::tests::multi_agent_v2_completion_queues_message_for_direct_parent \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            thread_manager::tests::thread_prepared_before_shutdown_is_rejected_after_manager_reopens \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            thread_manager::tests::thread_start_is_rejected_while_shutdown_is_in_progress \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            thread_manager::tests::successful_shutdown_reopens_manager_for_fresh_thread_start \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            thread_manager::tests::incomplete_shutdown_keeps_thread_start_fenced \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            thread_manager::tests::overlapping_shutdown_calls_are_serialized \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            tools::handlers::multi_agents::tests::multi_agent_v2_spawn_rejects_oversized_agent_path \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-protocol --lib \
+            agent_path::tests::invalid_names_and_paths_are_rejected \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            unified_exec::tests::yielded_exec_terminal_notification_waits_for_result_and_is_claimed_once \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            unified_exec::tests::terminal_notification_is_not_claimed_when_exec_command_did_not_yield \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            unified_exec::tests::removing_terminal_result_does_not_suppress_notification \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            unified_exec::tests::recorded_and_code_mode_outputs_resolve_duplicate_call_ids_by_process_id \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            context::exec_command_completion_notification::tests::notification_fields_are_bounded_for_model_context \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            unified_exec::errors::tests::process_failure_bounds_collected_output \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            unified_exec::process_manager::tests::draining_process_store_coordinates_with_terminal_notification_claim \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
+            unified_exec::process_manager::tests::process_exit_ends_output_collection_while_elicitation_is_paused \
+            -- --exact --nocapture
+
+  check:
+    if: github.event_name == 'push' || inputs.mode == '' || inputs.mode == 'full'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Reclaim runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: System build deps
+        # codex-bwrap links libcap via pkg-config; without it the whole
+        # workspace fails at build-script time, not at type-check time.
+        run: sudo apt-get update -qq && sudo apt-get install -y libcap-dev
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs
+          shared-key: check
+
+      - name: cargo check --workspace
+        working-directory: codex-rs
+        run: |
+          cargo check --workspace \
+            --exclude codex-v8-poc \
+            --exclude codex-code-mode-runtime \
+            --exclude codex-code-mode-host
+          df -h /
+
+      - name: fork manifest tests
+        # Cheap and load-bearing: the manifest is what tells an installer which
+        # capabilities this build has and which release channel is safe to pull
+        # from, so a manifest that stops parsing — or one whose update channel
+        # drifts back to upstream — has to fail here rather than in the field.
+        working-directory: codex-rs
+        run: cargo test -p codex-fork-manifest
+
+      - name: multi-agent feature precedence tests
+        # A command-line/config disable must win over a model-catalog V2
+        # default. Require the exact regression to execute so the filter cannot
+        # silently go green after a rename.
+        working-directory: codex-rs
+        run: |
+          set +e
+          output=$(cargo test -p codex-core --lib config::tests::explicitly_disabled_multi_agent_v2_overrides_model_catalog_v2 -- --exact --nocapture 2>&1)
+          status=$?
+          printf '%s\n' "$output"
+          printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed' || status=1
+          exit "$status"
+
+      - name: headless agent role contract tests
+        # Named role selection is a fork CLI capability. Keep parser and
+        # incompatible-operation coverage exact and non-vacuous so a renamed
+        # or deleted test cannot silently remove the contract.
+        working-directory: codex-rs
+        run: |
+          set +e
+          status=0
+          for test_name in \
+            cli::tests::headless_agent_role_parses_for_new_session \
+            cli::tests::headless_agent_role_rejects_blank_value \
+            cli::tests::headless_agent_role_rejects_existing_session_commands \
+            tests::thread_start_params_preserve_resolved_role_instructions_and_effort
+          do
+            output=$(cargo test -p codex-exec --lib "$test_name" -- --exact --nocapture 2>&1)
+            result=$?
+            printf '%s\n' "$output"
+            if [ "$result" -ne 0 ] || ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+              status=1
+            fi
+          done
+          exit "$status"
+
+      - name: headless agent role core tests
+        # The role owns identity while the headless invocation owns runtime
+        # safety/process state. Exercise those halves independently of the CLI.
+        working-directory: codex-rs
+        run: |
+          set +e
+          status=0
+          for test_name in \
+            agent::role::tests::apply_exec_agent_role_uses_role_identity_and_preserves_runtime_state \
+            agent::role::tests::apply_exec_agent_role_rejects_unknown_role
+          do
+            output=$(cargo test -p codex-core --lib "$test_name" -- --exact --nocapture 2>&1)
+            result=$?
+            printf '%s\n' "$output"
+            if [ "$result" -ne 0 ] || ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+              status=1
+            fi
+          done
+          exit "$status"
+
+      - name: headless agent role integration tests
+        # A real codex-exec binary must send role identity while retaining its
+        # headless safety mode, and an unknown role must remain local.
+        working-directory: codex-rs
+        run: |
+          set +e
+          status=0
+          for test_name in \
+            suite::headless_agent_role::exec_agent_role_reaches_request_and_preserves_headless_safety \
+            suite::headless_agent_role::exec_unknown_agent_role_fails_before_responses_request
+          do
+            output=$(cargo test -p codex-exec --test all "$test_name" -- --exact --nocapture --test-threads=1 2>&1)
+            result=$?
+            printf '%s\n' "$output"
+            if [ "$result" -ne 0 ] || ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+              status=1
+            fi
+          done
+          exit "$status"
+
+      - name: TUI presentation default tests
+        # Fork settings `tui.show_safety_buffering_ui` and
+        # `tui.show_prompt_suggestions`. What has to hold: both default to
+        # upstream behavior through TOML deserialization, explicit false reaches
+        # the resolved `Config`, a suppressed safety-buffering update still runs
+        # the cleanup path without retrying or otherwise touching the in-flight
+        # turn, and the `Create a plan?` nudge renders nowhere while Plan mode
+        # stays reachable. Exact filters, each required to run at least one
+        # passing test, so a rename cannot make this check vacuous. The three
+        # chatwidget/composer filters also carry insta snapshot assertions for
+        # the disabled presentation states; with no locally accepted `.snap`
+        # the first run goes red and leaves `.snap.new` files, uploaded below as
+        # the `tui-presentation-snapshots` artifact. `config_schema_matches_fixture`
+        # is deliberately not in this loop: the checked-in schema can be stale,
+        # and the fixture assertion belongs after regeneration in the
+        # `config schema freshness` step below.
+        timeout-minutes: 30
+        working-directory: codex-rs
+        env:
+          # insta skips writing `.snap.new` under CI by default; the pending
+          # snapshots are the artifact this job exists to produce.
+          INSTA_UPDATE: new
+        run: |
+          set +e
+          failures=0
+          for spec in \
+            "codex-core|config::tests::tui_presentation_defaults_are_enabled_when_unset" \
+            "codex-core|config::tests::tui_presentation_settings_parse_explicit_false" \
+            "codex-tui|chatwidget::tests::app_server::safety_buffering_ui_disabled_clears_stale_ui_and_keeps_turn_waiting" \
+            "codex-tui|chatwidget::tests::plan_mode::plan_mode_nudge_hidden_when_prompt_suggestions_disabled" \
+            "codex-tui|bottom_pane::chat_composer::tests::plan_mode_nudge_render_is_gated_by_prompt_suggestions_setting" \
+            "codex-fork-manifest|tests::every_fork_added_capability_is_declared" \
+            "codex-fork-manifest|tests::a_tui_setting_capability_kind_round_trips_as_snake_case"
+          do
+            package="${spec%%|*}"
+            test_name="${spec#*|}"
+            output=$(timeout 10m cargo test -p "$package" --lib "$test_name" -- \
+              --exact --nocapture --test-threads=1 2>&1)
+            status=$?
+            printf '%s\n' "$output"
+            if ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+              echo "::error::$package filter $test_name did not run at least one passing test"
+              status=1
+            fi
+            if [ "$status" -ne 0 ]; then
+              failures=$((failures + 1))
+            fi
+          done
+          exit "$failures"
+
+      - name: upload pending TUI presentation snapshots
+        # The snapshot-bearing presentation tests above have no locally accepted
+        # `.snap`: the first red run writes the authoritative `.snap.new` files,
+        # and this artifact is where they come from for review and acceptance.
+        # Tolerant once every snapshot has been accepted and none are pending.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tui-presentation-snapshots
+          path: codex-rs/tui/src/**/*.snap.new
+          if-no-files-found: ignore
+
+      - name: config schema freshness
+        if: always()
+        # The checked-in `core/config.schema.json` is generated, never
+        # hand-edited: Rust only runs here, so the runner regenerates it with the
+        # repo's own generator and fails with the diff. `just write-config-schema`
+        # is a one-line wrapper around this same binary, and `just` is not
+        # installed on the runner. The regenerated file is uploaded below so the
+        # checked-in result can be taken from this run rather than invented.
+        # `if: always()` keeps regeneration (and therefore the upload) ahead of
+        # any earlier step failure, so the artifact is always the generator's
+        # output and never the stale checked-in fixture. The freshness diff
+        # against the regenerated output is the fixture assertion; running
+        # `config_schema_matches_fixture` before this step would only fail on a
+        # stale checked-in schema before the generator ever runs.
+        working-directory: codex-rs
+        run: |
+          set +e
+          cargo run -p codex-core --bin codex-write-config-schema
+          if [ $? -ne 0 ]; then
+            echo "::error::config schema generation failed"
+            exit 1
+          fi
+          git diff --exit-code -- core/config.schema.json
+          if [ $? -ne 0 ]; then
+            echo "::error::codex-rs/core/config.schema.json is stale; take the config-schema artifact from this run and commit it"
+            exit 1
+          fi
+
+      - name: upload regenerated config schema
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: config-schema
+          path: codex-rs/core/config.schema.json
+          if-no-files-found: error
+
+      - name: hook contract tests
+        # Keep load-bearing hook wire/schema tests ahead of unrelated suites so
+        # a contract regression reports as soon as the workspace type-checks.
+        working-directory: codex-rs
+        run: cargo test -p codex-hooks
+
+      - name: skill activation audit state tests
+        # Focused fork enforcement coverage: full-source digests and turn-local
+        # exact-record activation state must fail before later hook suites run.
+        working-directory: codex-rs
+        run: |
+          cargo test -p codex-skills-extension --lib host_prompt::tests::host_skill_prompt_digest_uses_full_source_before_truncation -- --exact
+          cargo test -p codex-core --lib skill_activation_store
+          cargo test -p codex-core --lib pending_skill_activation
+          cargo test -p codex-core --lib implicit_skill_activation_candidate
+          cargo test -p codex-core --lib hook_runtime::tests::production_pre_tool_use_hook_receives_turn_local_skill_activation_snapshot -- --exact --nocapture --test-threads=1
+          cargo test -p codex-core --lib hook_runtime::tests::production_post_tool_use_hook_receives_turn_local_skill_activation_snapshot -- --exact --nocapture --test-threads=1
+
+      - name: classic shell skill activation handler tests
+        # These tests execute real handlers. Bound the family so an approval
+        # fixture regression fails promptly and is attributed to this backend.
+        timeout-minutes: 5
+        working-directory: codex-rs
+        run: cargo test -p codex-core --lib classic_shell_implicit_skill_activation -- --nocapture --test-threads=1
+
+      - name: unified exec skill activation handler tests
+        timeout-minutes: 5
+        working-directory: codex-rs
+        run: cargo test -p codex-core --lib unified_exec_implicit_skill_activation -- --nocapture --test-threads=1
+
+      - name: write stdin skill activation handler tests
+        timeout-minutes: 5
+        working-directory: codex-rs
+        run: cargo test -p codex-core --lib write_stdin_implicit_skill_activation -- --nocapture --test-threads=1
+
+      - name: fork-safe update channel tests
+        # These assert the negative that matters: no code path offers an
+        # upgrade that would install an upstream build over a fork one, and an
+        # upstream release tag does not parse as an available fork upgrade.
+        working-directory: codex-rs
+        run: |
+          cargo test -p codex-tui --lib update_action
+          cargo test -p codex-tui --lib update_versions
+          cargo test -p codex-cli --bin codex doctor::updates
+
+      - name: codex-api WebSocket provenance tests
+        # Run transport provenance before the monitor gate so a model identity
+        # regression remains independently attributable when monitor coverage
+        # is unavailable or fails for an unrelated reason.
+        working-directory: codex-rs
+        run: |
+          cargo test -p codex-api --lib websocket_handshake_model -- --nocapture
+          cargo test -p codex-api --lib websocket_response_model_attestation -- --nocapture
+
+      - name: regular-turn regression tests
+        # Keep the known plan-mode and pending-input start paths ahead of the
+        # provenance gates, with exact filters so a renamed test cannot make
+        # this check vacuous.
+        timeout-minutes: 15
+        working-directory: codex-rs
+        run: |
+          set +e
+          output=$(timeout 5m cargo test -p codex-core --lib \
+            session::turn_input::tests::start_only_accepts_user_input_in_plan_mode \
+            -- --exact --nocapture --test-threads=1 2>&1)
+          first=$?
+          printf '%s\n' "$output"
+          if ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+            echo "::error::plan-mode exact filter did not run at least one passing test"
+            first=1
+          fi
+          output=$(timeout 5m cargo test -p codex-core --test all \
+            suite::pending_input::idle_user_input_reaches_the_first_model_request \
+            -- --exact --nocapture --test-threads=1 2>&1)
+          second=$?
+          printf '%s\n' "$output"
+          if ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+            echo "::error::pending-input exact filter did not run at least one passing test"
+            second=1
+          fi
+          output=$(timeout 5m cargo test -p codex-core --lib \
+            session::tests::default_turn_construction_future_stays_small \
+            -- --exact --nocapture --test-threads=1 2>&1)
+          third=$?
+          printf '%s\n' "$output"
+          if ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+            echo "::error::turn-construction future-size filter did not run at least one passing test"
+            third=1
+          fi
+          exit $((first + second + third))
+
+      - name: whoami provenance tests
+        # whoami must distinguish request metadata from the response-scoped
+        # server model, including when a later sampling step has no model
+        # report. Keep this focused so provenance regressions are attributed
+        # separately from the monitor integration suite. Run each integration
+        # case in its own process so a provenance failure identifies the case
+        # instead of aborting a parallel test binary.
+        timeout-minutes: 25
+        working-directory: codex-rs
+        run: |
+          cargo test -p codex-core --lib whoami -- --nocapture
+          set +e
+          failures=0
+          for test_name in \
+            suite::whoami::whoami_reports_server_routed_model_and_request_provenance \
+            suite::whoami::whoami_does_not_reuse_server_identity_across_sampling_steps \
+            suite::whoami::whoami_does_not_attest_websocket_handshake_model \
+            suite::whoami::whoami_retry_clears_stale_model_in_the_same_sampling_step
+          do
+            output=$(timeout 5m cargo test -p codex-core --test all "$test_name" -- \
+              --exact --nocapture --test-threads=1 2>&1)
+            status=$?
+            printf '%s\n' "$output"
+            if ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+              echo "::error::whoami filter $test_name did not run at least one passing test"
+              status=1
+            fi
+            if [ "$status" -ne 0 ]; then
+              failures=$((failures + 1))
+            fi
+          done
+          exit "$failures"
+
+      - name: monitor tool tests
+        # The dev box may not run cargo test, so this is where the monitor's
+        # contract is actually executed: notification batching and sequencing,
+        # the per-monitor cap, the always-exactly-one terminal notification,
+        # stop-leaves-no-orphan, readable retained output, and idle-session
+        # wake-up through a second Responses inference.
+        working-directory: codex-rs
+        run: |
+          cargo test -p codex-core --lib monitor -- --nocapture
+          cargo test -p codex-core --lib try_start_turn_if_idle -- --nocapture
+          cargo test -p codex-core --test all monitor -- --nocapture
+          df -h /
+
+      - name: code-mode infrastructure failures abort the turn
+        # Missing/failed host infrastructure must never become ordinary tool
+        # output followed by a model-authored success claim. Each exact filter
+        # is non-vacuous and the integration cases assert that only the first
+        # Responses request occurs.
+        timeout-minutes: 20
+        working-directory: codex-rs
+        run: |
+          set +e
+          failures=0
+          for spec in \
+            "lib|tools::code_mode::execute_handler::tests::code_mode_runtime_start_failure_is_fatal_to_the_turn" \
+            "all|suite::code_mode::missing_process_host_keeps_code_mode_only_and_fails_closed" \
+            "all|suite::code_mode::missing_process_host_fails_closed_when_direct_fallback_is_disabled" \
+            "all|suite::code_mode::disabled_process_host_with_fallback_disabled_attempts_the_host"
+          do
+            kind="${spec%%|*}"
+            test_name="${spec#*|}"
+            if [ "$kind" = lib ]; then
+              target=(--lib)
+            else
+              target=(--test all)
+            fi
+            output=$(timeout 5m cargo test -p codex-core "${target[@]}" "$test_name" -- \
+              --exact --nocapture --test-threads=1 2>&1)
+            status=$?
+            printf '%s\n' "$output"
+            if ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+              echo "::error::code-mode fatal filter $test_name did not run at least one passing test"
+              status=1
+            fi
+            if [ "$status" -ne 0 ]; then
+              failures=$((failures + 1))
+            fi
+          done
+          exit "$failures"
+
+      - name: golden tool-name list
+        working-directory: codex-rs
+        run: cargo test -p codex-core --test all prompt_caching -- --nocapture || true
+
+  stack-diagnostics:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'stack-diagnostics'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: System build deps
+        run: sudo apt-get update -qq && sudo apt-get install -y libcap-dev
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs
+          shared-key: check
+
+      - name: targeted future-size and regular-turn regressions
+        working-directory: codex-rs
+        run: |
+          set +e
+          output=$(timeout 5m cargo test -p codex-core --lib \
+            session::tests::sampling_loop_future_boundary_is_pointer_sized \
+            -- --exact --nocapture --test-threads=1 2>&1)
+          size=$?
+          printf '%s\n' "$output"
+          if ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+            echo "::error::sampling-loop future-boundary filter did not run at least one passing test"
+            size=1
+          fi
+          output=$(timeout 5m cargo test -p codex-core --lib \
+            session::turn::tests::sampling_request_future_boundary_is_pointer_sized \
+            -- --exact --nocapture --test-threads=1 2>&1)
+          request=$?
+          printf '%s\n' "$output"
+          if ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+            echo "::error::sampling-request future-boundary filter did not run at least one passing test"
+            request=1
+          fi
+          output=$(timeout 5m cargo test -p codex-core --lib \
+            session::turn::tests::try_sampling_request_future_boundary_is_pointer_sized \
+            -- --exact --nocapture --test-threads=1 2>&1)
+          try_request=$?
+          printf '%s\n' "$output"
+          if ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+            echo "::error::try-sampling-request future-boundary filter did not run at least one passing test"
+            try_request=1
+          fi
+          output=$(timeout 5m cargo test -p codex-core --lib \
+            session::turn::tests::model_stream_future_boundary_is_pointer_sized \
+            -- --exact --nocapture --test-threads=1 2>&1)
+          stream=$?
+          printf '%s\n' "$output"
+          if ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+            echo "::error::model-stream future-boundary filter did not run at least one passing test"
+            stream=1
+          fi
+          output=$(timeout 5m cargo test -p codex-core --lib \
+            session::turn_input::tests::start_only_accepts_user_input_in_plan_mode \
+            -- --exact --nocapture --test-threads=1 2>&1)
+          unit=$?
+          printf '%s\n' "$output"
+          if ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+            echo "::error::plan-mode exact filter did not run at least one passing test"
+            unit=1
+          fi
+          output=$(timeout 5m cargo test -p codex-core --test all \
+            suite::pending_input::idle_user_input_reaches_the_first_model_request \
+            -- --exact --nocapture --test-threads=1 2>&1)
+          integration=$?
+          printf '%s\n' "$output"
+          if ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+            echo "::error::pending-input exact filter did not run at least one passing test"
+            integration=1
+          fi
+          exit $((size + request + try_request + stream + unit + integration))
+
+  whoami-regression:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'whoami-regression'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: System build deps
+        run: sudo apt-get update -qq && sudo apt-get install -y libcap-dev
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs
+          shared-key: whoami-regression
+
+      - name: whoami integration regression tests
+        working-directory: codex-rs
+        run: |
+          set +e
+          if ! timeout 10m cargo test -p codex-core --test all --no-run; then
+            echo "::error::whoami regression test binary failed to build"
+            exit 1
+          fi
+          failures=0
+          for test_name in \
+            suite::whoami::whoami_reports_server_routed_model_and_request_provenance \
+            suite::whoami::whoami_does_not_reuse_server_identity_across_sampling_steps \
+            suite::whoami::whoami_does_not_attest_websocket_handshake_model \
+            suite::whoami::whoami_retry_clears_stale_model_in_the_same_sampling_step
+          do
+            output=$(timeout 5m cargo test -p codex-core --test all "$test_name" -- \
+              --exact --nocapture --test-threads=1 2>&1)
+            status=$?
+            printf '%s\n' "$output"
+            if ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+              echo "::error::whoami filter $test_name did not run at least one passing test"
+              status=1
+            fi
+            if [ "$status" -ne 0 ]; then
+              failures=$((failures + 1))
+            fi
+          done
+          exit "$failures"
