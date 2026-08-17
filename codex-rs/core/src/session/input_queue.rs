@@ -1,6 +1,12 @@
+use crate::context::ContextualUserFragment;
+use crate::context::ExecCommandCompletionNotification;
+use crate::context::SubagentNotification;
+use crate::context::is_background_notification;
 use crate::state::ActiveTurn;
 use crate::state::MailboxDeliveryPhase;
+use crate::state::TaskKind;
 use crate::state::TurnState;
+use crate::unified_exec::MonitorNotificationDraft;
 use codex_diagnostics::Gauge;
 use codex_diagnostics::GaugeGuard;
 use codex_history::ResponseItemEnvelope;
@@ -11,7 +17,10 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
+use tokio::sync::Notify;
 use tokio::sync::watch;
 
 static PENDING_MAILBOX_MESSAGES: Gauge = Gauge::new("core.mailbox.pending");
@@ -27,6 +36,71 @@ pub enum TurnInput {
     // through the in-memory queue.
     ResponseItem(#[serde(with = "turn_input_response_item")] ResponseItemEnvelope),
     InterAgentCommunication(InterAgentCommunication),
+    /// A terminal child result delivered through the durable background-wake path.
+    AgentCompletion(InterAgentCommunication),
+}
+
+/// Input waiting for a turn, including monitor output that must not reserve a
+/// notification sequence number until an active compaction has finished.
+pub(crate) enum PendingInput {
+    Turn(TurnInput),
+    MonitorNotification(MonitorNotificationDraft),
+}
+
+impl From<TurnInput> for PendingInput {
+    fn from(input: TurnInput) -> Self {
+        Self::Turn(input)
+    }
+}
+
+impl PendingInput {
+    pub(crate) fn materialize(self) -> Option<TurnInput> {
+        match self {
+            Self::Turn(input) => Some(input),
+            Self::MonitorNotification(draft) => draft
+                .materialize()
+                .map(ContextualUserFragment::into)
+                .map(ResponseItemEnvelope::from)
+                .map(TurnInput::ResponseItem),
+        }
+    }
+
+    fn is_background(&self) -> bool {
+        match self {
+            Self::Turn(input) => InputQueue::input_is_background(input),
+            Self::MonitorNotification(_) => true,
+        }
+    }
+
+    fn is_user_input(&self) -> bool {
+        matches!(self, Self::Turn(TurnInput::UserInput { .. }))
+    }
+
+    fn has_agent_completion(&self) -> bool {
+        match self {
+            Self::Turn(TurnInput::AgentCompletion(_)) => true,
+            Self::Turn(TurnInput::ResponseItem(item)) => {
+                SubagentNotification::is_response_item(&item.item)
+            }
+            Self::Turn(TurnInput::UserInput { .. })
+            | Self::Turn(TurnInput::InterAgentCommunication(_))
+            | Self::MonitorNotification(_) => false,
+        }
+    }
+
+    fn requires_follow_up(&self) -> bool {
+        match self {
+            Self::Turn(TurnInput::InterAgentCommunication(communication)) => {
+                communication.trigger_turn
+            }
+            Self::MonitorNotification(_) => false,
+            Self::Turn(
+                TurnInput::UserInput { .. }
+                | TurnInput::ResponseItem(_)
+                | TurnInput::AgentCompletion(_),
+            ) => true,
+        }
+    }
 }
 
 mod turn_input_response_item {
@@ -67,16 +141,77 @@ pub(crate) enum InputQueueActivity {
     Steer,
 }
 
+#[derive(Debug, PartialEq)]
+pub(crate) enum PendingInputBatch {
+    Foreground(Vec<TurnInput>),
+    Background {
+        items: Vec<TurnInput>,
+        provenance: PendingTurnProvenance,
+    },
+}
+
 /// Turn-local pending input storage owned by the input queue flow.
 #[derive(Default)]
 pub(crate) struct TurnInputQueue {
-    items: Vec<TurnInput>,
+    items: VecDeque<QueuedTurnInput>,
+}
+
+struct QueuedTurnInput {
+    input: PendingInput,
+    provenance: PendingTurnProvenance,
 }
 
 /// Session-scoped pending input storage and active-turn mailbox delivery coordination.
 pub(crate) struct InputQueue {
     activity_tx: watch::Sender<InputQueueActivity>,
     mailbox_pending_mails: Mutex<VecDeque<PendingMailboxCommunication>>,
+    turn_start_lock: Mutex<()>,
+    background_notification_delivery_lock: Arc<Mutex<()>>,
+    background_wake_state: std::sync::Mutex<BackgroundWakeState>,
+    background_wake_requested: AtomicBool,
+    agent_completion_pending: AtomicBool,
+    background_wake_notify: Notify,
+}
+
+#[derive(Default)]
+struct BackgroundWakeState {
+    next_generation: u64,
+    pending: VecDeque<BackgroundWakeEntry>,
+}
+
+struct BackgroundWakeEntry {
+    generation: u64,
+    provenance: PendingTurnProvenance,
+    agent_completion: bool,
+}
+
+pub(crate) struct BackgroundWakeReceipt {
+    through_generation: Option<u64>,
+    provenance: PendingTurnProvenance,
+}
+
+impl BackgroundWakeReceipt {
+    pub(crate) fn apply_to_attributed_turn(
+        &self,
+        turn_metadata_state: &crate::turn_metadata::TurnMetadataState,
+    ) {
+        self.provenance
+            .apply_to_attributed_turn(turn_metadata_state);
+    }
+
+    pub(crate) fn apply_parent_turn(
+        &self,
+        metadata: &mut crate::responses_metadata::CodexResponsesMetadata,
+    ) {
+        match &self.provenance.parent_turn {
+            PendingParentTurn::Empty if self.through_generation.is_some() => {
+                metadata.parent_turn_id = None;
+            }
+            PendingParentTurn::Empty => {}
+            PendingParentTurn::Unique(id) => metadata.parent_turn_id = Some(id.clone()),
+            PendingParentTurn::Conflict => metadata.parent_turn_id = None,
+        }
+    }
 }
 
 struct PendingMailboxCommunication {
@@ -86,12 +221,263 @@ struct PendingMailboxCommunication {
     _diagnostics_guard: GaugeGuard,
 }
 
+#[derive(Default)]
+pub(crate) struct DrainedMailboxInputs {
+    pub(crate) items: Vec<TurnInput>,
+    pub(crate) provenance: PendingTurnProvenance,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) enum PendingParentTurn {
+    #[default]
+    Empty,
+    Unique(String),
+    Conflict,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PendingTurnProvenance {
+    pub(crate) parent_turn: PendingParentTurn,
+    pub(crate) root_turn: PendingParentTurn,
+}
+
 impl InputQueue {
     pub(crate) fn new() -> Self {
         let (activity_tx, _) = watch::channel(InputQueueActivity::Mailbox);
         Self {
             activity_tx,
             mailbox_pending_mails: Mutex::new(VecDeque::new()),
+            turn_start_lock: Mutex::new(()),
+            background_notification_delivery_lock: Arc::new(Mutex::new(())),
+            background_wake_state: std::sync::Mutex::new(BackgroundWakeState::default()),
+            background_wake_requested: AtomicBool::new(false),
+            agent_completion_pending: AtomicBool::new(false),
+            background_wake_notify: Notify::new(),
+        }
+    }
+
+    pub(crate) async fn lock_turn_start(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.turn_start_lock.lock().await
+    }
+
+    pub(crate) async fn lock_background_notification_delivery(
+        &self,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.background_notification_delivery_lock)
+            .lock_owned()
+            .await
+    }
+
+    pub(crate) fn request_background_wake(
+        &self,
+        provenance: PendingTurnProvenance,
+        agent_completion: bool,
+    ) {
+        let mut state = self
+            .background_wake_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.next_generation = state.next_generation.wrapping_add(1);
+        let generation = state.next_generation;
+        state.pending.push_back(BackgroundWakeEntry {
+            generation,
+            provenance,
+            agent_completion,
+        });
+        self.background_wake_requested
+            .store(true, Ordering::Release);
+    }
+
+    /// Wake the submission loop after the background notification represented
+    /// by the durable flag has been persisted and flushed.
+    pub(crate) fn notify_background_wake(&self) {
+        if self.background_wake_requested() {
+            self.background_wake_notify.notify_one();
+        }
+    }
+
+    pub(crate) async fn background_wake_notified(&self) {
+        self.background_wake_notify.notified().await;
+    }
+
+    pub(crate) fn background_wake_requested(&self) -> bool {
+        self.background_wake_requested.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn claim_background_wake(&self) -> bool {
+        let claimed = self.background_wake_requested.swap(false, Ordering::AcqRel);
+        if claimed {
+            self.background_wake_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pending
+                .clear();
+            self.agent_completion_pending
+                .store(false, Ordering::Release);
+        }
+        claimed
+    }
+
+    pub(crate) fn snapshot_background_wake(&self) -> BackgroundWakeReceipt {
+        let state = self
+            .background_wake_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut provenance = PendingTurnProvenance::default();
+        for entry in &state.pending {
+            provenance.merge_state(entry.provenance.clone());
+        }
+        BackgroundWakeReceipt {
+            through_generation: state.pending.back().map(|entry| entry.generation),
+            provenance,
+        }
+    }
+
+    pub(crate) fn acknowledge_background_wake(&self, receipt: BackgroundWakeReceipt) {
+        let Some(through_generation) = receipt.through_generation else {
+            return;
+        };
+        let mut state = self
+            .background_wake_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while state
+            .pending
+            .front()
+            .is_some_and(|entry| entry.generation <= through_generation)
+        {
+            state.pending.pop_front();
+        }
+        let has_pending = !state.pending.is_empty();
+        let has_agent_completion = state.pending.iter().any(|entry| entry.agent_completion);
+        self.background_wake_requested
+            .store(has_pending, Ordering::Release);
+        self.agent_completion_pending
+            .store(has_agent_completion, Ordering::Release);
+    }
+
+    /// Cancel the durable wake represented by an explicit interrupt boundary.
+    ///
+    /// The caller must hold `background_notification_delivery_lock` while taking
+    /// the receipt and canceling it, so notifications delivered after the
+    /// boundary retain their own generations and wake behavior.
+    pub(crate) fn cancel_background_wake_at_interrupt_boundary(
+        &self,
+        receipt: BackgroundWakeReceipt,
+    ) {
+        let Some(through_generation) = receipt.through_generation else {
+            self.agent_completion_pending
+                .store(false, Ordering::Release);
+            return;
+        };
+        let mut state = self
+            .background_wake_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while state
+            .pending
+            .front()
+            .is_some_and(|entry| entry.generation <= through_generation)
+        {
+            state.pending.pop_front();
+        }
+        let has_pending = !state.pending.is_empty();
+        let has_agent_completion = state.pending.iter().any(|entry| entry.agent_completion);
+        self.background_wake_requested
+            .store(has_pending, Ordering::Release);
+        self.agent_completion_pending
+            .store(has_agent_completion, Ordering::Release);
+    }
+
+    pub(crate) fn request_agent_completion_activity(&self) {
+        self.agent_completion_pending.store(true, Ordering::Release);
+        self.activity_tx.send_replace(InputQueueActivity::Mailbox);
+    }
+
+    /// Add a background notification to an active regular turn, or queue it on
+    /// compaction for the regular successor. The active-turn lock and turn-
+    /// state lock make this decision atomic with task finalization.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "active turn and turn state must be checked and updated atomically"
+    )]
+    pub(crate) async fn inject_background_inputs_if_running(
+        &self,
+        active_turn: &Mutex<Option<ActiveTurn>>,
+        inputs: Vec<PendingInput>,
+        provenance: PendingTurnProvenance,
+        activity: Option<InputQueueActivity>,
+    ) -> Result<(), (Vec<PendingInput>, PendingTurnProvenance)> {
+        let mut active = active_turn.lock().await;
+        let Some(active_turn) = active.as_mut() else {
+            return Err((inputs, provenance));
+        };
+        let mut defer_monitor_drafts = active_turn.aborting;
+        if let Some(task) = active_turn.task.as_ref() {
+            let accepts_background_notifications = match task.kind {
+                TaskKind::Regular => task.task.accepts_background_notifications(),
+                TaskKind::Compact => {
+                    defer_monitor_drafts = true;
+                    true
+                }
+                TaskKind::Review => false,
+            };
+            if !accepts_background_notifications {
+                return Err((inputs, provenance));
+            }
+        }
+        let mut turn_state = active_turn.turn_state.lock().await;
+        if !active_turn.aborting && !turn_state.accepts_mailbox_delivery_for_current_turn() {
+            return Err((inputs, provenance));
+        }
+        if let Some(task) = active_turn.task.as_ref() {
+            provenance
+                .mark_root_ambiguity_for_existing(task.turn_context.turn_metadata_state.as_ref());
+        }
+        let compact_turn_id = active_turn.task.as_ref().and_then(|task| {
+            matches!(task.kind, TaskKind::Compact).then_some(task.turn_context.sub_id.as_str())
+        });
+        let has_compact_background_input = compact_turn_id.is_some()
+            && inputs.iter().any(|input| {
+                matches!(input, PendingInput::MonitorNotification(_))
+                    || matches!(
+                        input,
+                        PendingInput::Turn(TurnInput::ResponseItem(item))
+                            if ExecCommandCompletionNotification::is_response_item(&item.item)
+                    )
+            });
+        let inputs = if defer_monitor_drafts {
+            inputs
+        } else {
+            inputs
+                .into_iter()
+                .filter_map(PendingInput::materialize)
+                .map(PendingInput::Turn)
+                .collect()
+        };
+        let has_inputs = !inputs.is_empty();
+        turn_state.pending_input.extend_pending(inputs, provenance);
+        if has_compact_background_input && let Some(compact_turn_id) = compact_turn_id {
+            crate::test_support::notify_background_input_admission(compact_turn_id);
+        }
+        if has_inputs && let Some(activity) = activity {
+            self.activity_tx.send_replace(activity);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn background_input_activity(input: &TurnInput) -> Option<InputQueueActivity> {
+        match input {
+            TurnInput::AgentCompletion(_) => Some(InputQueueActivity::Mailbox),
+            TurnInput::ResponseItem(item) if SubagentNotification::is_response_item(&item.item) => {
+                Some(InputQueueActivity::Mailbox)
+            }
+            TurnInput::UserInput { .. } | TurnInput::InterAgentCommunication(_) => {
+                Some(InputQueueActivity::Steer)
+            }
+            TurnInput::ResponseItem(_) => None,
         }
     }
 
@@ -103,14 +489,22 @@ impl InputQueue {
         Option<InputQueueActivity>,
     ) {
         let activity_rx = self.activity_tx.subscribe();
-        let has_pending_steer = if let Some(turn_state) = turn_state {
-            turn_state.lock().await.pending_input.has_user_input()
-        } else {
-            false
+        let (has_pending_steer, has_pending_completion) = match turn_state {
+            Some(turn_state) => {
+                let pending_input = &turn_state.lock().await.pending_input;
+                (
+                    pending_input.has_user_input(),
+                    pending_input.has_agent_completion(),
+                )
+            }
+            None => (false, false),
         };
         let pending_activity = if has_pending_steer {
             Some(InputQueueActivity::Steer)
-        } else if self.has_pending_mailbox_items().await {
+        } else if has_pending_completion
+            || self.agent_completion_pending.load(Ordering::Acquire)
+            || self.has_pending_mailbox_items().await
+        {
             Some(InputQueueActivity::Mailbox)
         } else {
             None
@@ -136,6 +530,72 @@ impl InputQueue {
         self.activity_tx.send_replace(InputQueueActivity::Mailbox);
     }
 
+    pub(crate) async fn enqueue_or_inject_mailbox_communication(
+        &self,
+        active_turn: &Mutex<Option<ActiveTurn>>,
+        communication: InterAgentCommunication,
+        parent_turn_id: Option<String>,
+        root_turn_id: Option<String>,
+    ) {
+        let provenance = if communication.trigger_turn {
+            PendingTurnProvenance::from_trigger(parent_turn_id.as_deref(), root_turn_id.as_deref())
+        } else {
+            PendingTurnProvenance::default()
+        };
+        let input = PendingInput::Turn(TurnInput::InterAgentCommunication(communication));
+        match self
+            .inject_background_inputs_if_running(
+                active_turn,
+                vec![input],
+                provenance,
+                Some(InputQueueActivity::Mailbox),
+            )
+            .await
+        {
+            Ok(()) => {}
+            Err((mut inputs, provenance)) => {
+                let PendingInput::Turn(TurnInput::InterAgentCommunication(communication)) =
+                    inputs.pop().expect("mailbox injection returns its input")
+                else {
+                    unreachable!("mailbox injection preserves the communication variant")
+                };
+                let parent_turn_id = match provenance.parent_turn {
+                    PendingParentTurn::Unique(parent_turn_id) => Some(parent_turn_id),
+                    PendingParentTurn::Empty | PendingParentTurn::Conflict => None,
+                };
+                let root_turn_id = match provenance.root_turn {
+                    PendingParentTurn::Unique(root_turn_id) => Some(root_turn_id),
+                    PendingParentTurn::Empty | PendingParentTurn::Conflict => None,
+                };
+                self.enqueue_mailbox_communication(communication, parent_turn_id, root_turn_id)
+                    .await;
+            }
+        }
+    }
+
+    pub(super) async fn drain_mailbox_into_turn_state_before_input(
+        &self,
+        turn_state: &Mutex<TurnState>,
+        turn_metadata_state: Option<&crate::turn_metadata::TurnMetadataState>,
+        input: Vec<TurnInput>,
+    ) {
+        let mailbox = self.drain_mailbox_inputs().await;
+        if let Some(turn_metadata_state) = turn_metadata_state {
+            mailbox
+                .provenance
+                .mark_root_ambiguity_for_existing(turn_metadata_state);
+        }
+        let mut turn_state = turn_state.lock().await;
+        turn_state
+            .pending_input
+            .extend(mailbox.items, mailbox.provenance);
+        turn_state
+            .pending_input
+            .extend(input, PendingTurnProvenance::default());
+        turn_state.accept_mailbox_delivery_for_current_turn();
+        self.activity_tx.send_replace(InputQueueActivity::Steer);
+    }
+
     pub(crate) async fn has_pending_mailbox_items(&self) -> bool {
         !self.mailbox_pending_mails.lock().await.is_empty()
     }
@@ -148,37 +608,54 @@ impl InputQueue {
             .any(|mail| mail.communication.trigger_turn)
     }
 
+    #[cfg(test)]
     pub(crate) async fn drain_mailbox_input_items(
         &self,
     ) -> (Vec<TurnInput>, Option<String>, Option<String>) {
+        let drained = self.drain_mailbox_inputs().await;
+        (
+            drained.items,
+            drained.provenance.parent_turn.into_option(),
+            drained.provenance.root_turn.into_option(),
+        )
+    }
+
+    pub(crate) async fn drain_mailbox_inputs(&self) -> DrainedMailboxInputs {
         let pending_mails = self
             .mailbox_pending_mails
             .lock()
             .await
             .drain(..)
             .collect::<Vec<_>>();
-        let parent_turn_id = pending_mails
+        let mut provenance = PendingTurnProvenance::default();
+        for mail in pending_mails
             .iter()
             .filter(|mail| mail.communication.trigger_turn)
-            .map(|mail| mail.parent_turn_id.as_deref())
-            .reduce(|expected, candidate| expected.filter(|id| candidate == Some(*id)))
-            .and_then(|id| id.filter(|id| !id.trim().is_empty()).map(str::to_string));
-        let root_turn_id = pending_mails
-            .iter()
-            .filter(|mail| mail.communication.trigger_turn)
-            .map(|mail| {
-                mail.parent_turn_id
-                    .as_deref()
-                    .filter(|id| !id.trim().is_empty())
-                    .and(mail.root_turn_id.as_deref())
-            })
-            .reduce(|expected, candidate| expected.filter(|id| candidate == Some(*id)))
-            .and_then(|id| id.filter(|id| !id.trim().is_empty()).map(str::to_string));
+        {
+            provenance.merge_state(PendingTurnProvenance::from_trigger(
+                mail.parent_turn_id.as_deref(),
+                mail.root_turn_id.as_deref(),
+            ));
+        }
         let items = pending_mails
             .into_iter()
             .map(|mail| TurnInput::InterAgentCommunication(mail.communication))
             .collect();
-        (items, parent_turn_id, root_turn_id)
+        DrainedMailboxInputs { items, provenance }
+    }
+
+    pub(crate) async fn ordered_background_inputs(
+        &self,
+        completion: impl Into<PendingInput>,
+    ) -> (Vec<PendingInput>, PendingTurnProvenance) {
+        let mut drained = self.drain_mailbox_inputs().await;
+        let items = drained
+            .items
+            .drain(..)
+            .map(PendingInput::Turn)
+            .chain(std::iter::once(completion.into()))
+            .collect();
+        (items, drained.provenance)
     }
 
     pub(crate) async fn turn_state_for_sub_id(
@@ -215,12 +692,12 @@ impl InputQueue {
         let mut turn_state = turn_state.lock().await;
         // Explicit same-turn work still needs a follow-up. Queue-only child mail does not: keep
         // it pending so task completion records it for the next turn without sampling again.
-        if turn_state.pending_input.items.iter().any(|input| {
-            !matches!(
-                input,
-                TurnInput::InterAgentCommunication(communication) if !communication.trigger_turn
-            )
-        }) {
+        if turn_state
+            .pending_input
+            .items
+            .iter()
+            .any(|queued| queued.input.requires_follow_up())
+        {
             return;
         }
         turn_state.set_mailbox_delivery_phase(MailboxDeliveryPhase::NextTurn);
@@ -256,83 +733,289 @@ impl InputQueue {
     ) {
         {
             let mut turn_state = turn_state.lock().await;
-            turn_state.pending_input.items.extend(input);
+            turn_state
+                .pending_input
+                .extend(input, PendingTurnProvenance::default());
             turn_state.accept_mailbox_delivery_for_current_turn();
         }
         self.activity_tx.send_replace(InputQueueActivity::Steer);
     }
 
+    #[cfg(test)]
     pub(crate) async fn extend_pending_input_for_turn_state(
         &self,
         turn_state: &Mutex<TurnState>,
         input: Vec<TurnInput>,
     ) {
-        turn_state.lock().await.pending_input.items.extend(input);
+        turn_state
+            .lock()
+            .await
+            .pending_input
+            .extend(input, PendingTurnProvenance::default());
     }
 
+    pub(crate) async fn extend_pending_input_batch_for_turn_state(
+        &self,
+        turn_state: &Mutex<TurnState>,
+        input: Vec<TurnInput>,
+        provenance: PendingTurnProvenance,
+    ) {
+        turn_state
+            .lock()
+            .await
+            .pending_input
+            .extend(input, provenance);
+    }
+
+    #[cfg(test)]
     pub(crate) async fn take_pending_input_for_turn_state(
         &self,
         turn_state: &Mutex<TurnState>,
     ) -> Vec<TurnInput> {
-        turn_state.lock().await.pending_input.items.split_off(0)
+        self.take_pending_input_batch_for_turn_state(turn_state)
+            .await
+            .0
+    }
+
+    pub(crate) async fn take_pending_input_batch_for_turn_state(
+        &self,
+        turn_state: &Mutex<TurnState>,
+    ) -> (Vec<TurnInput>, PendingTurnProvenance) {
+        let mut turn_state = turn_state.lock().await;
+        turn_state.pending_input.materialize_monitor_drafts();
+        turn_state.pending_input.take_all()
+    }
+
+    /// Materialize drafts while the caller still holds the background-delivery
+    /// lock. Task finalization uses this before publishing a taskless active
+    /// turn so a later watcher cannot reserve ahead of older queued drafts.
+    pub(crate) async fn materialize_monitor_drafts_for_turn_state(
+        &self,
+        turn_state: &Mutex<TurnState>,
+    ) {
+        turn_state
+            .lock()
+            .await
+            .pending_input
+            .materialize_monitor_drafts();
+    }
+
+    pub(crate) async fn pending_input_summary_for_turn_state(
+        &self,
+        turn_state: &Mutex<TurnState>,
+    ) -> (bool, bool, bool) {
+        let mut turn_state = turn_state.lock().await;
+        turn_state.pending_input.materialize_monitor_drafts();
+        (
+            !turn_state.pending_input.items.is_empty(),
+            turn_state.pending_input.has_user_input(),
+            turn_state
+                .pending_input
+                .items
+                .iter()
+                .any(|queued| !queued.input.is_background()),
+        )
+    }
+
+    pub(crate) async fn refresh_injected_agent_completion_activity(
+        &self,
+        active_turn: &Mutex<Option<ActiveTurn>>,
+        sub_id: &str,
+    ) {
+        let has_pending_completion = match self.turn_state_for_sub_id(active_turn, sub_id).await {
+            Some(turn_state) => turn_state.lock().await.pending_input.has_agent_completion(),
+            None => false,
+        };
+        let durable_agent_completion = self
+            .background_wake_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending
+            .iter()
+            .any(|entry| entry.agent_completion);
+        self.agent_completion_pending.store(
+            has_pending_completion || durable_agent_completion,
+            Ordering::Release,
+        );
+    }
+
+    pub(crate) async fn take_pending_background_inputs_for_turn_state(
+        &self,
+        turn_state: &Mutex<TurnState>,
+    ) -> (Vec<TurnInput>, PendingTurnProvenance) {
+        let mut turn_state = turn_state.lock().await;
+        turn_state.pending_input.materialize_monitor_drafts();
+        let pending_items = std::mem::take(&mut turn_state.pending_input.items);
+        let mut notification_items = Vec::new();
+        let mut notification_provenance = PendingTurnProvenance::default();
+        let mut remaining_items = VecDeque::with_capacity(pending_items.len());
+        for queued in pending_items {
+            let Some(input) = queued.input.materialize() else {
+                continue;
+            };
+            match input {
+                TurnInput::ResponseItem(response_item)
+                    if is_background_notification(&response_item.item) =>
+                {
+                    notification_provenance.merge_state(queued.provenance);
+                    notification_items.push(TurnInput::ResponseItem(response_item));
+                }
+                item @ (TurnInput::InterAgentCommunication(_) | TurnInput::AgentCompletion(_)) => {
+                    notification_provenance.merge_state(queued.provenance);
+                    notification_items.push(item);
+                }
+                input => remaining_items.push_back(QueuedTurnInput {
+                    input: PendingInput::Turn(input),
+                    provenance: queued.provenance,
+                }),
+            }
+        }
+        turn_state.pending_input.items = remaining_items;
+        (notification_items, notification_provenance)
+    }
+
+    pub(crate) async fn take_pending_input_and_mailbox_for_turn_state(
+        &self,
+        turn_state: &Mutex<TurnState>,
+    ) -> (Vec<TurnInput>, PendingTurnProvenance) {
+        let (mut items, mut provenance) = self
+            .take_pending_input_batch_for_turn_state(turn_state)
+            .await;
+        let mailbox = self.drain_mailbox_inputs().await;
+        items.extend(mailbox.items);
+        provenance.merge_state(mailbox.provenance);
+        (items, provenance)
     }
 
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "active turn checks and turn state updates must remain atomic"
     )]
-    pub(crate) async fn get_pending_input(
+    pub(crate) async fn take_next_pending_input_batch(
         &self,
         active_turn: &Mutex<Option<ActiveTurn>>,
-    ) -> (Vec<TurnInput>, Option<String>, Option<String>) {
-        let (pending_input, accepts_mailbox_delivery, active_turn_metadata) = {
+    ) -> PendingInputBatch {
+        let (pending_input, pending_provenance, accepts_mailbox_delivery, active_turn_metadata) = {
             let mut active = active_turn.lock().await;
             match active.as_mut() {
                 Some(active_turn) => {
+                    let defer_monitor_drafts = active_turn.aborting
+                        || active_turn
+                            .task
+                            .as_ref()
+                            .is_some_and(|task| task.kind == TaskKind::Compact);
                     let active_turn_metadata = active_turn
                         .task
                         .as_ref()
                         .map(|task| Arc::clone(&task.turn_context.turn_metadata_state));
                     let mut turn_state = active_turn.turn_state.lock().await;
-                    let accepts_mailbox_delivery =
-                        turn_state.accepts_mailbox_delivery_for_current_turn();
-                    let pending_input = if accepts_mailbox_delivery {
-                        turn_state.pending_input.items.split_off(0)
+                    let accepts_mailbox_delivery = !defer_monitor_drafts
+                        && turn_state.accepts_mailbox_delivery_for_current_turn();
+                    if !defer_monitor_drafts {
+                        turn_state.pending_input.materialize_monitor_drafts();
+                    }
+                    let (pending_input, provenance) = if accepts_mailbox_delivery
+                        && let Some(first) = turn_state.pending_input.items.front()
+                    {
+                        let first_is_background = first.input.is_background();
+                        let prefix_len = turn_state
+                            .pending_input
+                            .items
+                            .iter()
+                            .take_while(|queued| {
+                                queued.input.is_background() == first_is_background
+                            })
+                            .count();
+                        let mut provenance = PendingTurnProvenance::default();
+                        let items = turn_state
+                            .pending_input
+                            .items
+                            .drain(..prefix_len)
+                            .filter_map(|queued| {
+                                provenance.merge_state(queued.provenance);
+                                queued.input.materialize()
+                            })
+                            .collect();
+                        (items, provenance)
                     } else {
-                        Vec::new()
+                        (Vec::new(), PendingTurnProvenance::default())
                     };
                     (
                         pending_input,
+                        provenance,
                         accepts_mailbox_delivery,
                         active_turn_metadata,
                     )
                 }
-                None => (Vec::new(), true, None),
+                None => (Vec::new(), PendingTurnProvenance::default(), true, None),
             }
         };
         if !accepts_mailbox_delivery {
-            return (pending_input, None, None);
+            return PendingInputBatch::Foreground(pending_input);
         }
-        let (mailbox_items, parent_turn_id, root_turn_id) = self.drain_mailbox_input_items().await;
-        if let Some(active_turn_metadata) = active_turn_metadata
-            && mailbox_items.iter().any(|item| {
-                matches!(
-                    item,
-                    TurnInput::InterAgentCommunication(communication)
-                        if communication.trigger_turn
-                )
-            })
-            && (root_turn_id.is_none() || active_turn_metadata.root_turn_id() != root_turn_id)
-        {
-            active_turn_metadata.mark_root_turn_ambiguous();
+        if let Some(first) = pending_input.first() {
+            return if Self::input_is_background(first) {
+                PendingInputBatch::Background {
+                    items: pending_input,
+                    provenance: pending_provenance,
+                }
+            } else {
+                PendingInputBatch::Foreground(pending_input)
+            };
         }
-        if pending_input.is_empty() {
-            (mailbox_items, parent_turn_id, root_turn_id)
+        let mailbox = self.drain_mailbox_inputs().await;
+        if let Some(active_turn_metadata) = active_turn_metadata.as_deref() {
+            mailbox
+                .provenance
+                .mark_root_ambiguity_for_existing(active_turn_metadata);
+        }
+        if mailbox.items.is_empty() {
+            PendingInputBatch::Foreground(Vec::new())
         } else {
-            let mut pending_input = pending_input;
-            pending_input.extend(mailbox_items);
-            (pending_input, parent_turn_id, root_turn_id)
+            PendingInputBatch::Background {
+                items: mailbox.items,
+                provenance: mailbox.provenance,
+            }
         }
+    }
+
+    fn input_is_background(input: &TurnInput) -> bool {
+        match input {
+            TurnInput::InterAgentCommunication(_) | TurnInput::AgentCompletion(_) => true,
+            TurnInput::ResponseItem(item) => is_background_notification(&item.item),
+            TurnInput::UserInput { .. } => false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn get_pending_input(
+        &self,
+        active_turn: &Mutex<Option<ActiveTurn>>,
+    ) -> (Vec<TurnInput>, Option<String>, Option<String>) {
+        let mut all_items = Vec::new();
+        let mut all_provenance = PendingTurnProvenance::default();
+        loop {
+            match self.take_next_pending_input_batch(active_turn).await {
+                PendingInputBatch::Foreground(items) => {
+                    if items.is_empty() {
+                        break;
+                    }
+                    all_items.extend(items);
+                }
+                PendingInputBatch::Background { items, provenance } => {
+                    if items.is_empty() {
+                        break;
+                    }
+                    all_items.extend(items);
+                    all_provenance.merge_state(provenance);
+                }
+            }
+        }
+        (
+            all_items,
+            all_provenance.parent_turn.into_option(),
+            all_provenance.root_turn.into_option(),
+        )
     }
 
     #[expect(
@@ -344,10 +1027,19 @@ impl InputQueue {
             let active = active_turn.lock().await;
             match active.as_ref() {
                 Some(active_turn) => {
-                    let turn_state = active_turn.turn_state.lock().await;
+                    let defer_monitor_drafts = active_turn.aborting
+                        || active_turn
+                            .task
+                            .as_ref()
+                            .is_some_and(|task| task.kind == TaskKind::Compact);
+                    let mut turn_state = active_turn.turn_state.lock().await;
+                    if !defer_monitor_drafts {
+                        turn_state.pending_input.materialize_monitor_drafts();
+                    }
                     (
                         !turn_state.pending_input.items.is_empty(),
-                        turn_state.accepts_mailbox_delivery_for_current_turn(),
+                        !defer_monitor_drafts
+                            && turn_state.accepts_mailbox_delivery_for_current_turn(),
                     )
                 }
                 None => (false, true),
@@ -363,21 +1055,288 @@ impl InputQueue {
     }
 }
 
+impl PendingParentTurn {
+    fn merge(&mut self, candidate: Option<&str>) {
+        let candidate = candidate.filter(|id| !id.trim().is_empty());
+        match (&*self, candidate) {
+            (Self::Empty, Some(candidate)) => *self = Self::Unique(candidate.to_string()),
+            (Self::Unique(expected), Some(candidate)) if expected == candidate => {}
+            (Self::Conflict, _) => {}
+            _ => *self = Self::Conflict,
+        }
+    }
+
+    fn merge_state(&mut self, other: Self) {
+        match other {
+            Self::Empty => {}
+            Self::Unique(candidate) => self.merge(Some(&candidate)),
+            Self::Conflict => *self = Self::Conflict,
+        }
+    }
+
+    #[cfg(test)]
+    fn into_option(self) -> Option<String> {
+        match self {
+            Self::Unique(id) => Some(id),
+            Self::Empty | Self::Conflict => None,
+        }
+    }
+}
+
+impl PendingTurnProvenance {
+    fn from_trigger(parent_turn_id: Option<&str>, root_turn_id: Option<&str>) -> Self {
+        let parent_turn_id = parent_turn_id.filter(|id| !id.trim().is_empty());
+        let root_turn_id = parent_turn_id
+            .and(root_turn_id)
+            .filter(|id| !id.trim().is_empty());
+        let mut provenance = Self::default();
+        provenance.parent_turn.merge(parent_turn_id);
+        provenance.root_turn.merge(root_turn_id);
+        provenance
+    }
+
+    fn merge_state(&mut self, other: Self) {
+        self.parent_turn.merge_state(other.parent_turn);
+        self.root_turn.merge_state(other.root_turn);
+    }
+
+    pub(crate) fn apply_to_attributed_turn(
+        &self,
+        turn_metadata_state: &crate::turn_metadata::TurnMetadataState,
+    ) {
+        if let PendingParentTurn::Unique(parent_turn_id) = &self.parent_turn {
+            turn_metadata_state.set_parent_turn_id(parent_turn_id.clone());
+        }
+        match &self.root_turn {
+            PendingParentTurn::Unique(root_turn_id) => {
+                turn_metadata_state.set_root_turn_id(root_turn_id.clone());
+            }
+            PendingParentTurn::Conflict => turn_metadata_state.mark_root_turn_ambiguous(),
+            PendingParentTurn::Empty => {}
+        }
+    }
+
+    pub(crate) fn mark_root_ambiguity_for_existing(
+        &self,
+        turn_metadata_state: &crate::turn_metadata::TurnMetadataState,
+    ) {
+        match &self.root_turn {
+            PendingParentTurn::Unique(root_turn_id)
+                if turn_metadata_state.root_turn_id().as_deref() != Some(root_turn_id) =>
+            {
+                turn_metadata_state.mark_root_turn_ambiguous();
+            }
+            PendingParentTurn::Conflict => turn_metadata_state.mark_root_turn_ambiguous(),
+            PendingParentTurn::Empty | PendingParentTurn::Unique(_) => {}
+        }
+    }
+}
+
 impl TurnInputQueue {
+    fn extend(&mut self, input: Vec<TurnInput>, provenance: PendingTurnProvenance) {
+        self.extend_pending(
+            input.into_iter().map(PendingInput::Turn).collect(),
+            provenance,
+        );
+    }
+
+    fn extend_pending(&mut self, input: Vec<PendingInput>, provenance: PendingTurnProvenance) {
+        self.items
+            .extend(input.into_iter().map(|input| QueuedTurnInput {
+                input,
+                provenance: provenance.clone(),
+            }));
+    }
+
+    fn materialize_monitor_drafts(&mut self) {
+        let items = self
+            .items
+            .drain(..)
+            .filter_map(|queued| {
+                queued.input.materialize().map(|input| QueuedTurnInput {
+                    input: PendingInput::Turn(input),
+                    provenance: queued.provenance,
+                })
+            })
+            .collect::<VecDeque<_>>();
+        self.items = items;
+    }
+
+    fn take_all(&mut self) -> (Vec<TurnInput>, PendingTurnProvenance) {
+        self.materialize_monitor_drafts();
+        let mut provenance = PendingTurnProvenance::default();
+        let items = self
+            .items
+            .drain(..)
+            .filter_map(|queued| {
+                provenance.merge_state(queued.provenance);
+                queued.input.materialize()
+            })
+            .collect();
+        (items, provenance)
+    }
+
     fn has_user_input(&self) -> bool {
+        self.items.iter().any(|queued| queued.input.is_user_input())
+    }
+
+    fn has_agent_completion(&self) -> bool {
         self.items
             .iter()
-            .any(|input| matches!(input, TurnInput::UserInput { .. }))
+            .any(|queued| queued.input.has_agent_completion())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::ContextualUserFragment;
+    use crate::context::ExecCommandCompletion;
+    use crate::context::ExecCommandCompletionNotification;
+    use crate::context::MonitorNotification;
     use codex_history::CodexHarnessMetadata;
+    use codex_history::ResponseItemEnvelope;
     use codex_protocol::AgentPath;
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::ResponseItem;
     use codex_protocol::user_input::UserInput;
     use pretty_assertions::assert_eq;
+    use serde_json::Value;
+
+    use crate::unified_exec::MAX_MONITOR_NOTIFICATIONS;
+
+    fn monitor_payload(input: &TurnInput) -> Value {
+        let TurnInput::ResponseItem(ResponseItemEnvelope {
+            item: ResponseItem::Message { content, .. },
+            ..
+        }) = input
+        else {
+            panic!("expected a monitor response item");
+        };
+        let Some(ContentItem::InputText { text }) = content.first() else {
+            panic!("expected monitor input text");
+        };
+        let (_, payload) = text
+            .split_once("<monitor_notification>")
+            .expect("expected monitor notification marker");
+        let payload = payload
+            .split_once("</monitor_notification>")
+            .expect("expected monitor notification end marker")
+            .0;
+        serde_json::from_str(payload.trim()).expect("monitor payload should be valid JSON")
+    }
+
+    #[tokio::test]
+    async fn queued_monitor_drafts_preserve_order_provenance_and_terminal_suppression() {
+        let handle = crate::unified_exec::test_monitor_handle().await;
+        for _ in 0..(MAX_MONITOR_NOTIFICATIONS - 1) {
+            assert!(matches!(
+                handle.reserve_notification(),
+                crate::unified_exec::NotificationSlot::Allowed { .. }
+            ));
+        }
+        assert!(handle.claim_terminal(crate::unified_exec::MonitorState::Exited { exit_code: 0 }));
+
+        let provenance = PendingTurnProvenance {
+            parent_turn: PendingParentTurn::Unique("parent".to_string()),
+            root_turn: PendingParentTurn::Unique("root".to_string()),
+        };
+        let mut queue = TurnInputQueue::default();
+        queue.extend_pending(
+            vec![
+                PendingInput::MonitorNotification(MonitorNotificationDraft::batch(
+                    Arc::clone(&handle),
+                    vec!["first".to_string()],
+                    /*omitted_lines*/ 0,
+                )),
+                PendingInput::MonitorNotification(MonitorNotificationDraft::batch(
+                    Arc::clone(&handle),
+                    vec!["suppressed".to_string()],
+                    /*omitted_lines*/ 0,
+                )),
+                PendingInput::MonitorNotification(MonitorNotificationDraft::terminal(
+                    Arc::clone(&handle),
+                    /*lagged*/ false,
+                )),
+            ],
+            provenance.clone(),
+        );
+
+        let (items, actual_provenance) = queue.take_all();
+        assert_eq!(actual_provenance, provenance);
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|item| matches!(
+            item,
+            TurnInput::ResponseItem(envelope) if envelope.metadata.is_none()
+        )));
+
+        let payloads = items.iter().map(monitor_payload).collect::<Vec<_>>();
+        assert_eq!(
+            payloads
+                .iter()
+                .map(|payload| payload["seq"].as_u64().expect("monitor seq"))
+                .collect::<Vec<_>>(),
+            vec![20, 21]
+        );
+        assert_eq!(payloads[0]["lines"], serde_json::json!(["first"]));
+        assert_eq!(payloads[0]["final"], Value::Bool(false));
+        assert_eq!(payloads[1]["lines"], serde_json::json!([]));
+        assert_eq!(payloads[1]["final"], Value::Bool(true));
+        assert_eq!(payloads[1]["suppressed_notifications"], Value::from(1_u64));
+        assert_eq!(handle.info().await.notifications_suppressed, 1);
+    }
+
+    #[tokio::test]
+    async fn queued_monitor_drafts_use_reset_window_and_suppress_after_nineteen_successors() {
+        let handle = crate::unified_exec::test_monitor_handle().await;
+        for _ in 0..MAX_MONITOR_NOTIFICATIONS {
+            assert!(matches!(
+                handle.reserve_notification(),
+                crate::unified_exec::NotificationSlot::Allowed { .. }
+            ));
+        }
+        handle.begin_notification_window();
+
+        let provenance = PendingTurnProvenance {
+            parent_turn: PendingParentTurn::Unique("parent".to_string()),
+            root_turn: PendingParentTurn::Unique("root".to_string()),
+        };
+        let mut queue = TurnInputQueue::default();
+        let drafts = (0..=MAX_MONITOR_NOTIFICATIONS)
+            .map(|index| {
+                PendingInput::MonitorNotification(MonitorNotificationDraft::batch(
+                    Arc::clone(&handle),
+                    vec![format!("line-{index}")],
+                    /*omitted_lines*/ 0,
+                ))
+            })
+            .collect();
+        queue.extend_pending(drafts, provenance.clone());
+
+        let (items, actual_provenance) = queue.take_all();
+        assert_eq!(actual_provenance, provenance);
+        assert_eq!(
+            items.len(),
+            usize::try_from(MAX_MONITOR_NOTIFICATIONS).expect("monitor cap fits usize")
+        );
+        let payloads = items.iter().map(monitor_payload).collect::<Vec<_>>();
+        assert_eq!(
+            payloads
+                .iter()
+                .map(|payload| payload["seq"].as_u64().expect("monitor seq"))
+                .collect::<Vec<_>>(),
+            (MAX_MONITOR_NOTIFICATIONS + 1..=MAX_MONITOR_NOTIFICATIONS * 2).collect::<Vec<_>>()
+        );
+        assert_eq!(payloads[0]["lines"], serde_json::json!(["line-0"]));
+        assert_eq!(
+            payloads.last().expect("last monitor payload")["lines"],
+            serde_json::json!([format!("line-{}", MAX_MONITOR_NOTIFICATIONS - 1)])
+        );
+        let info = handle.info().await;
+        assert_eq!(info.notifications_delivered, MAX_MONITOR_NOTIFICATIONS * 2);
+        assert_eq!(info.notifications_suppressed, 1);
+        assert_eq!(info.last_notification_seq, MAX_MONITOR_NOTIFICATIONS * 2);
+    }
 
     #[test]
     fn response_item_serde_preserves_legacy_shape_and_rejects_metadata() {
@@ -593,6 +1552,277 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completion_batch_preserves_earlier_mailbox_order_and_parent() {
+        let input_queue = InputQueue::new();
+        let mail = make_mail(
+            AgentPath::try_from("/root/worker").expect("agent path"),
+            AgentPath::root(),
+            "progress",
+            /*trigger_turn*/ true,
+        );
+        let completion = make_mail(
+            AgentPath::try_from("/root/worker").expect("agent path"),
+            AgentPath::root(),
+            "done",
+            /*trigger_turn*/ false,
+        );
+        input_queue
+            .enqueue_mailbox_communication(
+                mail.clone(),
+                Some("parent-turn".to_string()),
+                /*root_turn_id*/ None,
+            )
+            .await;
+
+        let (items, provenance) = input_queue
+            .ordered_background_inputs(TurnInput::AgentCompletion(completion.clone()))
+            .await;
+        let items = items
+            .into_iter()
+            .map(|item| {
+                item.materialize()
+                    .expect("mailbox input should materialize")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            items,
+            vec![
+                TurnInput::InterAgentCommunication(mail),
+                TurnInput::AgentCompletion(completion),
+            ]
+        );
+        assert_eq!(
+            provenance.parent_turn.into_option().as_deref(),
+            Some("parent-turn")
+        );
+    }
+
+    #[test]
+    fn background_wake_receipts_partition_parent_provenance() {
+        let input_queue = InputQueue::new();
+        input_queue.request_background_wake(
+            PendingTurnProvenance {
+                parent_turn: PendingParentTurn::Unique("first".to_string()),
+                ..Default::default()
+            },
+            /*agent_completion*/ true,
+        );
+        let first = input_queue.snapshot_background_wake();
+        input_queue.request_background_wake(
+            PendingTurnProvenance {
+                parent_turn: PendingParentTurn::Unique("second".to_string()),
+                ..Default::default()
+            },
+            /*agent_completion*/ true,
+        );
+
+        input_queue.acknowledge_background_wake(first);
+
+        let remaining = input_queue.snapshot_background_wake();
+        assert_eq!(
+            remaining.provenance.parent_turn,
+            PendingParentTurn::Unique("second".to_string())
+        );
+        assert!(input_queue.background_wake_requested());
+    }
+
+    #[tokio::test]
+    async fn interrupt_cancellation_preserves_later_background_wake_generation() {
+        let input_queue = InputQueue::new();
+        input_queue.request_background_wake(
+            PendingTurnProvenance {
+                parent_turn: PendingParentTurn::Unique("before".to_string()),
+                ..Default::default()
+            },
+            /*agent_completion*/ true,
+        );
+        input_queue.request_agent_completion_activity();
+        let interrupt_boundary = input_queue.snapshot_background_wake();
+        input_queue.request_background_wake(
+            PendingTurnProvenance {
+                parent_turn: PendingParentTurn::Unique("after".to_string()),
+                ..Default::default()
+            },
+            /*agent_completion*/ false,
+        );
+
+        input_queue.cancel_background_wake_at_interrupt_boundary(interrupt_boundary);
+
+        assert!(input_queue.background_wake_requested());
+        assert_eq!(
+            input_queue
+                .snapshot_background_wake()
+                .provenance
+                .parent_turn,
+            PendingParentTurn::Unique("after".to_string())
+        );
+        let (_activity_rx, pending_activity) = input_queue.subscribe_activity(None).await;
+        assert_eq!(pending_activity, None);
+    }
+
+    #[test]
+    fn represented_empty_parent_clears_only_that_request_metadata() {
+        let input_queue = InputQueue::new();
+        let mut metadata = crate::responses_metadata::CodexResponsesMetadata::new(
+            "installation".to_string(),
+            "session".to_string(),
+            "thread".to_string(),
+            "window".to_string(),
+        );
+        metadata.parent_turn_id = Some("old-parent".to_string());
+
+        input_queue
+            .snapshot_background_wake()
+            .apply_parent_turn(&mut metadata);
+        assert_eq!(metadata.parent_turn_id.as_deref(), Some("old-parent"));
+
+        input_queue.request_background_wake(
+            PendingTurnProvenance::default(),
+            /*agent_completion*/ true,
+        );
+        input_queue
+            .snapshot_background_wake()
+            .apply_parent_turn(&mut metadata);
+        assert_eq!(metadata.parent_turn_id, None);
+    }
+
+    #[tokio::test]
+    async fn foreground_input_remains_ahead_of_later_completion() {
+        let input_queue = InputQueue::new();
+        let active_turn = ActiveTurn::default();
+        let turn_state = Arc::clone(&active_turn.turn_state);
+        let active_turn = Mutex::new(Some(active_turn));
+        let user_input = TurnInput::UserInput {
+            content: vec![UserInput::Text {
+                text: "steer first".to_string(),
+                text_elements: Vec::new(),
+            }],
+            client_id: None,
+        };
+        let completion = TurnInput::AgentCompletion(make_mail(
+            AgentPath::try_from("/root/worker").expect("agent path"),
+            AgentPath::root(),
+            "done",
+            /*trigger_turn*/ false,
+        ));
+        input_queue
+            .extend_pending_input_batch_for_turn_state(
+                turn_state.as_ref(),
+                vec![user_input.clone(), completion.clone()],
+                PendingTurnProvenance {
+                    parent_turn: PendingParentTurn::Unique("parent-turn".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert_eq!(
+            input_queue
+                .take_next_pending_input_batch(&active_turn)
+                .await,
+            PendingInputBatch::Foreground(vec![user_input])
+        );
+        assert_eq!(
+            input_queue
+                .take_next_pending_input_batch(&active_turn)
+                .await,
+            PendingInputBatch::Background {
+                items: vec![completion],
+                provenance: PendingTurnProvenance {
+                    parent_turn: PendingParentTurn::Unique("parent-turn".to_string()),
+                    ..Default::default()
+                },
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn interleaved_background_batches_keep_separate_parent_turns() {
+        let input_queue = InputQueue::new();
+        let active_turn = ActiveTurn::default();
+        let turn_state = Arc::clone(&active_turn.turn_state);
+        let active_turn = Mutex::new(Some(active_turn));
+        let completion_a = TurnInput::AgentCompletion(make_mail(
+            AgentPath::try_from("/root/a").expect("agent path"),
+            AgentPath::root(),
+            "a done",
+            /*trigger_turn*/ false,
+        ));
+        let foreground = TurnInput::UserInput {
+            content: vec![UserInput::Text {
+                text: "steer".to_string(),
+                text_elements: Vec::new(),
+            }],
+            client_id: None,
+        };
+        let completion_b = TurnInput::AgentCompletion(make_mail(
+            AgentPath::try_from("/root/b").expect("agent path"),
+            AgentPath::root(),
+            "b done",
+            /*trigger_turn*/ false,
+        ));
+        input_queue
+            .extend_pending_input_batch_for_turn_state(
+                turn_state.as_ref(),
+                vec![completion_a.clone()],
+                PendingTurnProvenance {
+                    parent_turn: PendingParentTurn::Unique("parent-a".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        input_queue
+            .extend_pending_input_batch_for_turn_state(
+                turn_state.as_ref(),
+                vec![foreground.clone()],
+                PendingTurnProvenance::default(),
+            )
+            .await;
+        input_queue
+            .extend_pending_input_batch_for_turn_state(
+                turn_state.as_ref(),
+                vec![completion_b.clone()],
+                PendingTurnProvenance {
+                    parent_turn: PendingParentTurn::Unique("parent-b".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert_eq!(
+            input_queue
+                .take_next_pending_input_batch(&active_turn)
+                .await,
+            PendingInputBatch::Background {
+                items: vec![completion_a],
+                provenance: PendingTurnProvenance {
+                    parent_turn: PendingParentTurn::Unique("parent-a".to_string()),
+                    ..Default::default()
+                },
+            }
+        );
+        assert_eq!(
+            input_queue
+                .take_next_pending_input_batch(&active_turn)
+                .await,
+            PendingInputBatch::Foreground(vec![foreground])
+        );
+        assert_eq!(
+            input_queue
+                .take_next_pending_input_batch(&active_turn)
+                .await,
+            PendingInputBatch::Background {
+                items: vec![completion_b],
+                provenance: PendingTurnProvenance {
+                    parent_turn: PendingParentTurn::Unique("parent-b".to_string()),
+                    ..Default::default()
+                },
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn input_queue_tracks_pending_trigger_turn_mail() {
         let input_queue = InputQueue::new();
 
@@ -625,5 +1855,222 @@ mod tests {
             )
             .await;
         assert!(input_queue.has_trigger_turn_mailbox_items().await);
+    }
+
+    #[tokio::test]
+    async fn background_wake_requests_are_coalesced_until_a_turn_claims_them() {
+        let input_queue = InputQueue::new();
+
+        input_queue.request_background_wake(
+            PendingTurnProvenance::default(),
+            /*agent_completion*/ false,
+        );
+        input_queue.request_background_wake(
+            PendingTurnProvenance::default(),
+            /*agent_completion*/ false,
+        );
+        assert!(input_queue.background_wake_requested());
+
+        assert!(input_queue.claim_background_wake());
+        assert!(!input_queue.background_wake_requested());
+        assert!(!input_queue.claim_background_wake());
+    }
+
+    #[tokio::test]
+    async fn background_wake_notification_waits_for_explicit_durable_wake() {
+        let input_queue = InputQueue::new();
+        input_queue.request_background_wake(
+            PendingTurnProvenance::default(),
+            /*agent_completion*/ false,
+        );
+
+        let mut notified = Box::pin(input_queue.background_wake_notified());
+        tokio::select! {
+            biased;
+            _ = &mut notified => panic!("a flag alone must not wake the submission loop"),
+            _ = tokio::task::yield_now() => {}
+        }
+
+        input_queue.notify_background_wake();
+        notified.await;
+    }
+
+    #[tokio::test]
+    async fn background_notifications_can_be_recovered_before_turn_state_cleanup() {
+        let input_queue = InputQueue::new();
+        let turn_state = Mutex::new(TurnState::default());
+        let monitor_item = ContextualUserFragment::into(MonitorNotification {
+            process_id: 1,
+            seq: 1,
+            command: "watch".to_string(),
+            kind: "watcher",
+            terminal_state: None,
+            lines: vec!["output".to_string()],
+            omitted_lines: 0,
+            suppressed_notifications: 0,
+            note: None,
+        });
+        let exec_completion_item =
+            ContextualUserFragment::into(ExecCommandCompletionNotification {
+                session_id: 2,
+                command: "build".to_string(),
+                completion: ExecCommandCompletion::Exited { exit_code: 0 },
+                output_may_be_available: true,
+            });
+        let ordinary_item = ResponseItem::Message {
+            id: None,
+            role: "developer".to_string(),
+            content: vec![codex_protocol::models::ContentItem::InputText {
+                text: "ordinary".to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        };
+        let agent_completion = make_mail(
+            AgentPath::try_from("/root/worker").expect("agent path"),
+            AgentPath::root(),
+            "done",
+            /*trigger_turn*/ false,
+        );
+        input_queue
+            .extend_pending_input_for_turn_state(
+                &turn_state,
+                vec![
+                    TurnInput::ResponseItem(monitor_item.clone().into()),
+                    TurnInput::ResponseItem(exec_completion_item.clone().into()),
+                    TurnInput::AgentCompletion(agent_completion.clone()),
+                    TurnInput::ResponseItem(ordinary_item.into()),
+                ],
+            )
+            .await;
+
+        assert_eq!(
+            (
+                vec![
+                    TurnInput::ResponseItem(monitor_item.into()),
+                    TurnInput::ResponseItem(exec_completion_item.into()),
+                    TurnInput::AgentCompletion(agent_completion),
+                ],
+                PendingTurnProvenance::default(),
+            ),
+            input_queue
+                .take_pending_background_inputs_for_turn_state(&turn_state)
+                .await
+        );
+        assert_eq!(
+            vec![TurnInput::ResponseItem(
+                ResponseItem::Message {
+                    id: None,
+                    role: "developer".to_string(),
+                    content: vec![codex_protocol::models::ContentItem::InputText {
+                        text: "ordinary".to_string(),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                }
+                .into(),
+            )],
+            input_queue
+                .take_pending_input_for_turn_state(&turn_state)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_agent_completion_is_reported_as_mailbox_activity() {
+        let input_queue = InputQueue::new();
+        let turn_state = Mutex::new(TurnState::default());
+        input_queue
+            .extend_pending_input_for_turn_state(
+                &turn_state,
+                vec![TurnInput::AgentCompletion(make_mail(
+                    AgentPath::try_from("/root/worker").expect("agent path"),
+                    AgentPath::root(),
+                    "done",
+                    /*trigger_turn*/ false,
+                ))],
+            )
+            .await;
+
+        let (_activity_rx, pending_activity) =
+            input_queue.subscribe_activity(Some(&turn_state)).await;
+
+        assert_eq!(pending_activity, Some(InputQueueActivity::Mailbox));
+    }
+
+    #[tokio::test]
+    async fn pending_agent_completion_activity_is_reported_as_mailbox_activity() {
+        let input_queue = InputQueue::new();
+        let turn_state = Mutex::new(TurnState::default());
+        input_queue.request_agent_completion_activity();
+
+        let (_activity_rx, pending_activity) =
+            input_queue.subscribe_activity(Some(&turn_state)).await;
+
+        assert_eq!(pending_activity, Some(InputQueueActivity::Mailbox));
+    }
+
+    #[tokio::test]
+    async fn pending_legacy_completion_is_reported_as_mailbox_activity() {
+        let input_queue = InputQueue::new();
+        let turn_state = Mutex::new(TurnState::default());
+        let notification = ContextualUserFragment::into(crate::context::SubagentNotification::new(
+            "worker",
+            codex_protocol::protocol::AgentStatus::Completed(Some("done".to_string())),
+        ));
+        input_queue
+            .extend_pending_input_for_turn_state(
+                &turn_state,
+                vec![TurnInput::ResponseItem(notification.into())],
+            )
+            .await;
+
+        let (_activity_rx, pending_activity) =
+            input_queue.subscribe_activity(Some(&turn_state)).await;
+
+        assert_eq!(pending_activity, Some(InputQueueActivity::Mailbox));
+    }
+
+    #[tokio::test]
+    async fn pending_process_notification_is_not_reported_as_mailbox_activity() {
+        let input_queue = InputQueue::new();
+        let turn_state = Mutex::new(TurnState::default());
+        let notification = ContextualUserFragment::into(MonitorNotification {
+            process_id: 1,
+            seq: 1,
+            command: "watch".to_string(),
+            kind: "watcher",
+            terminal_state: None,
+            lines: Vec::new(),
+            omitted_lines: 0,
+            suppressed_notifications: 0,
+            note: None,
+        });
+        input_queue
+            .extend_pending_input_for_turn_state(
+                &turn_state,
+                vec![TurnInput::ResponseItem(notification.into())],
+            )
+            .await;
+
+        let (_activity_rx, pending_activity) =
+            input_queue.subscribe_activity(Some(&turn_state)).await;
+
+        assert_eq!(pending_activity, None);
+    }
+
+    #[test]
+    fn injected_agent_completion_publishes_mailbox_activity() {
+        let completion = TurnInput::AgentCompletion(make_mail(
+            AgentPath::try_from("/root/worker").expect("agent path"),
+            AgentPath::root(),
+            "done",
+            /*trigger_turn*/ false,
+        ));
+
+        assert_eq!(
+            InputQueue::background_input_activity(&completion),
+            Some(InputQueueActivity::Mailbox)
+        );
     }
 }

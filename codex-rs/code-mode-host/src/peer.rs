@@ -26,13 +26,14 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-const CELL_MESSAGE_CAPACITY: usize = 128;
+const CELL_MESSAGE_CAPACITY: usize = MAX_PENDING_DELEGATE_CALLS + 1;
 
 pub(super) struct HostPeer {
     outgoing_tx: mpsc::Sender<EncodedFrame>,
     bulk_tx: Option<mpsc::Sender<EncodedFrame>>,
     pending: Mutex<HashMap<DelegateRequestId, PendingDelegate>>,
     delegate_permits: Arc<Semaphore>,
+    receipt_permits: Arc<Semaphore>,
     cell_routes: StdMutex<HashMap<(SessionId, CellId), CellRoute>>,
     cell_routes_changed: Notify,
     next_request_id: AtomicI64,
@@ -43,6 +44,7 @@ pub(super) struct HostPeer {
 struct PendingDelegate {
     response_tx: oneshot::Sender<Result<DelegateResponse, String>>,
     dispatched: bool,
+    cancellation: CancellationToken,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -67,6 +69,7 @@ impl HostPeer {
             bulk_tx: None,
             pending: Mutex::new(HashMap::new()),
             delegate_permits: Arc::new(Semaphore::new(MAX_PENDING_DELEGATE_CALLS)),
+            receipt_permits: Arc::new(Semaphore::new(1)),
             cell_routes: StdMutex::new(HashMap::new()),
             cell_routes_changed: Notify::new(),
             next_request_id: AtomicI64::new(1),
@@ -80,14 +83,7 @@ impl HostPeer {
         self
     }
 
-    pub(super) fn send(&self, message: HostToClient) -> Result<(), PeerSendError> {
-        let frame = EncodedFrame::encode(&message)
-            .map_err(|err| PeerSendError::Payload(err.to_string()))?;
-        let lane = message.transport_lane();
-        self.send_frame(frame, lane)
-    }
-
-    pub(super) fn respond(
+    pub(super) async fn respond(
         &self,
         id: RequestId,
         result: Result<codex_code_mode_protocol::host::HostResponse, String>,
@@ -96,17 +92,27 @@ impl HostPeer {
             id,
             result: WireResult::from_result(result),
         };
-        if let Err(PeerSendError::Payload(err)) = self.send(message) {
-            let _ = self.send(HostToClient::Response {
-                id,
-                result: WireResult::Err {
-                    message: format!("code-mode host response exceeds the IPC frame limit: {err}"),
-                },
-            });
+        if let Err(PeerSendError::Payload(err)) = self
+            .send_with_backpressure(message, &CancellationToken::new())
+            .await
+        {
+            let _ = self
+                .send_with_backpressure(
+                    HostToClient::Response {
+                        id,
+                        result: WireResult::Err {
+                            message: format!(
+                                "code-mode host response exceeds the IPC frame limit: {err}"
+                            ),
+                        },
+                    },
+                    &CancellationToken::new(),
+                )
+                .await;
         }
     }
 
-    fn initial_response(
+    async fn initial_response(
         &self,
         id: RequestId,
         result: Result<codex_code_mode_protocol::host::WireRuntimeResponse, String>,
@@ -115,15 +121,23 @@ impl HostPeer {
             id,
             result: WireResult::from_result(result),
         };
-        if let Err(PeerSendError::Payload(err)) = self.send(message) {
-            let _ = self.send(HostToClient::InitialResponse {
-                id,
-                result: WireResult::Err {
-                    message: format!(
-                        "code-mode initial response exceeds the IPC frame limit: {err}"
-                    ),
-                },
-            });
+        if let Err(PeerSendError::Payload(err)) = self
+            .send_with_backpressure(message, &CancellationToken::new())
+            .await
+        {
+            let _ = self
+                .send_with_backpressure(
+                    HostToClient::InitialResponse {
+                        id,
+                        result: WireResult::Err {
+                            message: format!(
+                                "code-mode initial response exceeds the IPC frame limit: {err}"
+                            ),
+                        },
+                    },
+                    &CancellationToken::new(),
+                )
+                .await;
         }
     }
 
@@ -139,6 +153,49 @@ impl HostPeer {
         let Ok(permit) = Arc::clone(&self.delegate_permits).try_acquire_owned() else {
             return Err("code-mode host has too many pending delegate calls".to_string());
         };
+        self.call_with_permit(session_id, request, cancellation_token, permit)
+            .await
+    }
+
+    pub(super) async fn call_tool_result_delivered(
+        self: &Arc<Self>,
+        session_id: SessionId,
+        cell_id: CellId,
+        runtime_tool_call_id: String,
+        delivered: bool,
+    ) -> Result<DelegateResponse, String> {
+        if self.disconnected.is_cancelled() {
+            return Err("code-mode client connection closed".to_string());
+        }
+        let cancellation_token = CancellationToken::new();
+        let permit = tokio::select! {
+            biased;
+            _ = self.disconnected.cancelled() => {
+                return Err("code-mode client connection closed".to_string());
+            }
+            permit = Arc::clone(&self.receipt_permits).acquire_owned() => permit
+                .map_err(|_| "code-mode receipt capacity closed".to_string())?,
+        };
+        self.call_with_permit(
+            session_id,
+            DelegateRequest::ToolResultDelivered {
+                cell_id: cell_id.into(),
+                runtime_tool_call_id,
+                delivered,
+            },
+            cancellation_token,
+            permit,
+        )
+        .await
+    }
+
+    async fn call_with_permit(
+        self: &Arc<Self>,
+        session_id: SessionId,
+        request: DelegateRequest,
+        cancellation_token: CancellationToken,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<DelegateResponse, String> {
         let id = DelegateRequestId::new(self.next_request_id.fetch_add(1, Ordering::Relaxed));
         let (response_tx, response_rx) = oneshot::channel();
         self.pending.lock().await.insert(
@@ -146,13 +203,15 @@ impl HostPeer {
             PendingDelegate {
                 response_tx,
                 dispatched: false,
+                cancellation: cancellation_token.clone(),
                 _permit: permit,
             },
         );
         let mut pending = PendingDelegateRequest::new(Arc::clone(self), id);
         let cell_id = match &request {
             DelegateRequest::InvokeTool { invocation } => invocation.cell_id.clone().into(),
-            DelegateRequest::Notify { cell_id, .. } => cell_id.clone().into(),
+            DelegateRequest::Notify { cell_id, .. }
+            | DelegateRequest::ToolResultDelivered { cell_id, .. } => cell_id.clone().into(),
         };
         let (dispatched_tx, dispatched_rx) = oneshot::channel();
         if let Err(err) = self.route_cell_message(
@@ -193,7 +252,12 @@ impl HostPeer {
             }
             _ = cancellation_token.cancelled() => {
                 if self.remove_pending(id).await.is_some() {
-                    let _ = self.send(HostToClient::CancelDelegateRequest { id });
+                    let _ = self
+                        .send_with_backpressure(
+                            HostToClient::CancelDelegateRequest { id },
+                            &CancellationToken::new(),
+                        )
+                        .await;
                 }
                 pending.disarm();
                 Err("code mode delegate request cancelled".to_string())
@@ -324,26 +388,41 @@ impl HostPeer {
         request: DelegateRequest,
         dispatched_tx: oneshot::Sender<Result<(), String>>,
     ) {
-        let result = {
-            let mut pending = self.pending.lock().await;
-            let Some(pending) = pending.get_mut(&id) else {
+        let cancellation = {
+            let pending = self.pending.lock().await;
+            let Some(pending) = pending.get(&id) else {
                 let _ = dispatched_tx.send(Err(
                     "code-mode delegate request was cancelled before dispatch".to_string(),
                 ));
                 return;
             };
-            match self.send(HostToClient::DelegateRequest {
-                id,
-                session_id,
-                request,
-            }) {
-                Ok(()) => {
-                    pending.dispatched = true;
-                    Ok(())
-                }
-                Err(err) => Err(err.to_string()),
-            }
+            pending.cancellation.clone()
         };
+        let result = self
+            .send_with_backpressure(
+                HostToClient::DelegateRequest {
+                    id,
+                    session_id,
+                    request,
+                },
+                &cancellation,
+            )
+            .await
+            .map_err(|err| err.to_string());
+        if result.is_ok() {
+            let mut pending = self.pending.lock().await;
+            if let Some(pending) = pending.get_mut(&id) {
+                pending.dispatched = true;
+            } else {
+                drop(pending);
+                let _ = self
+                    .send_with_backpressure(
+                        HostToClient::CancelDelegateRequest { id },
+                        &CancellationToken::new(),
+                    )
+                    .await;
+            }
+        }
         let _ = dispatched_tx.send(result);
     }
 
@@ -398,25 +477,29 @@ impl HostPeer {
         });
     }
 
-    fn send_frame(&self, frame: EncodedFrame, lane: TransportLane) -> Result<(), PeerSendError> {
-        let sender = match lane {
+    async fn send_with_backpressure(
+        &self,
+        message: HostToClient,
+        cancellation: &CancellationToken,
+    ) -> Result<(), PeerSendError> {
+        let frame = EncodedFrame::encode(&message)
+            .map_err(|err| PeerSendError::Payload(err.to_string()))?;
+        let sender = match message.transport_lane() {
             TransportLane::Control => &self.outgoing_tx,
             TransportLane::Bulk => self.bulk_tx.as_ref().unwrap_or(&self.outgoing_tx),
         };
-        match sender.try_send(frame) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(_)) => {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(PeerSendError::Unavailable(
+                "code-mode delegate request cancelled".to_string(),
+            )),
+            _ = self.disconnected.cancelled() => Err(PeerSendError::Unavailable(
+                "code-mode client connection closed".to_string(),
+            )),
+            result = sender.send(frame) => result.map_err(|_| {
                 self.disconnect();
-                Err(PeerSendError::Unavailable(
-                    "code-mode host outgoing queue is full".to_string(),
-                ))
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.disconnect();
-                Err(PeerSendError::Unavailable(
-                    "code-mode client connection closed".to_string(),
-                ))
-            }
+                PeerSendError::Unavailable("code-mode client connection closed".to_string())
+            }),
         }
     }
 }
@@ -437,7 +520,7 @@ async fn drive_cell(
         tokio::select! {
             biased;
             result = &mut initial_response => {
-                peer.initial_response(request_id, result.map(Into::into));
+        peer.initial_response(request_id, result.map(Into::into)).await;
                 if let Some(initial_response_sent_tx) = initial_response_sent_tx.take() {
                     let _ = initial_response_sent_tx.send(());
                 }
@@ -461,7 +544,8 @@ async fn drive_cell(
     };
 
     if closed {
-        peer.initial_response(request_id, initial_response.await.map(Into::into));
+        peer.initial_response(request_id, initial_response.await.map(Into::into))
+            .await;
         if let Some(initial_response_sent_tx) = initial_response_sent_tx.take() {
             let _ = initial_response_sent_tx.send(());
         }
@@ -485,10 +569,15 @@ async fn drive_cell(
             }
         }
     }
-    let _ = peer.send(HostToClient::CellClosed {
-        session_id: key.0.clone(),
-        cell_id: (&key.1).into(),
-    });
+    let _ = peer
+        .send_with_backpressure(
+            HostToClient::CellClosed {
+                session_id: key.0.clone(),
+                cell_id: (&key.1).into(),
+            },
+            &CancellationToken::new(),
+        )
+        .await;
     peer.remove_cell_route(&key);
 }
 
@@ -543,7 +632,12 @@ impl Drop for PendingDelegateRequest {
             if let Some(pending) = peer.remove_pending(id).await
                 && pending.dispatched
             {
-                let _ = peer.send(HostToClient::CancelDelegateRequest { id });
+                let _ = peer
+                    .send_with_backpressure(
+                        HostToClient::CancelDelegateRequest { id },
+                        &CancellationToken::new(),
+                    )
+                    .await;
             }
         });
     }

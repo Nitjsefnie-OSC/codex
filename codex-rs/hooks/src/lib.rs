@@ -1,3 +1,4 @@
+mod background_state;
 mod config_rules;
 mod declarations;
 mod engine;
@@ -7,10 +8,14 @@ mod mcp;
 mod output_spill;
 mod registry;
 mod schema;
+mod skill_activation;
 mod types;
 
 use codex_protocol::protocol::HookEventName;
 
+pub use background_state::BackgroundState;
+pub use background_state::BackgroundTerminalSnapshot;
+pub use background_state::MonitorSnapshot;
 pub use config_rules::hook_states_from_stack;
 pub use declarations::PluginHookDeclaration;
 pub use declarations::plugin_hook_declarations;
@@ -81,6 +86,9 @@ pub use registry::Hooks;
 pub use registry::HooksConfig;
 pub use registry::list_hooks;
 pub use schema::write_schema_fixtures;
+pub use skill_activation::SkillActivation;
+pub use skill_activation::SkillActivationKind;
+pub use skill_activation::SkillActivationScope;
 pub use types::Hook;
 pub use types::HookEvent;
 pub use types::HookEventAfterAgent;

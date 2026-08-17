@@ -117,27 +117,53 @@ pub(crate) fn get_command(
                 .as_ref()
                 .map(|shell_str| get_shell_by_model_provided_path(&PathBuf::from(shell_str)));
             let shell = model_shell.as_ref().unwrap_or(session_shell.as_ref());
-            Ok(ResolvedCommand {
-                command: shell.derive_exec_args(&args.cmd, use_login_shell),
-                shell_type: shell.shell_type,
-            })
+            Ok(resolve_shell_command(
+                &args.cmd,
+                shell,
+                shell_mode,
+                use_login_shell,
+            ))
         }
-        UnifiedExecShellMode::ZshFork(zsh_fork_config) => {
+        UnifiedExecShellMode::ZshFork(_) => {
             if args.shell.is_some() {
                 return Err(
                     "`shell` is not supported for local zsh-fork exec; omit `shell` to use zsh-fork, or target a remote environment where `shell` is supported.".to_string(),
                 );
             }
 
-            Ok(ResolvedCommand {
-                command: vec![
-                    zsh_fork_config.shell_zsh_path.to_string_lossy().to_string(),
-                    if use_login_shell { "-lc" } else { "-c" }.to_string(),
-                    args.cmd.clone(),
-                ],
-                shell_type: ShellType::Zsh,
-            })
+            Ok(resolve_shell_command(
+                &args.cmd,
+                session_shell.as_ref(),
+                shell_mode,
+                use_login_shell,
+            ))
         }
+    }
+}
+
+/// Wrap a shell command string in the argv the configured shell mode requires.
+///
+/// Shared with `monitor` so a monitored command is spawned exactly the way
+/// `exec_command` spawns one.
+pub(crate) fn resolve_shell_command(
+    cmd: &str,
+    shell: &Shell,
+    shell_mode: &UnifiedExecShellMode,
+    use_login_shell: bool,
+) -> ResolvedCommand {
+    match shell_mode {
+        UnifiedExecShellMode::Direct => ResolvedCommand {
+            command: shell.derive_exec_args(cmd, use_login_shell),
+            shell_type: shell.shell_type,
+        },
+        UnifiedExecShellMode::ZshFork(zsh_fork_config) => ResolvedCommand {
+            command: vec![
+                zsh_fork_config.shell_zsh_path.to_string_lossy().to_string(),
+                if use_login_shell { "-lc" } else { "-c" }.to_string(),
+                cmd.to_string(),
+            ],
+            shell_type: ShellType::Zsh,
+        },
     }
 }
 

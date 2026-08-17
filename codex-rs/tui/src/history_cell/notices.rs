@@ -2,6 +2,20 @@
 
 use super::*;
 
+/// This fork's repository, not upstream's. A user following an "installation
+/// options" link to openai/codex installs a build without this one's
+/// capabilities.
+fn fork_repository_url() -> &'static str {
+    &codex_fork_manifest::manifest().fork.repository
+}
+
+/// This fork's releases page, for the same reason.
+fn releases_page_url() -> &'static str {
+    &codex_fork_manifest::manifest()
+        .release_channel
+        .releases_page_url
+}
+
 #[cfg_attr(debug_assertions, allow(dead_code))]
 #[derive(Debug)]
 pub(crate) struct UpdateAvailableHistoryCell {
@@ -28,7 +42,7 @@ impl HistoryCell for UpdateAvailableHistoryCell {
         } else {
             line![
                 "See ",
-                "https://github.com/openai/codex".cyan().underlined(),
+                fork_repository_url().cyan().underlined(),
                 " for installation options."
             ]
         };
@@ -43,9 +57,7 @@ impl HistoryCell for UpdateAvailableHistoryCell {
             update_instruction,
             "",
             "See full release notes:",
-            "https://github.com/openai/codex/releases/latest"
-                .cyan()
-                .underlined(),
+            releases_page_url().cyan().underlined(),
         ];
 
         let inner_width = content
@@ -60,7 +72,7 @@ impl HistoryCell for UpdateAvailableHistoryCell {
         let update_instruction = if let Some(update_action) = self.update_action {
             format!("Run {} to update.", update_action.command_str())
         } else {
-            "See https://github.com/openai/codex for installation options.".to_string()
+            format!("See {} for installation options.", fork_repository_url())
         };
         vec![
             Line::from("Update available!"),
@@ -68,7 +80,7 @@ impl HistoryCell for UpdateAvailableHistoryCell {
             Line::from(update_instruction),
             Line::from(""),
             Line::from("See full release notes:"),
-            Line::from("https://github.com/openai/codex/releases/latest"),
+            Line::from(releases_page_url()),
         ]
     }
 

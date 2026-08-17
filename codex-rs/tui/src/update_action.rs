@@ -5,6 +5,19 @@ use codex_install_context::InstallMethod;
 #[cfg(any(not(debug_assertions), test))]
 use codex_install_context::StandalonePlatform;
 
+/// Whether this fork ships builds through the package managers and installer
+/// scripts the upstream update actions drive.
+///
+/// It does not, so this is `false` and every such action is withheld; the
+/// constant is read from the manifest rather than inlined so turning it on
+/// later is a manifest edit, not a code hunt.
+#[cfg(any(not(debug_assertions), test))]
+fn fork_publishes_package_manager_releases() -> bool {
+    codex_fork_manifest::manifest()
+        .release_channel
+        .package_manager_releases
+}
+
 /// Update action the CLI should perform after the TUI exits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateAction {
@@ -25,6 +38,25 @@ pub enum UpdateAction {
 impl UpdateAction {
     #[cfg(any(not(debug_assertions), test))]
     pub(crate) fn from_install_context(context: &InstallContext) -> Option<Self> {
+        Self::from_install_context_with_channel(context, fork_publishes_package_manager_releases())
+    }
+
+    #[cfg(any(not(debug_assertions), test))]
+    fn from_install_context_with_channel(
+        context: &InstallContext,
+        upstream_installers_ship_this_build: bool,
+    ) -> Option<Self> {
+        // Every action below installs an *upstream* build: the npm package, the
+        // Homebrew cask, and the install.sh/install.ps1 scripts all resolve to
+        // openai/codex. Running one on a fork install replaces the binary with
+        // one that has none of the fork's capabilities, and nothing about the
+        // upgrade says so. When the fork does not ship through them there is no
+        // in-place update action; the caller points at the fork releases page
+        // instead.
+        if !upstream_installers_ship_this_build {
+            return None;
+        }
+
         match &context.method {
             InstallMethod::Npm => Some(UpdateAction::NpmGlobalLatest),
             InstallMethod::Bun => Some(UpdateAction::BunGlobalLatest),
@@ -83,69 +115,114 @@ mod tests {
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
 
+    fn native_release_dir() -> AbsolutePathBuf {
+        AbsolutePathBuf::from_absolute_path(std::env::temp_dir().join("native-release"))
+            .expect("temp dir path should be absolute")
+    }
+
+    fn install_methods() -> Vec<InstallMethod> {
+        let release_dir = native_release_dir();
+        vec![
+            InstallMethod::Npm,
+            InstallMethod::Bun,
+            InstallMethod::Pnpm,
+            InstallMethod::Brew,
+            InstallMethod::Standalone {
+                platform: StandalonePlatform::Unix,
+                release_dir: release_dir.clone(),
+                resources_dir: Some(release_dir.join("codex-resources")),
+            },
+            InstallMethod::Standalone {
+                platform: StandalonePlatform::Windows,
+                release_dir: release_dir.clone(),
+                resources_dir: Some(release_dir.join("codex-resources")),
+            },
+            InstallMethod::Other,
+        ]
+    }
+
+    fn action_for(method: InstallMethod, upstream_ships_this_build: bool) -> Option<UpdateAction> {
+        UpdateAction::from_install_context_with_channel(
+            &InstallContext {
+                method,
+                package_layout: None,
+            },
+            upstream_ships_this_build,
+        )
+    }
+
     #[test]
     fn maps_install_context_to_update_action() {
-        let native_release_dir =
-            AbsolutePathBuf::from_absolute_path(std::env::temp_dir().join("native-release"))
-                .expect("temp dir path should be absolute");
+        let release_dir = native_release_dir();
 
+        assert_eq!(action_for(InstallMethod::Other, true), None);
         assert_eq!(
-            UpdateAction::from_install_context(&InstallContext {
-                method: InstallMethod::Other,
-                package_layout: None,
-            }),
-            None
-        );
-        assert_eq!(
-            UpdateAction::from_install_context(&InstallContext {
-                method: InstallMethod::Npm,
-                package_layout: None,
-            }),
+            action_for(InstallMethod::Npm, true),
             Some(UpdateAction::NpmGlobalLatest)
         );
         assert_eq!(
-            UpdateAction::from_install_context(&InstallContext {
-                method: InstallMethod::Bun,
-                package_layout: None,
-            }),
+            action_for(InstallMethod::Bun, true),
             Some(UpdateAction::BunGlobalLatest)
         );
         assert_eq!(
-            UpdateAction::from_install_context(&InstallContext {
-                method: InstallMethod::Pnpm,
-                package_layout: None,
-            }),
+            action_for(InstallMethod::Pnpm, true),
             Some(UpdateAction::PnpmGlobalLatest)
         );
         assert_eq!(
-            UpdateAction::from_install_context(&InstallContext {
-                method: InstallMethod::Brew,
-                package_layout: None,
-            }),
+            action_for(InstallMethod::Brew, true),
             Some(UpdateAction::BrewUpgrade)
         );
         assert_eq!(
-            UpdateAction::from_install_context(&InstallContext {
-                method: InstallMethod::Standalone {
+            action_for(
+                InstallMethod::Standalone {
                     platform: StandalonePlatform::Unix,
-                    release_dir: native_release_dir.clone(),
-                    resources_dir: Some(native_release_dir.join("codex-resources")),
+                    release_dir: release_dir.clone(),
+                    resources_dir: Some(release_dir.join("codex-resources")),
                 },
-                package_layout: None,
-            }),
+                true
+            ),
             Some(UpdateAction::StandaloneUnix)
         );
         assert_eq!(
-            UpdateAction::from_install_context(&InstallContext {
-                method: InstallMethod::Standalone {
+            action_for(
+                InstallMethod::Standalone {
                     platform: StandalonePlatform::Windows,
-                    release_dir: native_release_dir.clone(),
-                    resources_dir: Some(native_release_dir.join("codex-resources")),
+                    release_dir: release_dir.clone(),
+                    resources_dir: Some(release_dir.join("codex-resources")),
                 },
-                package_layout: None,
-            }),
+                true
+            ),
             Some(UpdateAction::StandaloneWindows)
         );
+    }
+
+    #[test]
+    fn no_install_method_upgrades_in_place_when_upstream_does_not_ship_this_build() {
+        for method in install_methods() {
+            assert_eq!(
+                action_for(method.clone(), false),
+                None,
+                "{method:?} would have installed an upstream build over this one"
+            );
+        }
+    }
+
+    #[test]
+    fn this_fork_withholds_every_upstream_update_action() {
+        // Guards the wiring, not just the helper: if the manifest ever claims
+        // the fork ships through upstream's installers while it does not, every
+        // update path silently reverts a user to an upstream build.
+        assert!(!fork_publishes_package_manager_releases());
+        for method in install_methods() {
+            assert_eq!(
+                UpdateAction::from_install_context(&InstallContext {
+                    method: method.clone(),
+                    package_layout: None,
+                }),
+                None,
+                "{method:?} offered an upstream update action"
+            );
+        }
     }
 
     #[test]

@@ -166,6 +166,13 @@ impl ClientToHost {
                     },
                 ..
             }
+            | Self::DelegateResponse {
+                result:
+                    WireResult::Ok {
+                        value: DelegateResponse::ToolResultDeliveryRecorded,
+                    },
+                ..
+            }
             | Self::ClientHello(_)
             | Self::Request { .. }
             | Self::CancelRequest { .. } => TransportLane::Control,
@@ -222,7 +229,8 @@ impl HostToClient {
             }
             | Self::CancelDelegateRequest { .. } => TransportLane::Bulk,
             Self::DelegateRequest {
-                request: DelegateRequest::Notify { .. },
+                request:
+                    DelegateRequest::Notify { .. } | DelegateRequest::ToolResultDelivered { .. },
                 ..
             }
             | Self::HostHello(_)
@@ -291,6 +299,12 @@ pub enum DelegateRequest {
         cell_id: WireCellId,
         text: String,
     },
+    #[serde(rename = "tool/resultDelivered")]
+    ToolResultDelivered {
+        cell_id: WireCellId,
+        runtime_tool_call_id: String,
+        delivered: bool,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -300,6 +314,8 @@ pub enum DelegateResponse {
     ToolResult { result: JsonValue },
     #[serde(rename = "notification/delivered")]
     NotificationDelivered,
+    #[serde(rename = "tool/resultDeliveryRecorded")]
+    ToolResultDeliveryRecorded,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Serialize)]

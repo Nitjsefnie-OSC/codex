@@ -62,6 +62,7 @@ use codex_config::ConfigLoadOptions;
 use codex_config::LoaderOverrides;
 use codex_config::format_config_error_with_source;
 use codex_core::StateDbHandle;
+use codex_core::apply_exec_agent_role;
 use codex_core::check_execpolicy_for_warnings;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
@@ -249,6 +250,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
 
     let Cli {
         command,
+        agent,
         strict_config,
         shared,
         skip_git_repo_check,
@@ -262,6 +264,8 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         output_schema: output_schema_path,
         mut config_overrides,
     } = cli;
+    cli::validate_agent_role_command(agent.as_deref(), command.as_ref())
+        .map_err(anyhow::Error::msg)?;
     let mut shared = shared.into_inner();
     shared.take_auto_review_config_overrides(&mut config_overrides);
     let SharedCliOptions {
@@ -443,12 +447,17 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
             .cloud_config_bundle(cloud_config_bundle.clone())
             .build()
     };
-    let config = build_exec_config(
+    let mut config = build_exec_config(
         overrides,
         dangerously_bypass_approvals_and_sandbox,
         build_config,
     )
     .await?;
+    if let Some(agent) = agent.as_deref() {
+        apply_exec_agent_role(&mut config, agent)
+            .await
+            .map_err(anyhow::Error::msg)?;
+    }
     let resume_approvals_reviewer_override = cli_kv_overrides
         .iter()
         .any(|(key, _)| key == "approvals_reviewer")
@@ -1182,12 +1191,25 @@ fn thread_start_params_from_config(config: &Config) -> ThreadStartParams {
         approvals_reviewer: Some(config.approvals_reviewer.into()),
         sandbox: sandbox.flatten(),
         permissions,
-        config: thread_config_overrides_from_config(config),
+        config: new_thread_config_overrides_from_config(config),
         ephemeral: Some(config.ephemeral),
         history_mode: (!config.ephemeral).then_some(ThreadHistoryMode::Paginated),
         thread_source: Some(ThreadSource::User),
+        base_instructions: config.base_instructions.clone(),
+        developer_instructions: config.developer_instructions.clone(),
         ..ThreadStartParams::default()
     }
+}
+
+fn new_thread_config_overrides_from_config(config: &Config) -> Option<HashMap<String, Value>> {
+    let mut overrides = thread_config_overrides_from_config(config).unwrap_or_default();
+    if let Some(reasoning_effort) = config.model_reasoning_effort.as_ref() {
+        overrides.insert(
+            "model_reasoning_effort".to_string(),
+            Value::String(reasoning_effort.to_string()),
+        );
+    }
+    (!overrides.is_empty()).then_some(overrides)
 }
 
 fn thread_resume_params_from_config(
