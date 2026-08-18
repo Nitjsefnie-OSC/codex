@@ -101,7 +101,7 @@ pub(crate) fn create_monitor_tool() -> ToolSpec {
         name: TOOL_NAME.to_string(),
         description: r#"Run a long-running command in the background and get told about its output as it arrives.
 
-`start` returns as soon as the command is running, with a process id. From then on you receive `monitor_notification` messages carrying batches of complete stdout lines, and exactly one final notification reporting how the command ended — success, failure, stop, or timeout. Stderr stays quiet but remains available with `read`. Notifications are capped per monitor; the full retained output is always available with `read`.
+`start` returns as soon as the command is running, with a process id. From then on you receive `monitor_notification` messages carrying batches of complete stdout lines, and exactly one final notification reporting how the command ended — success, failure, stop, or timeout. Stderr stays quiet but remains available with `read`. Notifications are rate-limited per monitor; the full retained output is always available with `read`.
 
 Classify the work: a `job` is expected to finish (a build, a test run, a deploy); a `watcher` is persistent and runs until you stop it or the session ends (a log tail, a dev server). Use `list` to see what is running, who started it, and whether its notifications are unread; `wait` to block until a job finishes; `stop` to end one.
 

@@ -23,6 +23,7 @@ use std::sync::atomic::Ordering;
 
 use serde::Serialize;
 use tokio::sync::watch;
+use tokio::time::Duration;
 use tokio::time::Instant;
 
 use super::head_tail_buffer::HeadTailBuffer;
@@ -32,11 +33,16 @@ use super::process::UnifiedExecProcess;
 /// evicted first so a long session cannot accumulate transcripts without bound.
 pub(crate) const MAX_RETAINED_MONITORS: usize = 64;
 
-/// Non-terminal notifications a single monitor may deliver to the model per
-/// context window. Past this, batches are counted and dropped; the retained
-/// output still has them, and the terminal notification reports how many were
-/// suppressed.
+/// Initial burst budget for a monitor's non-terminal notifications. Time
+/// replenishes spent capacity, and compaction restores the full budget for the
+/// replacement context. Batches that arrive while no capacity is available are
+/// counted and dropped; the retained output still has them, and the terminal
+/// notification reports how many were suppressed.
 pub(crate) const MAX_MONITOR_NOTIFICATIONS: u64 = 20;
+
+/// Time required to replenish one non-terminal notification after a monitor
+/// spends its current burst budget.
+const MONITOR_NOTIFICATION_REFILL_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Complete lines carried by one notification. A firehose batch is truncated to
 /// this and reports the remainder as `omitted_lines`.
@@ -178,27 +184,43 @@ pub(crate) struct MonitorAttachment {
 
 /// Mutable notification bookkeeping. Guarded by a std mutex because every
 /// operation on it is a handful of integer updates and never awaits.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct MonitorCounters {
     next_seq: u64,
     delivered: u64,
-    delivered_in_window: u64,
+    available_notifications: u64,
+    last_refill: Instant,
     suppressed: u64,
     last_seq: u64,
     acknowledged_seq: u64,
 }
 
+impl Default for MonitorCounters {
+    fn default() -> Self {
+        Self {
+            next_seq: 0,
+            delivered: 0,
+            available_notifications: MAX_MONITOR_NOTIFICATIONS,
+            last_refill: Instant::now(),
+            suppressed: 0,
+            last_seq: 0,
+            acknowledged_seq: 0,
+        }
+    }
+}
+
 impl MonitorCounters {
     /// Reserve a sequence number for a batch notification, or report that the
-    /// monitor's notification cap for this context window has already been
-    /// spent.
+    /// monitor's currently available delivery budget has been spent.
     fn reserve(&mut self) -> NotificationSlot {
-        if self.delivered_in_window >= MAX_MONITOR_NOTIFICATIONS {
+        self.replenish(Instant::now());
+        if self.available_notifications == 0 {
             self.suppressed += 1;
             return NotificationSlot::Suppressed;
         }
+        self.available_notifications -= 1;
         NotificationSlot::Allowed {
-            seq: self.advance(true),
+            seq: self.advance(),
         }
     }
 
@@ -206,13 +228,28 @@ impl MonitorCounters {
     /// terminal notification is never capped — it is the one message that must
     /// always arrive.
     fn reserve_terminal(&mut self) -> u64 {
-        self.advance(false)
+        self.advance()
     }
 
     /// Start a new model-visible notification window while compaction publishes
     /// its replacement history.
     fn begin_notification_window(&mut self) {
-        self.delivered_in_window = 0;
+        self.available_notifications = MAX_MONITOR_NOTIFICATIONS;
+        self.last_refill = Instant::now();
+    }
+
+    fn replenish(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.last_refill);
+        let refill_interval_secs = MONITOR_NOTIFICATION_REFILL_INTERVAL.as_secs();
+        let refill_intervals = elapsed.as_secs() / refill_interval_secs;
+        if refill_intervals == 0 {
+            return;
+        }
+        self.available_notifications = self
+            .available_notifications
+            .saturating_add(refill_intervals)
+            .min(MAX_MONITOR_NOTIFICATIONS);
+        self.last_refill += Duration::from_secs(refill_intervals * refill_interval_secs);
     }
 
     /// Record how far the caller has consumed the notifications. Acknowledgement
@@ -231,12 +268,9 @@ impl MonitorCounters {
         self.last_seq.saturating_sub(self.acknowledged_seq)
     }
 
-    fn advance(&mut self, counts_toward_window: bool) -> u64 {
+    fn advance(&mut self) -> u64 {
         self.next_seq += 1;
         self.delivered += 1;
-        if counts_toward_window {
-            self.delivered_in_window += 1;
-        }
         self.last_seq = self.next_seq;
         self.next_seq
     }
@@ -263,7 +297,8 @@ pub(crate) struct MonitorHandle {
 pub(crate) enum NotificationSlot {
     /// Deliver the notification under this sequence number.
     Allowed { seq: u64 },
-    /// The monitor is past its cap; the batch was counted, not sent.
+    /// The monitor temporarily has no delivery budget; the batch was counted,
+    /// not sent.
     Suppressed,
 }
 
@@ -304,9 +339,10 @@ impl MonitorNotificationDraft {
 
     /// Reserve this draft's sequence number and build its model-visible item.
     ///
-    /// A capped batch returns `None` when its window is exhausted. Suppression
-    /// is recorded by the reservation itself, while terminal notifications are
-    /// always materialized after all earlier drafts in queue order.
+    /// A rate-limited batch returns `None` while its delivery budget is
+    /// exhausted. Suppression is recorded by the reservation itself, while
+    /// terminal notifications are always materialized after all earlier drafts
+    /// in queue order.
     pub(crate) fn materialize(self) -> Option<crate::context::MonitorNotification> {
         match self {
             Self::Batch {

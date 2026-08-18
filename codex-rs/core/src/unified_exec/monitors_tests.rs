@@ -33,6 +33,27 @@ fn a_noisy_monitor_stops_at_its_cap_and_counts_what_it_dropped() {
     assert_eq!(counters.suppressed, 5);
 }
 
+#[tokio::test(start_paused = true)]
+async fn elapsed_time_replenishes_notifications_and_preserves_partial_intervals() {
+    let mut counters = MonitorCounters::default();
+    for _ in 0..MAX_MONITOR_NOTIFICATIONS {
+        assert!(allowed_seq(counters.reserve()).is_some());
+    }
+    assert_eq!(allowed_seq(counters.reserve()), None);
+
+    tokio::time::advance(std::time::Duration::from_secs(19)).await;
+
+    assert_eq!(allowed_seq(counters.reserve()), Some(21));
+    assert_eq!(allowed_seq(counters.reserve()), None);
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+
+    assert_eq!(allowed_seq(counters.reserve()), Some(22));
+    assert_eq!(allowed_seq(counters.reserve()), None);
+    assert_eq!(counters.delivered, 22);
+    assert_eq!(counters.suppressed, 3);
+    assert_eq!(counters.last_seq, 22);
+}
+
 #[test]
 fn compaction_starts_a_new_notification_window_without_resetting_lifetime_stats() {
     let mut counters = MonitorCounters::default();
