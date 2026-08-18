@@ -518,12 +518,14 @@ async fn yielded_exec_completion_during_compaction_wakes_successor_once() -> Res
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_session_once()
--> Result<()> {
+async fn monitor_notification_budget_recovers_over_time_and_resets_after_compaction() -> Result<()>
+{
     skip_if_no_network!(Ok(()));
 
     const START_GATE: &str = "monitor-compaction-start.ready";
     const BEFORE_COMPACTION_GATE: &str = "monitor-compaction-before.ready";
+    const REFILL_GATE: &str = "monitor-refill.ready";
+    const REFILL_OUTPUT_GATE: &str = "monitor-refill-output.ready";
     const DURING_COMPACTION_GATE: &str = "monitor-compaction-during.ready";
     const BATCH_READY_PREFIX: &str = "monitor-compaction-batch-";
     const BATCH_ACK_PREFIX: &str = "monitor-compaction-batch-ack-";
@@ -534,13 +536,13 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
     let monitor_command = match test_target_os() {
         TestTargetOs::Linux | TestTargetOs::MacOs => {
             let command = format!(
-                "while [ ! -f {START_GATE} ]; do sleep 0.05; done; i=1; while [ \"$i\" -le {PRE_COMPACTION_NOTIFICATION_COUNT} ]; do j=0; while [ \"$j\" -lt {LINES_PER_NOTIFICATION} ]; do printf 'monitor-before-%s-%s\\n' \"$i\" \"$j\"; j=$((j + 1)); done; touch {BATCH_READY_PREFIX}$i.ready; while [ ! -f {BATCH_ACK_PREFIX}$i ]; do sleep 0.05; done; i=$((i + 1)); done; touch {BEFORE_COMPACTION_GATE}; while [ ! -f {DURING_COMPACTION_GATE} ]; do sleep 0.05; done; j=0; while [ \"$j\" -lt {LINES_PER_NOTIFICATION} ]; do printf 'monitor-after-%s\\n' \"$j\"; j=$((j + 1)); done; sleep 30"
+                "while [ ! -f {START_GATE} ]; do sleep 0.05; done; i=1; while [ \"$i\" -le {PRE_COMPACTION_NOTIFICATION_COUNT} ]; do j=0; while [ \"$j\" -lt {LINES_PER_NOTIFICATION} ]; do printf 'monitor-before-%s-%s\\n' \"$i\" \"$j\"; j=$((j + 1)); done; touch {BATCH_READY_PREFIX}$i.ready; while [ ! -f {BATCH_ACK_PREFIX}$i ]; do sleep 0.05; done; i=$((i + 1)); done; touch {BEFORE_COMPACTION_GATE}; while [ ! -f {REFILL_GATE} ]; do sleep 0.05; done; j=0; while [ \"$j\" -lt {LINES_PER_NOTIFICATION} ]; do printf 'monitor-after-refill-%s\\n' \"$j\"; j=$((j + 1)); done; touch {REFILL_OUTPUT_GATE}; while [ ! -f {DURING_COMPACTION_GATE} ]; do sleep 0.05; done; j=0; while [ \"$j\" -lt {LINES_PER_NOTIFICATION} ]; do printf 'monitor-after-compaction-%s\\n' \"$j\"; j=$((j + 1)); done; sleep 30"
             );
             vec!["bash".to_string(), "-c".to_string(), command]
         }
         TestTargetOs::Windows => {
             let command = format!(
-                "while (-not (Test-Path -LiteralPath '{START_GATE}')) {{ Start-Sleep -Milliseconds 50 }}; $i=1; while ($i -le {PRE_COMPACTION_NOTIFICATION_COUNT}) {{ for ($j=0; $j -lt {LINES_PER_NOTIFICATION}; $j++) {{ [Console]::Out.WriteLine(\"monitor-before-$i-$j\") }}; New-Item -ItemType File -Force -Path \"{BATCH_READY_PREFIX}$i.ready\" | Out-Null; while (-not (Test-Path -LiteralPath \"{BATCH_ACK_PREFIX}$i\")) {{ Start-Sleep -Milliseconds 50 }}; $i++ }}; New-Item -ItemType File -Force -Path '{BEFORE_COMPACTION_GATE}' | Out-Null; while (-not (Test-Path -LiteralPath '{DURING_COMPACTION_GATE}')) {{ Start-Sleep -Milliseconds 50 }}; for ($j=0; $j -lt {LINES_PER_NOTIFICATION}; $j++) {{ [Console]::Out.WriteLine(\"monitor-after-$j\") }}; Start-Sleep -Seconds 30"
+                "while (-not (Test-Path -LiteralPath '{START_GATE}')) {{ Start-Sleep -Milliseconds 50 }}; $i=1; while ($i -le {PRE_COMPACTION_NOTIFICATION_COUNT}) {{ for ($j=0; $j -lt {LINES_PER_NOTIFICATION}; $j++) {{ [Console]::Out.WriteLine(\"monitor-before-$i-$j\") }}; New-Item -ItemType File -Force -Path \"{BATCH_READY_PREFIX}$i.ready\" | Out-Null; while (-not (Test-Path -LiteralPath \"{BATCH_ACK_PREFIX}$i\")) {{ Start-Sleep -Milliseconds 50 }}; $i++ }}; New-Item -ItemType File -Force -Path '{BEFORE_COMPACTION_GATE}' | Out-Null; while (-not (Test-Path -LiteralPath '{REFILL_GATE}')) {{ Start-Sleep -Milliseconds 50 }}; for ($j=0; $j -lt {LINES_PER_NOTIFICATION}; $j++) {{ [Console]::Out.WriteLine(\"monitor-after-refill-$j\") }}; New-Item -ItemType File -Force -Path '{REFILL_OUTPUT_GATE}' | Out-Null; while (-not (Test-Path -LiteralPath '{DURING_COMPACTION_GATE}')) {{ Start-Sleep -Milliseconds 50 }}; for ($j=0; $j -lt {LINES_PER_NOTIFICATION}; $j++) {{ [Console]::Out.WriteLine(\"monitor-after-compaction-$j\") }}; Start-Sleep -Seconds 30"
             );
             vec![
                 "powershell".to_string(),
@@ -588,6 +590,17 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
         }]);
     }
     response_streams.extend([
+        vec![StreamingSseChunk {
+            gate: None,
+            body: sse(vec![
+                ev_response_created("monitor-refill-response"),
+                ev_assistant_message(
+                    "monitor-refill-message",
+                    "received the monitor notification after timed refill",
+                ),
+                ev_completed("monitor-refill-response"),
+            ]),
+        }],
         vec![
             StreamingSseChunk {
                 gate: None,
@@ -643,6 +656,16 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
         .selection()
         .cwd
         .join(BEFORE_COMPACTION_GATE)?;
+    let refill_gate = test
+        .executor_environment()
+        .selection()
+        .cwd
+        .join(REFILL_GATE)?;
+    let refill_output_gate = test
+        .executor_environment()
+        .selection()
+        .cwd
+        .join(REFILL_OUTPUT_GATE)?;
     let during_compaction_gate = test
         .executor_environment()
         .selection()
@@ -793,6 +816,68 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
         );
     }
 
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    test.fs()
+        .write_file(&refill_gate, b"ready".to_vec(), /*sandbox*/ None)
+        .await?;
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if test
+                .fs()
+                .read_file(&refill_output_gate, /*sandbox*/ None)
+                .await
+                .is_ok()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .with_context(|| "timed out waiting for monitor output after timed refill")?;
+    timeout(
+        Duration::from_secs(10),
+        streaming_server.wait_for_request_count(3 + PRE_COMPACTION_NOTIFICATION_COUNT),
+    )
+    .await
+    .with_context(|| "timed out waiting for the monitor request after timed refill")?;
+    let requests = streaming_server.requests().await;
+    assert_eq!(3 + PRE_COMPACTION_NOTIFICATION_COUNT, requests.len());
+    let expected_refill_lines = Value::Array(
+        (0..LINES_PER_NOTIFICATION)
+            .map(|index| Value::String(format!("monitor-after-refill-{index}")))
+            .collect(),
+    );
+    let refill_requests = requests
+        .iter()
+        .map(|request| Ok((request, monitor_notification_payloads(request)?)))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|(_, payloads)| {
+            payloads
+                .iter()
+                .any(|payload| payload.get("lines") == Some(&expected_refill_lines))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        1,
+        refill_requests.len(),
+        "the replenished monitor batch should wake exactly one successor"
+    );
+    let (_, refill_payloads) = &refill_requests[0];
+    assert_eq!(
+        (1..=PRE_COMPACTION_NOTIFICATION_COUNT as u64 + 1).collect::<Vec<_>>(),
+        monitor_notification_sequences(refill_payloads, "timed-refill monitor request")?,
+    );
+    completion_receivers
+        .remove(0)
+        .await
+        .with_context(|| "timed-refill response stage did not complete")?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
     test.codex.submit(Op::Compact).await?;
     let compact_turn_id = wait_for_event_match(&test.codex, |event| match event {
         EventMsg::TurnStarted(event) => Some(event.turn_id.clone()),
@@ -805,7 +890,7 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
     tokio::pin!(monitor_draft_admitted);
     timeout(
         Duration::from_secs(10),
-        streaming_server.wait_for_request_count(3 + PRE_COMPACTION_NOTIFICATION_COUNT),
+        streaming_server.wait_for_request_count(4 + PRE_COMPACTION_NOTIFICATION_COUNT),
     )
     .await
     .with_context(|| "timed out waiting for the active compaction request")?;
@@ -837,12 +922,12 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
 
     timeout(
         Duration::from_secs(10),
-        streaming_server.wait_for_request_count(4 + PRE_COMPACTION_NOTIFICATION_COUNT),
+        streaming_server.wait_for_request_count(5 + PRE_COMPACTION_NOTIFICATION_COUNT),
     )
     .await
     .with_context(|| "timed out waiting for the post-compaction monitor request")?;
     let requests = streaming_server.requests().await;
-    assert_eq!(4 + PRE_COMPACTION_NOTIFICATION_COUNT, requests.len());
+    assert_eq!(5 + PRE_COMPACTION_NOTIFICATION_COUNT, requests.len());
     let decoded_payloads = requests
         .iter()
         .map(|request| monitor_notification_payloads(request))
@@ -850,7 +935,7 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
         .context("failed to decode post-compaction request bodies")?;
     let expected_after_lines = Value::Array(
         (0..LINES_PER_NOTIFICATION)
-            .map(|index| Value::String(format!("monitor-after-{index}")))
+            .map(|index| Value::String(format!("monitor-after-compaction-{index}")))
             .collect(),
     );
     let post_compaction_requests = requests
@@ -874,7 +959,7 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
         "post-compaction monitor request",
     )?;
     assert_eq!(
-        vec![21_u64],
+        vec![22_u64],
         actual_sequences,
         "post-compaction request should contain only the successor monitor notification"
     );
@@ -895,7 +980,7 @@ async fn monitor_notification_window_resets_after_compaction_and_wakes_idle_sess
     assert!(completion_receivers.is_empty());
     test.codex.shutdown_and_wait().await?;
     assert_eq!(
-        4 + PRE_COMPACTION_NOTIFICATION_COUNT,
+        5 + PRE_COMPACTION_NOTIFICATION_COUNT,
         streaming_server.requests().await.len()
     );
     streaming_server.shutdown().await;
