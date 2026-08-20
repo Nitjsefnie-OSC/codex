@@ -1,9 +1,18 @@
 ---
-source: tui/src/history_cell.rs
+source: tui/src/history_cell/tests.rs
+assertion_line: 659
 expression: rendered
 ---
 /ps
 
-Background terminals
+Native agents
 
-  • No background terminals running.
+  • No native agents running.
+
+exec_command terminals
+
+  • No exec_command terminals running.
+
+Monitor jobs and watchers
+
+  • No monitor jobs or watchers running.

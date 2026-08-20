@@ -32,8 +32,8 @@ impl ChatWidget {
         let (_command, parsed_cmd) = command_execution_command_and_parsed(command, command_actions);
         self.flush_answer_stream_with_separator();
         if is_unified_exec_source(*source) {
-            if *source == ExecCommandSource::UnifiedExecStartup {
-                self.track_unified_exec_process_begin(id, process_id.as_deref(), command);
+            if let Some(kind) = unified_exec_process_kind(*source) {
+                self.track_unified_exec_process_begin(id, process_id.as_deref(), command, kind);
             }
             if !self.bottom_pane.is_task_running() {
                 return;
@@ -167,6 +167,7 @@ impl ChatWidget {
         call_id: &str,
         process_id: Option<&str>,
         command: &str,
+        kind: UnifiedExecProcessKind,
     ) {
         let key = process_id.unwrap_or(call_id).to_string();
         let command = split_command_string(command);
@@ -177,12 +178,14 @@ impl ChatWidget {
             .find(|process| process.key == key)
         {
             existing.call_id = call_id.to_string();
+            existing.kind = kind;
             existing.command_display = command_display;
             existing.recent_chunks.clear();
         } else {
             self.unified_exec_processes.push(UnifiedExecProcessSummary {
                 key,
                 call_id: call_id.to_string(),
+                kind,
                 command_display,
                 recent_chunks: Vec::new(),
             });
@@ -369,6 +372,41 @@ impl ChatWidget {
         let is_unified_exec_interaction =
             matches!(source, ExecCommandSource::UnifiedExecInteraction);
         let is_user_shell = source == ExecCommandSource::UserShell;
+        let retain_untracked_unified_exec = !was_running
+            && matches!(
+                source,
+                ExecCommandSource::UnifiedExecStartup | ExecCommandSource::MonitorStartup
+            )
+            && self.transcript.active_cell.is_none();
+        // Unified exec skips unknown start events, so group their successful completions here.
+        if !was_running
+            && matches!(
+                source,
+                ExecCommandSource::UnifiedExecStartup | ExecCommandSource::MonitorStartup
+            )
+            && let Some(cell) = self
+                .transcript
+                .active_cell
+                .as_mut()
+                .and_then(|cell| cell.as_any_mut().downcast_mut::<ExecCell>())
+            && !cell.is_active()
+            && cell.iter_calls().all(|call| {
+                matches!(
+                    call.source,
+                    ExecCommandSource::Agent
+                        | ExecCommandSource::UnifiedExecStartup
+                        | ExecCommandSource::MonitorStartup
+                )
+            })
+        {
+            cell.add_call(
+                id.clone(),
+                command.clone(),
+                parsed.clone(),
+                source,
+                /*interaction_input*/ None,
+            );
+        }
         let end_target = match self.transcript.active_cell.as_ref() {
             Some(cell) => match cell.as_any().downcast_ref::<ExecCell>() {
                 Some(exec_cell) if exec_cell.iter_calls().any(|call| call.call_id == id) => {

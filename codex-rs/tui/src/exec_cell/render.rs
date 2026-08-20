@@ -244,6 +244,44 @@ impl HistoryCell for ExecCell {
 }
 
 impl ExecCell {
+    fn compact_group_display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let completed_commands = self
+            .calls
+            .iter()
+            .take_while(|call| {
+                matches!(
+                    call.source,
+                    ExecCommandSource::Agent
+                        | ExecCommandSource::UnifiedExecStartup
+                        | ExecCommandSource::MonitorStartup
+                ) && call.duration.is_some()
+                    && call
+                        .output
+                        .as_ref()
+                        .is_some_and(|output| output.exit_code == 0)
+            })
+            .count();
+        let mut lines = Vec::new();
+        if completed_commands > 0 {
+            let noun = if completed_commands == 1 {
+                "command"
+            } else {
+                "commands"
+            };
+            lines.push(Line::from(vec![
+                "•".green().bold(),
+                " ".into(),
+                format!("Ran {completed_commands} {noun}").bold(),
+                " · ".dim(),
+                TRANSCRIPT_HINT.dim(),
+            ]));
+        }
+        for call in &self.calls[completed_commands..] {
+            lines.extend(self.command_call_display_lines(width, call));
+        }
+        lines
+    }
+
     fn output_ellipsis_text(omitted: usize) -> String {
         format!("… +{omitted} lines ({TRANSCRIPT_HINT})")
     }

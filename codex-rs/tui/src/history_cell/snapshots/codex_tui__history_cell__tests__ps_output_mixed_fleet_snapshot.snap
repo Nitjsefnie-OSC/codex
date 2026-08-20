@@ -1,0 +1,20 @@
+---
+source: tui/src/history_cell/tests.rs
+assertion_line: 689
+expression: rendered
+---
+/ps
+
+Native agents
+
+  • /root/research — Ada [explorer] — running
+
+exec_command terminals
+
+  • cargo check --workspace
+    ↳ Checking codex-tui
+
+Monitor jobs and watchers
+
+  • gh run watch 42
+    ↳ check in progress

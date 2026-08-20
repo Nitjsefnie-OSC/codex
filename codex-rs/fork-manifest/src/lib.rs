@@ -94,6 +94,8 @@ pub enum CapabilityKind {
     HookField,
     /// A CLI subcommand or flag.
     Cli,
+    /// A TUI capability that does not require a configuration setting.
+    Tui,
     /// A TUI presentation setting the fork adds to `config.toml`.
     ///
     /// Distinct from [`CapabilityKind::Cli`] because it changes nothing a model
@@ -251,6 +253,14 @@ mod tests {
         assert!(manifest.has_capability("tool.whoami"));
         assert!(manifest.has_capability("tool.monitor"));
         assert!(manifest.has_capability("hook.stop_background_state"));
+
+        let ps_agent_fleet = manifest
+            .capability("tui.ps_agent_fleet")
+            .unwrap_or_else(|| panic!("/ps agent fleet capability should be declared"));
+        assert_eq!(ps_agent_fleet.kind, CapabilityKind::Tui);
+        assert_eq!(ps_agent_fleet.name, "/ps agent fleet");
+        assert_eq!(ps_agent_fleet.config_key, None);
+        assert!(ps_agent_fleet.default_enabled);
 
         let exec_agent_role = manifest
             .capability("cli.exec_agent_role")

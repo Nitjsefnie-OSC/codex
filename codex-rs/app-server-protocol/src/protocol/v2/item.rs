@@ -1099,6 +1099,7 @@ v2_enum_from_core! {
         Agent,
         UserShell,
         UnifiedExecStartup,
+        MonitorStartup,
         UnifiedExecInteraction,
     }
 }
