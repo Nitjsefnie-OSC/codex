@@ -264,7 +264,9 @@ impl ExecCell {
     fn is_groupable_source(source: ExecCommandSource) -> bool {
         matches!(
             source,
-            ExecCommandSource::Agent | ExecCommandSource::UnifiedExecStartup
+            ExecCommandSource::Agent
+                | ExecCommandSource::UnifiedExecStartup
+                | ExecCommandSource::MonitorStartup
         )
     }
 }

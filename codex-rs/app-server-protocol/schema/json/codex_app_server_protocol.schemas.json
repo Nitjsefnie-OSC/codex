@@ -8321,6 +8321,7 @@
           "agent",
           "userShell",
           "unifiedExecStartup",
+          "monitorStartup",
           "unifiedExecInteraction"
         ],
         "type": "string"

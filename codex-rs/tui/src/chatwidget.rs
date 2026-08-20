@@ -341,12 +341,14 @@ pub(crate) use self::connectors::ConnectorScopeGeneration;
 use self::connectors::ConnectorsState;
 mod exec_state;
 use self::exec_state::RunningCommand;
+use self::exec_state::UnifiedExecProcessKind;
 use self::exec_state::UnifiedExecProcessSummary;
 use self::exec_state::UnifiedExecWaitState;
 use self::exec_state::UnifiedExecWaitStreak;
 use self::exec_state::command_execution_command_and_parsed;
 use self::exec_state::is_standard_tool_call;
 use self::exec_state::is_unified_exec_source;
+use self::exec_state::unified_exec_process_kind;
 mod goal_status;
 use self::goal_status::GoalStatusState;
 #[cfg(test)]
@@ -1467,16 +1469,24 @@ impl ChatWidget {
         ));
     }
 
-    pub(crate) fn add_ps_output(&mut self) {
-        let processes = self
-            .unified_exec_processes
-            .iter()
-            .map(|process| history_cell::UnifiedExecProcessDetails {
+    pub(crate) fn add_ps_output(&mut self, native_agents: Vec<history_cell::NativeAgentDetails>) {
+        let mut exec_command_processes = Vec::new();
+        let mut monitor_processes = Vec::new();
+        for process in &self.unified_exec_processes {
+            let details = history_cell::UnifiedExecProcessDetails {
                 command_display: process.command_display.clone(),
                 recent_chunks: process.recent_chunks.clone(),
-            })
-            .collect();
-        self.add_to_history(history_cell::new_unified_exec_processes_output(processes));
+            };
+            match process.kind {
+                UnifiedExecProcessKind::ExecCommand => exec_command_processes.push(details),
+                UnifiedExecProcessKind::Monitor => monitor_processes.push(details),
+            }
+        }
+        self.add_to_history(history_cell::new_process_list_output(
+            native_agents,
+            exec_command_processes,
+            monitor_processes,
+        ));
     }
 
     fn clean_background_terminals(&mut self) {

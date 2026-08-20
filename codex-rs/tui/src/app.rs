@@ -226,6 +226,7 @@ mod pending_interactive_replay;
 mod pets;
 mod platform_actions;
 mod plugin_mentions;
+mod process_list;
 mod replay_filter;
 mod resize_reflow;
 mod safety_buffering;

@@ -107,8 +107,10 @@ fn tracker_update_for_known_delta<'a>(
 }
 
 async fn emit_exec_command_begin(ctx: ToolEventCtx<'_>, exec_input: &ExecCommandInput<'_>) {
-    if exec_input.source == ExecCommandSource::UnifiedExecStartup
-        && let Some(attribution) = exec_input.plugin_attribution
+    if matches!(
+        exec_input.source,
+        ExecCommandSource::UnifiedExecStartup | ExecCommandSource::MonitorStartup
+    ) && let Some(attribution) = exec_input.plugin_attribution
         && let Some(operation) = recognize_artifact_operation(Some(attribution), exec_input.command)
     {
         let metric_tags = [

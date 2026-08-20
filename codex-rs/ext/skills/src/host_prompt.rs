@@ -143,7 +143,6 @@ mod tests {
             name: "large-skill".to_string(),
             description: "A large skill".to_string(),
             short_description: None,
-            model: None,
             interface: None,
             dependencies: None,
             policy: None,

@@ -3272,6 +3272,7 @@ pub enum ExecCommandSource {
     Agent,
     UserShell,
     UnifiedExecStartup,
+    MonitorStartup,
     UnifiedExecInteraction,
 }
 

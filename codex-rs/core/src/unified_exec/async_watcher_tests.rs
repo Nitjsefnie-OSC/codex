@@ -14,6 +14,7 @@ use codex_protocol::items::CommandExecutionStatus;
 use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ExecCommandSource;
 use codex_sandboxing::SandboxType;
 
 use pretty_assertions::assert_eq;
@@ -167,6 +168,7 @@ async fn exit_watcher_waits_for_late_network_denial_before_classifying_end() -> 
         context.call_id,
         vec!["proof".to_string()],
         cwd,
+        ExecCommandSource::UnifiedExecStartup,
         /*process_id*/ 123,
         /*plugin_attribution*/ None,
         transcript,
