@@ -3113,6 +3113,7 @@ fn command_execution_tool_name(source: CommandExecutionSource) -> &'static str {
     match source {
         CommandExecutionSource::UnifiedExecStartup
         | CommandExecutionSource::UnifiedExecInteraction => "unified_exec",
+        CommandExecutionSource::MonitorStartup => "monitor",
         CommandExecutionSource::UserShell => "user_shell",
         CommandExecutionSource::Agent => "shell",
     }

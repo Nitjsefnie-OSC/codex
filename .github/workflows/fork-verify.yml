@@ -225,9 +225,8 @@ jobs:
           run_exact cargo test -p codex-core --lib \
             thread_manager::tests::overlapping_shutdown_calls_are_serialized \
             -- --exact --nocapture
-          run_exact cargo test -p codex-core --lib \
-            tools::handlers::multi_agents::tests::multi_agent_v2_spawn_rejects_oversized_agent_path \
-            -- --exact --nocapture
+          # Upstream ignores the handler-level oversized-path test on Linux until its sandbox
+          # helpers work inside test microVMs. Keep the platform-independent validation active.
           run_exact cargo test -p codex-protocol --lib \
             agent_path::tests::invalid_names_and_paths_are_rejected \
             -- --exact --nocapture
@@ -285,6 +284,10 @@ jobs:
           workspaces: codex-rs
           shared-key: check
 
+      - name: Rust formatting
+        working-directory: codex-rs
+        run: cargo fmt -- --config imports_granularity=Item --check
+
       - name: cargo check --workspace
         working-directory: codex-rs
         run: |
@@ -293,6 +296,40 @@ jobs:
             --exclude codex-code-mode-runtime \
             --exclude codex-code-mode-host
           df -h /
+
+      - name: ps fleet presentation regression
+        working-directory: codex-rs
+        env:
+          INSTA_UPDATE: new
+        run: |
+          set +e
+          failures=0
+          for spec in \
+            "codex-tui|history_cell::tests::ps_output_empty_snapshot" \
+            "codex-tui|history_cell::tests::ps_output_empty_fleet_keeps_distinct_sections" \
+            "codex-tui|history_cell::tests::ps_output_mixed_fleet_snapshot" \
+            "codex-tui|history_cell::tests::ps_output_multiline_snapshot" \
+            "codex-tui|history_cell::tests::ps_output_long_command_snapshot" \
+            "codex-tui|history_cell::tests::ps_output_halfwidth_sound_marks_snapshot" \
+            "codex-tui|history_cell::tests::ps_output_many_sessions_snapshot" \
+            "codex-tui|history_cell::tests::ps_output_chunk_leading_whitespace_snapshot" \
+            "codex-tui|chatwidget::tests::exec_flow::ps_routes_exec_command_and_monitor_processes_to_distinct_sections" \
+            "codex-tui|chatwidget::tests::slash_commands::slash_ps_requests_app_owned_process_list" \
+            "codex-tui|app::tests::process_list_includes_only_live_path_backed_native_agents" \
+            "codex-core|unified_exec::head_tail_buffer::tests::draining_resets_state_and_push_buffer_preserves_omissions"
+          do
+            package="${spec%%|*}"
+            test_name="${spec#*|}"
+            output=$(cargo test -p "$package" --lib "$test_name" -- \
+              --exact --nocapture --test-threads=1 2>&1)
+            status=$?
+            printf '%s\n' "$output"
+            if [ "$status" -ne 0 ] \
+              || ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+              failures=$((failures + 1))
+            fi
+          done
+          exit "$failures"
 
       - name: fork manifest tests
         # Cheap and load-bearing: the manifest is what tells an installer which
@@ -429,9 +466,9 @@ jobs:
           exit "$failures"
 
       - name: upload pending TUI presentation snapshots
-        # The snapshot-bearing presentation tests above have no locally accepted
-        # `.snap`: the first red run writes the authoritative `.snap.new` files,
-        # and this artifact is where they come from for review and acceptance.
+        # Snapshot deltas are generated only on the runner: a red run writes the
+        # authoritative `.snap.new` files, and this artifact is where they come
+        # from for review and acceptance.
         # Tolerant once every snapshot has been accepted and none are pending.
         if: always()
         uses: actions/upload-artifact@v4
@@ -474,6 +511,22 @@ jobs:
         with:
           name: config-schema
           path: codex-rs/core/config.schema.json
+          if-no-files-found: error
+
+      - name: app-server schema freshness
+        if: always()
+        working-directory: codex-rs
+        run: |
+          python3 app-server-protocol/scripts/write_schema_fixtures.py
+          python3 app-server-protocol/scripts/write_schema_fixtures.py --experimental
+          git diff --exit-code -- app-server-protocol/schema
+
+      - name: upload regenerated app-server schema
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-server-schema
+          path: codex-rs/app-server-protocol/schema
           if-no-files-found: error
 
       - name: hook contract tests

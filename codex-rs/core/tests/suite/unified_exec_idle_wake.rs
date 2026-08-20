@@ -4,6 +4,8 @@ use anyhow::Context;
 use anyhow::Result;
 use codex_core::compact::SUMMARIZATION_PROMPT;
 use codex_features::Feature;
+use codex_file_system::ReadFileOptions;
+use codex_file_system::WriteFileOptions;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use core_test_support::TestTargetOs;
@@ -232,7 +234,12 @@ async fn yielded_exec_completion_after_compaction_wakes_idle_session_once_and_re
     .await;
 
     test.fs()
-        .write_file(&completion_gate, b"ready".to_vec(), /*sandbox*/ None)
+        .write_file(
+            &completion_gate,
+            b"ready".to_vec(),
+            WriteFileOptions::default(),
+            /*sandbox*/ None,
+        )
         .await?;
 
     let completion_requests = tokio::time::timeout(Duration::from_secs(10), async {
@@ -428,7 +435,12 @@ async fn yielded_exec_completion_during_compaction_wakes_successor_once() -> Res
     let completion_admission = completion_admitted.notified();
     tokio::pin!(completion_admission);
     test.fs()
-        .write_file(&completion_gate, b"ready".to_vec(), /*sandbox*/ None)
+        .write_file(
+            &completion_gate,
+            b"ready".to_vec(),
+            WriteFileOptions::default(),
+            /*sandbox*/ None,
+        )
         .await?;
     timeout(Duration::from_secs(30), &mut completion_admission)
         .await
@@ -703,7 +715,12 @@ async fn monitor_notification_budget_recovers_over_time_and_resets_after_compact
         .await
         .with_context(|| "monitor follow-up response stage did not complete")?;
     test.fs()
-        .write_file(&start_gate, b"ready".to_vec(), /*sandbox*/ None)
+        .write_file(
+            &start_gate,
+            b"ready".to_vec(),
+            WriteFileOptions::default(),
+            /*sandbox*/ None,
+        )
         .await?;
 
     for (index, (ready_gate, ack_gate)) in
@@ -714,7 +731,11 @@ async fn monitor_notification_budget_recovers_over_time_and_resets_after_compact
             loop {
                 if test
                     .fs()
-                    .read_file(ready_gate, /*sandbox*/ None)
+                    .read_file(
+                        ready_gate,
+                        ReadFileOptions::default(),
+                        /*sandbox*/ None,
+                    )
                     .await
                     .is_ok()
                 {
@@ -754,7 +775,12 @@ async fn monitor_notification_budget_recovers_over_time_and_resets_after_compact
         })
         .await;
         test.fs()
-            .write_file(ack_gate, b"ready".to_vec(), /*sandbox*/ None)
+            .write_file(
+                ack_gate,
+                b"ready".to_vec(),
+                WriteFileOptions::default(),
+                /*sandbox*/ None,
+            )
             .await?;
     }
 
@@ -762,7 +788,11 @@ async fn monitor_notification_budget_recovers_over_time_and_resets_after_compact
         loop {
             if test
                 .fs()
-                .read_file(&before_compaction_gate, /*sandbox*/ None)
+                .read_file(
+                    &before_compaction_gate,
+                    ReadFileOptions::default(),
+                    /*sandbox*/ None,
+                )
                 .await
                 .is_ok()
             {
@@ -818,13 +848,22 @@ async fn monitor_notification_budget_recovers_over_time_and_resets_after_compact
 
     tokio::time::sleep(Duration::from_secs(10)).await;
     test.fs()
-        .write_file(&refill_gate, b"ready".to_vec(), /*sandbox*/ None)
+        .write_file(
+            &refill_gate,
+            b"ready".to_vec(),
+            WriteFileOptions::default(),
+            /*sandbox*/ None,
+        )
         .await?;
     timeout(Duration::from_secs(30), async {
         loop {
             if test
                 .fs()
-                .read_file(&refill_output_gate, /*sandbox*/ None)
+                .read_file(
+                    &refill_output_gate,
+                    ReadFileOptions::default(),
+                    /*sandbox*/ None,
+                )
                 .await
                 .is_ok()
             {
@@ -898,6 +937,7 @@ async fn monitor_notification_budget_recovers_over_time_and_resets_after_compact
         .write_file(
             &during_compaction_gate,
             b"ready".to_vec(),
+            WriteFileOptions::default(),
             /*sandbox*/ None,
         )
         .await?;
@@ -1077,7 +1117,12 @@ text(JSON.stringify(result));"#,
 
     tokio::time::sleep(Duration::from_secs(15)).await;
     test.fs()
-        .write_file(&completion_gate, b"ready".to_vec(), /*sandbox*/ None)
+        .write_file(
+            &completion_gate,
+            b"ready".to_vec(),
+            WriteFileOptions::default(),
+            /*sandbox*/ None,
+        )
         .await?;
 
     let completion_requests = tokio::time::timeout(Duration::from_secs(10), async {

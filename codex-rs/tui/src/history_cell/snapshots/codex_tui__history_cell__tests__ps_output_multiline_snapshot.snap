@@ -1,13 +1,22 @@
 ---
-source: tui/src/history_cell.rs
+source: tui/src/history_cell/tests.rs
+assertion_line: 784
 expression: rendered
 ---
 /ps
 
-Background terminals
+Native agents
+
+  • No native agents running.
+
+exec_command terminals
 
   • echo hello [...]
     ↳ hello
       done
   • rg "foo" src
     ↳ src/main.rs:12:foo
+
+Monitor jobs and watchers
+
+  • No monitor jobs or watchers running.
