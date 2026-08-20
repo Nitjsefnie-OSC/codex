@@ -151,7 +151,10 @@ impl ChatWidget {
                 ..
             } => self.on_command_execution_started(item),
             item @ ThreadItem::CommandExecution {
-                source: ExecCommandSource::Agent | ExecCommandSource::UnifiedExecStartup,
+                source:
+                    ExecCommandSource::Agent
+                    | ExecCommandSource::UnifiedExecStartup
+                    | ExecCommandSource::MonitorStartup,
                 status:
                     codex_app_server_protocol::CommandExecutionStatus::Completed
                     | codex_app_server_protocol::CommandExecutionStatus::Failed,

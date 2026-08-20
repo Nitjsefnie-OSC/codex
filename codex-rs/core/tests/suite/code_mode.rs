@@ -281,6 +281,29 @@ fn run_code_mode_turn_with_builder<'a>(
     })
 }
 
+fn run_code_mode_failure_test(
+    test_name: &'static str,
+    test: impl FnOnce() -> BoxFuture<'static, Result<()>> + Send + 'static,
+) -> Result<()> {
+    const TEST_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
+
+    let handle = std::thread::Builder::new()
+        .name(test_name.to_string())
+        .stack_size(TEST_STACK_SIZE_BYTES)
+        .spawn(move || -> Result<()> {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()?;
+            runtime.block_on(test())
+        })?;
+
+    match handle.join() {
+        Ok(result) => result,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
 async fn run_unavailable_code_mode_turn(
     server: &MockServer,
     test: &TestCodex,
@@ -356,8 +379,17 @@ async fn missing_process_host_falls_back_to_direct_tools_and_warns_once() -> Res
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn missing_process_host_keeps_code_mode_only_and_fails_closed() -> Result<()> {
+// Upstream growth can make these failure-path futures overflow libtest's default thread stack
+// before the Tokio runtime runs their assertions.
+#[test]
+fn missing_process_host_keeps_code_mode_only_and_fails_closed() -> Result<()> {
+    run_code_mode_failure_test(
+        "missing_process_host_keeps_code_mode_only_and_fails_closed",
+        || Box::pin(missing_process_host_keeps_code_mode_only_and_fails_closed_impl()),
+    )
+}
+
+async fn missing_process_host_keeps_code_mode_only_and_fails_closed_impl() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -404,8 +436,15 @@ async fn missing_process_host_keeps_code_mode_only_and_fails_closed() -> Result<
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn missing_process_host_fails_closed_when_direct_fallback_is_disabled() -> Result<()> {
+#[test]
+fn missing_process_host_fails_closed_when_direct_fallback_is_disabled() -> Result<()> {
+    run_code_mode_failure_test(
+        "missing_process_host_fails_closed_when_direct_fallback_is_disabled",
+        || Box::pin(missing_process_host_fails_closed_when_direct_fallback_is_disabled_impl()),
+    )
+}
+
+async fn missing_process_host_fails_closed_when_direct_fallback_is_disabled_impl() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -447,8 +486,15 @@ async fn missing_process_host_fails_closed_when_direct_fallback_is_disabled() ->
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn disabled_process_host_with_fallback_disabled_attempts_the_host() -> Result<()> {
+#[test]
+fn disabled_process_host_with_fallback_disabled_attempts_the_host() -> Result<()> {
+    run_code_mode_failure_test(
+        "disabled_process_host_with_fallback_disabled_attempts_the_host",
+        || Box::pin(disabled_process_host_with_fallback_disabled_attempts_the_host_impl()),
+    )
+}
+
+async fn disabled_process_host_with_fallback_disabled_attempts_the_host_impl() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;

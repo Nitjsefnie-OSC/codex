@@ -253,7 +253,9 @@ impl ExecCell {
             .take_while(|call| {
                 matches!(
                     call.source,
-                    ExecCommandSource::Agent | ExecCommandSource::UnifiedExecStartup
+                    ExecCommandSource::Agent
+                        | ExecCommandSource::UnifiedExecStartup
+                        | ExecCommandSource::MonitorStartup
                 ) && call.duration.is_some()
                     && call
                         .output

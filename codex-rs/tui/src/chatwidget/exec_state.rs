@@ -14,8 +14,15 @@ pub(super) struct RunningCommand {
 pub(super) struct UnifiedExecProcessSummary {
     pub(super) key: String,
     pub(super) call_id: String,
+    pub(super) kind: UnifiedExecProcessKind,
     pub(super) command_display: String,
     pub(super) recent_chunks: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum UnifiedExecProcessKind {
+    ExecCommand,
+    Monitor,
 }
 
 pub(super) struct UnifiedExecWaitState {
@@ -57,8 +64,22 @@ impl UnifiedExecWaitStreak {
 pub(super) fn is_unified_exec_source(source: ExecCommandSource) -> bool {
     matches!(
         source,
-        ExecCommandSource::UnifiedExecStartup | ExecCommandSource::UnifiedExecInteraction
+        ExecCommandSource::UnifiedExecStartup
+            | ExecCommandSource::MonitorStartup
+            | ExecCommandSource::UnifiedExecInteraction
     )
+}
+
+pub(super) fn unified_exec_process_kind(
+    source: ExecCommandSource,
+) -> Option<UnifiedExecProcessKind> {
+    match source {
+        ExecCommandSource::UnifiedExecStartup => Some(UnifiedExecProcessKind::ExecCommand),
+        ExecCommandSource::MonitorStartup => Some(UnifiedExecProcessKind::Monitor),
+        ExecCommandSource::Agent
+        | ExecCommandSource::UserShell
+        | ExecCommandSource::UnifiedExecInteraction => None,
+    }
 }
 
 pub(super) fn is_standard_tool_call(parsed_cmd: &[ParsedCommand]) -> bool {
