@@ -1878,6 +1878,43 @@ async fn open_agent_picker_preserves_cached_metadata_for_replay_threads() -> Res
 }
 
 #[tokio::test]
+async fn process_list_includes_only_live_path_backed_native_agents() {
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    let running_thread_id = ThreadId::new();
+    let stopped_thread_id = ThreadId::new();
+
+    app.agent_navigation
+        .record_sub_agent_activity(SubAgentActivityDisplay {
+            thread_id: running_thread_id,
+            agent_path: "/root/research".to_string(),
+            is_running_hint: true,
+        });
+    app.agent_navigation.upsert(
+        running_thread_id,
+        Some("Ada".to_string()),
+        Some("explorer".to_string()),
+        /*is_closed*/ false,
+    );
+    app.agent_navigation
+        .record_sub_agent_activity(SubAgentActivityDisplay {
+            thread_id: stopped_thread_id,
+            agent_path: "/root/finished".to_string(),
+            is_running_hint: false,
+        });
+
+    app.add_process_list_output();
+
+    let event = app_event_rx.try_recv().expect("process list history cell");
+    let cell = match event {
+        AppEvent::InsertHistoryCell(cell) => cell,
+        other => panic!("expected process list history cell, got {other:?}"),
+    };
+    let rendered = lines_to_single_string(&cell.display_lines(/*width*/ 80));
+    assert!(rendered.contains("/root/research — Ada [explorer] — running"));
+    assert!(!rendered.contains("/root/finished"));
+}
+
+#[tokio::test]
 async fn open_agent_picker_preserves_running_hints_until_observed_completion() -> Result<()> {
     let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
     let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(

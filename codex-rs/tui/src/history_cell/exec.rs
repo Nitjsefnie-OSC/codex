@@ -104,14 +104,30 @@ pub(crate) fn new_unified_exec_interaction(
 }
 
 #[derive(Debug)]
-struct UnifiedExecProcessesCell {
-    processes: Vec<UnifiedExecProcessDetails>,
+struct ProcessListCell {
+    native_agents: Vec<NativeAgentDetails>,
+    exec_command_processes: Vec<UnifiedExecProcessDetails>,
+    monitor_processes: Vec<UnifiedExecProcessDetails>,
 }
 
-impl UnifiedExecProcessesCell {
-    fn new(processes: Vec<UnifiedExecProcessDetails>) -> Self {
-        Self { processes }
+impl ProcessListCell {
+    fn new(
+        native_agents: Vec<NativeAgentDetails>,
+        exec_command_processes: Vec<UnifiedExecProcessDetails>,
+        monitor_processes: Vec<UnifiedExecProcessDetails>,
+    ) -> Self {
+        Self {
+            native_agents,
+            exec_command_processes,
+            monitor_processes,
+        }
     }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NativeAgentDetails {
+    pub(crate) agent_path: String,
+    pub(crate) label: String,
 }
 
 #[derive(Debug, Clone)]
@@ -120,21 +136,21 @@ pub(crate) struct UnifiedExecProcessDetails {
     pub(crate) recent_chunks: Vec<String>,
 }
 
-impl HistoryCell for UnifiedExecProcessesCell {
-    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        if width == 0 {
-            return Vec::new();
-        }
-
-        let wrap_width = width as usize;
+impl ProcessListCell {
+    fn append_process_section(
+        out: &mut Vec<Line<'static>>,
+        title: &'static str,
+        empty_message: &'static str,
+        processes: &[UnifiedExecProcessDetails],
+        wrap_width: usize,
+    ) {
         let max_processes = 16usize;
-        let mut out: Vec<Line<'static>> = Vec::new();
-        out.push(vec!["Background terminals".bold()].into());
+        out.push(vec![title.bold()].into());
         out.push("".into());
 
-        if self.processes.is_empty() {
-            out.push("  • No background terminals running.".italic().into());
-            return out;
+        if processes.is_empty() {
+            out.push(format!("  • {empty_message}").italic().into());
+            return;
         }
 
         let prefix = "  • ";
@@ -142,7 +158,7 @@ impl HistoryCell for UnifiedExecProcessesCell {
         let truncation_suffix = " [...]";
         let truncation_suffix_width = display_width(truncation_suffix);
         let mut shown = 0usize;
-        for process in &self.processes {
+        for process in processes {
             if shown >= max_processes {
                 break;
             }
@@ -210,7 +226,7 @@ impl HistoryCell for UnifiedExecProcessesCell {
             shown += 1;
         }
 
-        let remaining = self.processes.len().saturating_sub(shown);
+        let remaining = processes.len().saturating_sub(shown);
         if remaining > 0 {
             let more_text = format!("... and {remaining} more running");
             if wrap_width <= prefix_width {
@@ -221,6 +237,61 @@ impl HistoryCell for UnifiedExecProcessesCell {
                 out.push(vec![prefix.dim(), truncated.dim()].into());
             }
         }
+    }
+}
+
+impl HistoryCell for ProcessListCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        if width == 0 {
+            return Vec::new();
+        }
+
+        let wrap_width = width as usize;
+        let max_agents = 16usize;
+        let prefix = "  • ";
+        let prefix_width = display_width(prefix);
+        let mut out: Vec<Line<'static>> = Vec::new();
+
+        out.push(vec!["Native agents".bold()].into());
+        out.push("".into());
+        if self.native_agents.is_empty() {
+            out.push("  • No native agents running.".italic().into());
+        } else {
+            for agent in self.native_agents.iter().take(max_agents) {
+                if wrap_width <= prefix_width {
+                    out.push(Line::from(prefix.dim()));
+                    continue;
+                }
+                let row = format!("{} — {} — running", agent.agent_path, agent.label);
+                let budget = wrap_width.saturating_sub(prefix_width);
+                let (truncated, _, _) = take_prefix_by_width(&row, budget);
+                out.push(vec![prefix.dim(), truncated.cyan()].into());
+            }
+            let remaining = self.native_agents.len().saturating_sub(max_agents);
+            if remaining > 0 {
+                let more_text = format!("... and {remaining} more running");
+                let budget = wrap_width.saturating_sub(prefix_width);
+                let (truncated, _, _) = take_prefix_by_width(&more_text, budget);
+                out.push(vec![prefix.dim(), truncated.dim()].into());
+            }
+        }
+
+        out.push("".into());
+        Self::append_process_section(
+            &mut out,
+            "exec_command terminals",
+            "No exec_command terminals running.",
+            &self.exec_command_processes,
+            wrap_width,
+        );
+        out.push("".into());
+        Self::append_process_section(
+            &mut out,
+            "Monitor jobs and watchers",
+            "No monitor jobs or watchers running.",
+            &self.monitor_processes,
+            wrap_width,
+        );
 
         out
     }
@@ -234,10 +305,12 @@ impl HistoryCell for UnifiedExecProcessesCell {
     }
 }
 
-pub(crate) fn new_unified_exec_processes_output(
-    processes: Vec<UnifiedExecProcessDetails>,
+pub(crate) fn new_process_list_output(
+    native_agents: Vec<NativeAgentDetails>,
+    exec_command_processes: Vec<UnifiedExecProcessDetails>,
+    monitor_processes: Vec<UnifiedExecProcessDetails>,
 ) -> CompositeHistoryCell {
     let command = PlainHistoryCell::new(vec!["/ps".magenta().into()]);
-    let summary = UnifiedExecProcessesCell::new(processes);
+    let summary = ProcessListCell::new(native_agents, exec_command_processes, monitor_processes);
     CompositeHistoryCell::new(vec![Box::new(command), Box::new(summary)])
 }

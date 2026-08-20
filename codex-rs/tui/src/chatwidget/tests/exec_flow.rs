@@ -1115,6 +1115,7 @@ async fn unified_exec_wait_status_header_updates_on_late_command_display() {
     chat.unified_exec_processes.push(UnifiedExecProcessSummary {
         key: "proc-1".to_string(),
         call_id: "call-1".to_string(),
+        kind: UnifiedExecProcessKind::ExecCommand,
         command_display: "sleep 5".to_string(),
         recent_chunks: Vec::new(),
     });
@@ -1740,7 +1741,7 @@ async fn interrupt_preserves_unified_exec_processes() {
 
     assert_eq!(chat.unified_exec_processes.len(), 2);
 
-    chat.add_ps_output();
+    chat.add_ps_output(Vec::new());
     let cells = drain_insert_history(&mut rx);
     let combined = cells
         .iter()
@@ -1748,7 +1749,7 @@ async fn interrupt_preserves_unified_exec_processes() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        combined.contains("Background terminals"),
+        combined.contains("exec_command terminals"),
         "expected /ps to remain available after interrupt; got {combined:?}"
     );
     assert!(
@@ -1757,6 +1758,38 @@ async fn interrupt_preserves_unified_exec_processes() {
     );
 
     let _ = drain_insert_history(&mut rx);
+}
+
+#[tokio::test]
+async fn ps_routes_exec_command_and_monitor_processes_to_distinct_sections() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    begin_unified_exec_startup(&mut chat, "exec-call", "exec-process", "sleep exec-command");
+    begin_exec_with_source(
+        &mut chat,
+        "monitor-call",
+        "sleep monitor-job",
+        ExecCommandSource::MonitorStartup,
+    );
+    let _ = drain_insert_history(&mut rx);
+
+    chat.add_ps_output(Vec::new());
+
+    let combined = drain_insert_history(&mut rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let exec_start = combined
+        .find("exec_command terminals")
+        .expect("exec_command section");
+    let monitor_start = combined
+        .find("Monitor jobs and watchers")
+        .expect("monitor section");
+    assert!(exec_start < monitor_start);
+    assert!(combined[exec_start..monitor_start].contains("sleep exec-command"));
+    assert!(!combined[exec_start..monitor_start].contains("sleep monitor-job"));
+    assert!(combined[monitor_start..].contains("sleep monitor-job"));
 }
 
 #[tokio::test]
@@ -1793,7 +1826,7 @@ async fn turn_complete_keeps_unified_exec_processes() {
 
     assert_eq!(chat.unified_exec_processes.len(), 2);
 
-    chat.add_ps_output();
+    chat.add_ps_output(Vec::new());
     let cells = drain_insert_history(&mut rx);
     let combined = cells
         .iter()
@@ -1801,7 +1834,7 @@ async fn turn_complete_keeps_unified_exec_processes() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        combined.contains("Background terminals"),
+        combined.contains("exec_command terminals"),
         "expected /ps to remain available after turn complete; got {combined:?}"
     );
     assert!(

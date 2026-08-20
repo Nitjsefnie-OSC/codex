@@ -2727,6 +2727,15 @@ async fn slash_resume_opens_picker_while_mcp_startup_is_running() {
 }
 
 #[tokio::test]
+async fn slash_ps_requests_app_owned_process_list() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.dispatch_command(SlashCommand::Ps);
+
+    assert_matches!(rx.try_recv(), Ok(AppEvent::OpenProcessList));
+}
+
+#[tokio::test]
 async fn slash_import_opens_claude_code_import_picker() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
@@ -3069,7 +3078,12 @@ async fn slash_cd_rejects_pending_input_and_unsupported_session_ownership() {
             "side" => chat.set_side_conversation_active(/*active*/ true),
             "owned" => chat.set_parent_owned_thread(),
             "ephemeral" => chat.config.ephemeral = true,
-            "exec" => chat.track_unified_exec_process_begin("call", Some("process"), "sleep"),
+            "exec" => chat.track_unified_exec_process_begin(
+                "call",
+                Some("process"),
+                "sleep",
+                UnifiedExecProcessKind::ExecCommand,
+            ),
             "mcp" => {
                 let cell =
                     history_cell::new_mcp_inventory_loading(/*animations_enabled*/ false);

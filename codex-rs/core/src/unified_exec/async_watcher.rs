@@ -189,6 +189,7 @@ pub(crate) fn spawn_exit_watcher(
     call_id: String,
     command: Vec<String>,
     cwd: PathUri,
+    source: ExecCommandSource,
     process_id: i32,
     plugin_attribution: Option<PluginCommandAttribution>,
     transcript: Arc<Mutex<HeadTailBuffer>>,
@@ -224,6 +225,7 @@ pub(crate) fn spawn_exit_watcher(
                 call_id,
                 command,
                 cwd,
+                source,
                 Some(process_id.to_string()),
                 plugin_attribution,
                 transcript,
@@ -249,6 +251,7 @@ pub(crate) fn spawn_exit_watcher(
                 call_id,
                 command,
                 cwd,
+                source,
                 Some(process_id.to_string()),
                 plugin_attribution,
                 transcript,
@@ -380,6 +383,7 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
     call_id: String,
     command: Vec<String>,
     cwd: PathUri,
+    source: ExecCommandSource,
     process_id: Option<String>,
     plugin_attribution: Option<PluginCommandAttribution>,
     transcript: Arc<Mutex<HeadTailBuffer>>,
@@ -402,13 +406,7 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
         &call_id,
         /*turn_diff_tracker*/ None,
     );
-    let emitter = ToolEmitter::unified_exec(
-        &command,
-        cwd,
-        ExecCommandSource::UnifiedExecStartup,
-        process_id,
-        plugin_attribution,
-    );
+    let emitter = ToolEmitter::unified_exec(&command, cwd, source, process_id, plugin_attribution);
     emitter
         .emit(
             event_ctx,
@@ -427,6 +425,7 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
     call_id: String,
     command: Vec<String>,
     cwd: PathUri,
+    source: ExecCommandSource,
     process_id: Option<String>,
     plugin_attribution: Option<PluginCommandAttribution>,
     transcript: Arc<Mutex<HeadTailBuffer>>,
@@ -458,13 +457,7 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
         &call_id,
         /*turn_diff_tracker*/ None,
     );
-    let emitter = ToolEmitter::unified_exec(
-        &command,
-        cwd,
-        ExecCommandSource::UnifiedExecStartup,
-        process_id,
-        plugin_attribution,
-    );
+    let emitter = ToolEmitter::unified_exec(&command, cwd, source, process_id, plugin_attribution);
     emitter
         .emit(
             event_ctx,
