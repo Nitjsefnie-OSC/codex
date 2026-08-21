@@ -60,7 +60,11 @@ async fn handle_spawn_agent(
         .map(str::trim)
         .filter(|role| !role.is_empty());
     let inherited_role_name = turn.session_source.get_agent_role();
-    let child_role_name = role_name.or(inherited_role_name.as_deref());
+    let child_role_name = if args.fork_context {
+        inherited_role_name.as_deref()
+    } else {
+        role_name
+    };
     let input_items = parse_collab_input(args.message, args.items)?;
     let prompt = render_input_preview(&input_items);
     let session_source = turn.session_source.clone();

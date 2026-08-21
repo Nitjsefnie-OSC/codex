@@ -397,16 +397,26 @@ jobs:
             tools::handlers::multi_agents::tests::identity_tests::spawn_agent_explicit_model_preserves_role_effort_default \
             tools::handlers::multi_agents::tests::identity_tests::spawn_agent_explicit_effort_preserves_role_model_default \
             tools::handlers::multi_agents::tests::identity_tests::spawn_agent_role_overrides_invalid_configured_identity_defaults \
+            tools::handlers::multi_agents::tests::identity_tests::spawn_agent_role_model_uses_selected_model_default_effort \
+            tools::handlers::multi_agents::tests::identity_tests::spawn_agent_uncatalogued_role_model_preserves_parent_effort \
             tools::handlers::multi_agents::tests::identity_tests::spawn_agent_rejects_invalid_final_model_effort_pair \
             tools::handlers::multi_agents::tests::identity_tests::multi_agent_v2_spawn_explicit_model_and_effort_override_role_defaults \
             tools::handlers::multi_agents::tests::identity_tests::multi_agent_v2_spawn_explicit_model_preserves_role_effort_default \
             tools::handlers::multi_agents::tests::identity_tests::multi_agent_v2_spawn_explicit_effort_preserves_role_model_default \
             tools::handlers::multi_agents::tests::identity_tests::multi_agent_v2_role_overrides_invalid_configured_identity_defaults \
+            tools::handlers::multi_agents::tests::identity_tests::multi_agent_v2_role_model_uses_selected_model_default_effort \
+            tools::handlers::multi_agents::tests::identity_tests::multi_agent_v2_uncatalogued_role_model_preserves_parent_effort \
             tools::handlers::multi_agents::tests::identity_tests::multi_agent_v2_rejects_invalid_final_model_effort_pair \
+            tools::handlers::multi_agents::tests::identity_tests::spawn_agent_rejection_does_not_emit_in_progress_item \
             tools::handlers::multi_agents::tests::identity_tests::spawn_agent_full_history_rejects_identity_overrides \
             tools::handlers::multi_agents::tests::identity_tests::multi_agent_v2_full_history_rejects_identity_overrides \
+            tools::handlers::multi_agents::tests::identity_tests::spawn_agent_fresh_does_not_inherit_parent_role_metadata \
             tools::handlers::multi_agents::tests::identity_tests::spawn_agent_full_history_inherits_parent_identity \
-            tools::handlers::multi_agents::tests::identity_tests::multi_agent_v2_full_history_inherits_parent_identity
+            tools::handlers::multi_agents::tests::identity_tests::spawn_agent_full_history_inherits_parent_role_metadata \
+            tools::handlers::multi_agents::tests::identity_tests::multi_agent_v2_fresh_does_not_inherit_parent_role_metadata \
+            tools::handlers::multi_agents::tests::identity_tests::multi_agent_v2_full_history_inherits_parent_identity \
+            tools::handlers::multi_agents::tests::identity_tests::multi_agent_v2_full_history_inherits_parent_role_metadata \
+            tools::handlers::multi_agents::tests::multi_agent_v2_spawn_partial_fork_turns_allows_agent_type_override
           do
             output=$(cargo test -p codex-core --lib "$test_name" -- --exact --nocapture 2>&1)
             result=$?

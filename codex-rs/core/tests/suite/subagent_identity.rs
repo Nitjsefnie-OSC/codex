@@ -1,7 +1,5 @@
 use super::*;
 use core_test_support::responses::mount_sse_once;
-use pretty_assertions::assert_eq;
-use test_case::test_case;
 
 #[test_case(
     Some(REQUESTED_MODEL),

@@ -889,6 +889,7 @@ async fn multi_agent_v2_spawn_partial_fork_turns_allows_agent_type_override() {
     assert_eq!(snapshot.model, "gpt-5-role-override");
     assert_eq!(snapshot.model_provider_id, parent_provider_id);
     assert_eq!(snapshot.reasoning_effort, Some(ReasoningEffort::Low));
+    assert_eq!(snapshot.session_source.get_agent_role(), Some(role_name));
 }
 
 #[tokio::test]

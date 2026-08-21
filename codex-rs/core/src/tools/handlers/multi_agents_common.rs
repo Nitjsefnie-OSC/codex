@@ -334,10 +334,9 @@ pub(crate) async fn apply_explicit_spawn_agent_identity_selection(
         config.model_reasoning_effort = Some(reasoning_effort.clone());
     }
 
-    let requested_model_survives = selection.explicit_model.is_some()
-        || applied_role.model
+    let strict_model_selection = selection.explicit_model.is_some()
         || (!applied_role.model && selection.configured_model.is_some());
-    if requested_model_survives {
+    let selected_model_name = if strict_model_selection {
         let requested_model = config.model.as_deref().ok_or_else(|| {
             FunctionCallError::RespondToModel(
                 "spawn_agent could not resolve the requested child model".to_string(),
@@ -354,19 +353,26 @@ pub(crate) async fn apply_explicit_spawn_agent_identity_selection(
             turn.multi_agent_version,
         )?;
         config.model = Some(selected_model_name.clone());
-        let effort_selected_by_higher_precedence_source =
-            selection.explicit_reasoning_effort.is_some()
-                || applied_role.reasoning_effort
-                || selection.configured_reasoning_effort.is_some();
-        if !effort_selected_by_higher_precedence_source {
-            let selected_model_info = session
-                .services
-                .models_manager
-                .get_model_info(&selected_model_name, &config.to_models_manager_config())
-                .await;
-            if let Some(default_reasoning_level) = selected_model_info.default_reasoning_level {
-                config.model_reasoning_effort = Some(default_reasoning_level);
-            }
+        Some(selected_model_name)
+    } else if applied_role.model {
+        config.model.clone()
+    } else {
+        None
+    };
+
+    let effort_selected_by_higher_precedence_source = selection.explicit_reasoning_effort.is_some()
+        || applied_role.reasoning_effort
+        || selection.configured_reasoning_effort.is_some();
+    if let Some(selected_model_name) = selected_model_name
+        && !effort_selected_by_higher_precedence_source
+    {
+        let selected_model_info = session
+            .services
+            .models_manager
+            .get_model_info(&selected_model_name, &config.to_models_manager_config())
+            .await;
+        if let Some(default_reasoning_level) = selected_model_info.default_reasoning_level {
+            config.model_reasoning_effort = Some(default_reasoning_level);
         }
     }
     Ok(())

@@ -117,7 +117,6 @@ async fn handle_spawn_agent(
         .map(str::trim)
         .filter(|role| !role.is_empty());
     let inherited_role_name = turn.session_source.get_agent_role();
-    let child_role_name = role_name.or(inherited_role_name.as_deref());
 
     let session_source = turn.session_source.clone();
     let child_depth = next_thread_spawn_depth(&session_source);
@@ -127,6 +126,11 @@ async fn handle_spawn_agent(
         config.service_tier = Some(service_tier.clone());
     }
     let is_full_history_fork = matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory));
+    let child_role_name = if is_full_history_fork {
+        inherited_role_name.as_deref()
+    } else {
+        role_name
+    };
     let (identity_selection, applied_role) = if is_full_history_fork {
         reject_full_fork_identity_overrides(
             role_name,
