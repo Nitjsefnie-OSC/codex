@@ -2607,6 +2607,8 @@ async fn spawn_agent_explicit_identity_fields_override_role_defaults(
     let mut spawn_args = json!({
         "message": CHILD_PROMPT,
         "agent_type": "custom",
+        "task_name": "v2-role-override",
+        "fork_turns": "none",
     });
     if let Some(requested_model) = requested_model {
         spawn_args["model"] = json!(requested_model);
@@ -2745,6 +2747,8 @@ async fn multi_agent_v2_spawn_agent_rejects_invalid_final_model_effort_pair() ->
     let spawn_args = serde_json::to_string(&json!({
         "message": CHILD_PROMPT,
         "agent_type": "custom",
+        "task_name": "v2-invalid-pair",
+        "fork_turns": "none",
         "reasoning_effort": ReasoningEffort::Minimal,
     }))?;
     mount_sse_once_match(
