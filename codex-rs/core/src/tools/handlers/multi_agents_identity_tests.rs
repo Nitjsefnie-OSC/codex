@@ -96,7 +96,7 @@ async fn spawn_agent_explicit_model_and_effort_override_role_defaults() {
         .await
         .expect("spawn_agent should honor explicit identity overrides");
 
-    assert_eq!(
+    pretty_assertions::assert_eq!(
         (snapshot.model.as_str(), snapshot.reasoning_effort),
         ("gpt-5.4", Some(ReasoningEffort::High))
     );
@@ -108,7 +108,7 @@ async fn spawn_agent_explicit_model_preserves_role_effort_default() {
         .await
         .expect("spawn_agent should honor an explicit model");
 
-    assert_eq!(
+    pretty_assertions::assert_eq!(
         (snapshot.model.as_str(), snapshot.reasoning_effort),
         ("gpt-5.4", Some(ReasoningEffort::Low))
     );
@@ -120,7 +120,7 @@ async fn spawn_agent_explicit_effort_preserves_role_model_default() {
         .await
         .expect("spawn_agent should honor an explicit reasoning effort");
 
-    assert_eq!(
+    pretty_assertions::assert_eq!(
         (snapshot.model.as_str(), snapshot.reasoning_effort),
         ("gpt-5-role-override", Some(ReasoningEffort::High))
     );
@@ -137,7 +137,7 @@ async fn spawn_agent_role_overrides_invalid_configured_identity_defaults() {
     .await
     .expect("role defaults should replace lower configured defaults before validation");
 
-    assert_eq!(
+    pretty_assertions::assert_eq!(
         (snapshot.model.as_str(), snapshot.reasoning_effort),
         ("gpt-5-role-override", Some(ReasoningEffort::Low))
     );
@@ -192,7 +192,7 @@ async fn spawn_agent_role_model_uses_selected_model_default_effort() {
         .config_snapshot()
         .await;
 
-    assert_eq!(
+    pretty_assertions::assert_eq!(
         (snapshot.model, snapshot.reasoning_effort),
         ("gpt-5.6-sol".to_string(), Some(ReasoningEffort::Low))
     );
@@ -229,7 +229,7 @@ async fn spawn_agent_uncatalogued_role_model_preserves_parent_effort() {
         .config_snapshot()
         .await;
 
-    assert_eq!(
+    pretty_assertions::assert_eq!(
         (snapshot.model, snapshot.reasoning_effort),
         (
             "custom-provider/uncatalogued-role-model".to_string(),
@@ -300,7 +300,7 @@ async fn multi_agent_v2_role_model_uses_selected_model_default_effort() {
         .config_snapshot()
         .await;
 
-    assert_eq!(
+    pretty_assertions::assert_eq!(
         (snapshot.model, snapshot.reasoning_effort),
         ("gpt-5.6-sol".to_string(), Some(ReasoningEffort::Low))
     );
@@ -352,7 +352,7 @@ async fn multi_agent_v2_uncatalogued_role_model_preserves_parent_effort() {
         .config_snapshot()
         .await;
 
-    assert_eq!(
+    pretty_assertions::assert_eq!(
         (snapshot.model, snapshot.reasoning_effort),
         (
             "custom-provider/uncatalogued-role-model".to_string(),
@@ -367,7 +367,7 @@ async fn spawn_agent_rejects_invalid_final_model_effort_pair() {
         .await
         .expect_err("the final model and effort should be validated together");
 
-    assert_eq!(
+    pretty_assertions::assert_eq!(
         error,
         FunctionCallError::RespondToModel(
             "Reasoning effort `minimal` is not supported for model `gpt-5.4`. Supported reasoning efforts: low, medium, high, xhigh".to_string()
@@ -458,7 +458,7 @@ async fn multi_agent_v2_spawn_explicit_model_and_effort_override_role_defaults()
         .await
         .expect("spawn_agent should honor explicit identity overrides");
 
-    assert_eq!(
+    pretty_assertions::assert_eq!(
         (snapshot.model.as_str(), snapshot.reasoning_effort),
         ("gpt-5.4", Some(ReasoningEffort::High))
     );
@@ -470,7 +470,7 @@ async fn multi_agent_v2_spawn_explicit_model_preserves_role_effort_default() {
         .await
         .expect("spawn_agent should honor an explicit model");
 
-    assert_eq!(
+    pretty_assertions::assert_eq!(
         (snapshot.model.as_str(), snapshot.reasoning_effort),
         ("gpt-5.4", Some(ReasoningEffort::Low))
     );
@@ -482,7 +482,7 @@ async fn multi_agent_v2_spawn_explicit_effort_preserves_role_model_default() {
         .await
         .expect("spawn_agent should honor an explicit reasoning effort");
 
-    assert_eq!(
+    pretty_assertions::assert_eq!(
         (snapshot.model.as_str(), snapshot.reasoning_effort),
         ("gpt-5-role-override", Some(ReasoningEffort::High))
     );
@@ -499,7 +499,7 @@ async fn multi_agent_v2_role_overrides_invalid_configured_identity_defaults() {
     .await
     .expect("role defaults should replace lower configured defaults before validation");
 
-    assert_eq!(
+    pretty_assertions::assert_eq!(
         (snapshot.model.as_str(), snapshot.reasoning_effort),
         ("gpt-5-role-override", Some(ReasoningEffort::Low))
     );
@@ -511,7 +511,7 @@ async fn multi_agent_v2_rejects_invalid_final_model_effort_pair() {
         .await
         .expect_err("the final model and effort should be validated together");
 
-    assert_eq!(
+    pretty_assertions::assert_eq!(
         error,
         FunctionCallError::RespondToModel(
             "Reasoning effort `minimal` is not supported for model `gpt-5.4`. Supported reasoning efforts: low, medium, high, xhigh".to_string()
@@ -668,7 +668,7 @@ async fn spawn_agent_full_history_inherits_parent_identity() {
         .expect("spawned agent thread should exist")
         .config_snapshot()
         .await;
-    assert_eq!(
+    pretty_assertions::assert_eq!(
         (snapshot.model, snapshot.reasoning_effort),
         expected_identity
     );
@@ -723,7 +723,7 @@ async fn spawn_agent_full_history_inherits_parent_role_metadata() {
         .config_snapshot()
         .await;
 
-    assert_eq!(
+    pretty_assertions::assert_eq!(
         (
             snapshot.session_source.get_agent_role(),
             snapshot.model,
@@ -731,7 +731,7 @@ async fn spawn_agent_full_history_inherits_parent_role_metadata() {
         ),
         (Some(role_name), expected_identity.0, expected_identity.1)
     );
-    assert_eq!(
+    pretty_assertions::assert_eq!(
         manager
             .get_thread(parse_agent_id(
                 result["agent_id"].as_str().expect("agent id"),
@@ -788,7 +788,7 @@ async fn spawn_agent_fresh_does_not_inherit_parent_role_metadata() {
         .config_snapshot()
         .await;
 
-    assert_eq!(snapshot.session_source.get_agent_role(), None);
+    pretty_assertions::assert_eq!(snapshot.session_source.get_agent_role(), None);
 }
 
 #[tokio::test]
@@ -874,7 +874,7 @@ async fn multi_agent_v2_full_history_inherits_parent_role_metadata() {
         .await
         .expect("spawned agent thread should exist");
     let snapshot = child_thread.config_snapshot().await;
-    assert_eq!(
+    pretty_assertions::assert_eq!(
         (
             snapshot.session_source.get_agent_role(),
             snapshot.model.clone(),
@@ -909,9 +909,9 @@ async fn multi_agent_v2_full_history_inherits_parent_role_metadata() {
         )
         .await
         .expect("child metadata should be readable");
-    assert_eq!(stored_child.agent_role.as_deref(), Some(role_name.as_str()));
-    assert_eq!(stored_child.model, Some(expected_parent_identity.0.clone()));
-    assert_eq!(
+    pretty_assertions::assert_eq!(stored_child.agent_role.as_deref(), Some(role_name.as_str()));
+    pretty_assertions::assert_eq!(stored_child.model, Some(expected_parent_identity.0.clone()));
+    pretty_assertions::assert_eq!(
         stored_child.reasoning_effort,
         expected_parent_identity.1.clone()
     );
@@ -930,7 +930,7 @@ async fn multi_agent_v2_full_history_inherits_parent_role_metadata() {
         .await
         .expect("reloaded child thread should exist");
     let reloaded_snapshot = reloaded_child.config_snapshot().await;
-    assert_eq!(
+    pretty_assertions::assert_eq!(
         (
             reloaded_snapshot.session_source.get_agent_role(),
             reloaded_snapshot.model,
@@ -942,7 +942,7 @@ async fn multi_agent_v2_full_history_inherits_parent_role_metadata() {
             expected_parent_identity.1,
         )
     );
-    assert_eq!(
+    pretty_assertions::assert_eq!(
         reloaded_child
             .session
             .new_default_turn()
@@ -1004,7 +1004,7 @@ async fn multi_agent_v2_fresh_does_not_inherit_parent_role_metadata() {
         .config_snapshot()
         .await;
 
-    assert_eq!(snapshot.session_source.get_agent_role(), None);
+    pretty_assertions::assert_eq!(snapshot.session_source.get_agent_role(), None);
 }
 
 #[tokio::test]
@@ -1053,14 +1053,14 @@ async fn multi_agent_v2_full_history_inherits_parent_identity() {
         .map(|(thread_id, _)| thread_id)
         .find(|thread_id| *thread_id != root.thread_id)
         .expect("spawned agent should receive an op");
-    assert_eq!(result["task_name"], "/root/full_history_identity");
+    pretty_assertions::assert_eq!(result["task_name"], "/root/full_history_identity");
     let snapshot = manager
         .get_thread(child_id)
         .await
         .expect("spawned agent thread should exist")
         .config_snapshot()
         .await;
-    assert_eq!(
+    pretty_assertions::assert_eq!(
         (snapshot.model, snapshot.reasoning_effort),
         expected_identity
     );

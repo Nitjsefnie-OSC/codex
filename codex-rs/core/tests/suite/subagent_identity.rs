@@ -1,28 +1,31 @@
 use super::*;
 use core_test_support::responses::mount_sse_once;
 
-#[test_case(
+const V2_REQUESTED_MODEL: &str = "gpt-5.6-sol";
+const V2_REQUESTED_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Low;
+
+#[test_case::test_case(
     Some(REQUESTED_MODEL),
     Some(REQUESTED_REASONING_EFFORT),
     REQUESTED_MODEL,
     Some(REQUESTED_REASONING_EFFORT);
     "both explicit"
 )]
-#[test_case(
+#[test_case::test_case(
     Some(REQUESTED_MODEL),
     None,
     REQUESTED_MODEL,
     Some(ROLE_REASONING_EFFORT);
     "model only"
 )]
-#[test_case(
+#[test_case::test_case(
     None,
     Some(REQUESTED_REASONING_EFFORT),
     OVERRIDABLE_ROLE_MODEL,
     Some(REQUESTED_REASONING_EFFORT);
     "reasoning effort only"
 )]
-#[test_case(
+#[test_case::test_case(
     None,
     None,
     OVERRIDABLE_ROLE_MODEL,
@@ -78,7 +81,7 @@ async fn spawn_agent_explicit_identity_fields_override_role_defaults(
     )
     .await?;
 
-    assert_eq!(
+    pretty_assertions::assert_eq!(
         (child_snapshot.model, child_snapshot.reasoning_effort),
         (expected_model.to_string(), expected_reasoning_effort)
     );
@@ -86,28 +89,28 @@ async fn spawn_agent_explicit_identity_fields_override_role_defaults(
     Ok(())
 }
 
-#[test_case(
+#[test_case::test_case(
     Some(V2_REQUESTED_MODEL),
     Some(V2_REQUESTED_REASONING_EFFORT),
     V2_REQUESTED_MODEL,
     Some(V2_REQUESTED_REASONING_EFFORT);
     "both explicit"
 )]
-#[test_case(
+#[test_case::test_case(
     Some(V2_REQUESTED_MODEL),
     None,
     V2_REQUESTED_MODEL,
     Some(ROLE_REASONING_EFFORT);
     "model only"
 )]
-#[test_case(
+#[test_case::test_case(
     None,
     Some(V2_REQUESTED_REASONING_EFFORT),
     V2_ROLE_MODEL,
     Some(V2_REQUESTED_REASONING_EFFORT);
     "reasoning effort only"
 )]
-#[test_case(
+#[test_case::test_case(
     None,
     None,
     V2_ROLE_MODEL,
@@ -168,7 +171,7 @@ async fn multi_agent_v2_spawn_agent_explicit_identity_fields_override_role_defau
     )
     .await?;
 
-    assert_eq!(
+    pretty_assertions::assert_eq!(
         (child_snapshot.model, child_snapshot.reasoning_effort),
         (expected_model.to_string(), expected_reasoning_effort)
     );
@@ -315,7 +318,7 @@ async fn spawn_agent_tool_description_mentions_overridable_role_defaults() -> Re
     test.submit_turn(TURN_1_PROMPT).await?;
 
     let requests = resp_mock.requests();
-    assert_eq!(requests.len(), 2);
+    pretty_assertions::assert_eq!(requests.len(), 2);
     let output = requests[1].tool_search_output(call_id);
     let spawn_agent = namespace_child_tool(&output, "multi_agent_v1", "spawn_agent")
         .expect("tool_search should return multi_agent_v1.spawn_agent");
@@ -323,7 +326,7 @@ async fn spawn_agent_tool_description_mentions_overridable_role_defaults() -> Re
         .expect("spawn_agent agent_type description");
     let custom_role_description =
         role_block(&agent_type_description, "custom").expect("custom role description");
-    assert_eq!(
+    pretty_assertions::assert_eq!(
         custom_role_description,
         "custom: {\nCustom role\n- This role's model defaults to `gpt-5.4` and its reasoning effort defaults to `high`. Explicit `model` and `reasoning_effort` spawn arguments override these defaults.\n}"
     );
