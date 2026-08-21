@@ -491,7 +491,7 @@ async fn setup_turn_one_with_custom_spawned_child(
     )
     .await;
 
-    let mut builder = configure_test(test_codex().with_config(|config| {
+    let mut builder = configure_test(test_codex().with_config(move |config| {
         config
             .features
             .enable(Feature::Collab)
