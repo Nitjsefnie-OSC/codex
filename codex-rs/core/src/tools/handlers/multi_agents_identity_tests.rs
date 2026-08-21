@@ -1,7 +1,6 @@
 use super::*;
 use crate::session::tests::make_session_and_context_with_rx;
 use codex_protocol::protocol::MultiAgentVersion;
-use codex_protocol::protocol::ThreadHistoryMode;
 
 async fn install_uncatalogued_model_only_role(turn: &mut TurnContext) -> String {
     let role_name = "uncatalogued-model-only-role".to_string();
@@ -850,14 +849,11 @@ async fn multi_agent_v2_full_history_inherits_parent_role_metadata() {
         Some(state_db),
     );
     let root = manager
-        .start_thread(StartThreadOptions {
-            history_mode: Some(ThreadHistoryMode::Paginated),
-            environments: Some(Vec::new()),
-            ..StartThreadOptions::new(config.clone())
-        })
+        .start_thread(StartThreadOptions::new(config.clone()))
         .await
         .expect("root thread should start");
-    session.services.agent_control = manager.agent_control();
+    let agent_control = manager.agent_control();
+    session.services.agent_control = agent_control.clone();
     session.thread_id = root.thread_id;
     turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
         parent_thread_id: root.thread_id,
@@ -937,8 +933,7 @@ async fn multi_agent_v2_full_history_inherits_parent_role_metadata() {
     let mut sender_config = config;
     sender_config.model = Some("gpt-5.6-luna".to_string());
     sender_config.model_reasoning_effort = Some(ReasoningEffort::Minimal);
-    manager
-        .agent_control()
+    agent_control
         .ensure_v2_agent_loaded(sender_config, child_id)
         .await
         .expect("full-history child should reload");
