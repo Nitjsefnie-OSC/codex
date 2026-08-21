@@ -671,7 +671,7 @@ mod implicit_activation_tests {
             ))
             .await;
         let denial = match result {
-            Ok(output) => output.log_preview(),
+            Ok(output) => output.log_output(),
             Err(error) => error.to_string(),
         }
         .to_ascii_lowercase();

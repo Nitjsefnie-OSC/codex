@@ -27,6 +27,8 @@ jobs:
     if: github.event_name == 'push' || inputs.mode == '' || inputs.mode == 'full'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      RUST_MIN_STACK: "8388608" # 8 MiB
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -259,6 +261,8 @@ jobs:
     if: github.event_name == 'push' || inputs.mode == '' || inputs.mode == 'full'
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    env:
+      RUST_MIN_STACK: "8388608" # 8 MiB
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
