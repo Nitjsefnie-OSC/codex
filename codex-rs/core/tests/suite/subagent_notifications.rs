@@ -2739,7 +2739,7 @@ async fn multi_agent_v2_spawn_agent_explicit_identity_fields_override_role_defau
     let mut spawn_args = json!({
         "message": CHILD_PROMPT,
         "agent_type": "custom",
-        "task_name": "v2-role-override",
+        "task_name": "v2_role_override",
         "fork_turns": "none",
     });
     if let Some(requested_model) = requested_model {
