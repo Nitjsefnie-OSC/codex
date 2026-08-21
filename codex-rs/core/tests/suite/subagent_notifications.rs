@@ -385,6 +385,25 @@ async fn wait_for_requests(
     }
 }
 
+async fn wait_for_v2_child_request(
+    mock: &core_test_support::responses::ResponseMock,
+) -> Result<Vec<ResponsesRequest>> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let requests = mock.requests();
+        if requests
+            .iter()
+            .any(|request| !request.inputs_of_type("agent_message").is_empty())
+        {
+            return Ok(requests);
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for V2 child agent message request");
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
 async fn wait_for_request_with_model(
     mock: &core_test_support::responses::ResponseMock,
     model: &str,
@@ -537,7 +556,7 @@ async fn setup_turn_one_with_custom_spawned_child(
         }
     }
     if multi_agent_version == MultiAgentVersion::V2 {
-        let _ = wait_for_requests(&child_request_log).await?;
+        let _ = wait_for_v2_child_request(&child_request_log).await?;
     }
 
     let spawned_id = wait_for_spawned_thread_id(&test).await?;
