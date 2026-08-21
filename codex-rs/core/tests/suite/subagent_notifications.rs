@@ -536,6 +536,10 @@ async fn setup_turn_one_with_custom_spawned_child(
             sleep(Duration::from_millis(10)).await;
         }
     }
+    if multi_agent_version == MultiAgentVersion::V2 {
+        let _ = wait_for_requests(&child_request_log).await?;
+    }
+
     let spawned_id = wait_for_spawned_thread_id(&test).await?;
 
     Ok((test, spawned_id, child_request_log))
@@ -552,6 +556,8 @@ async fn spawn_child_and_capture_snapshot(
         server,
         MultiAgentVersion::V1,
         spawn_args,
+        None,
+        None,
         configure_test,
     )
     .await
@@ -561,11 +567,13 @@ async fn spawn_child_and_capture_snapshot_with_version(
     server: &MockServer,
     multi_agent_version: MultiAgentVersion,
     spawn_args: serde_json::Value,
+    expected_model: Option<&str>,
+    expected_reasoning_effort: Option<ReasoningEffort>,
     configure_test: impl FnOnce(
         core_test_support::test_codex::TestCodexBuilder,
     ) -> core_test_support::test_codex::TestCodexBuilder,
 ) -> Result<ThreadConfigSnapshot> {
-    let (test, spawned_id, _child_request_log) = setup_turn_one_with_custom_spawned_child(
+    let (test, spawned_id, child_request_log) = setup_turn_one_with_custom_spawned_child(
         server,
         multi_agent_version,
         spawn_args,
@@ -574,6 +582,26 @@ async fn spawn_child_and_capture_snapshot_with_version(
         configure_test,
     )
     .await?;
+
+    if multi_agent_version == MultiAgentVersion::V2 {
+        let expected_model = expected_model
+            .ok_or_else(|| anyhow::anyhow!("V2 child model expectation is required"))?;
+        let expected_reasoning_effort = expected_reasoning_effort
+            .ok_or_else(|| anyhow::anyhow!("V2 child reasoning effort expectation is required"))?;
+        let child_request = wait_for_request_with_model(&child_request_log, expected_model).await?;
+        let child_body = child_request.body_json();
+        assert_eq!(
+            (
+                child_body["model"].clone(),
+                child_body["reasoning"]["effort"].clone(),
+            ),
+            (
+                json!(expected_model),
+                json!(expected_reasoning_effort.to_string()),
+            ),
+        );
+    }
+
     let thread_id = ThreadId::from_string(&spawned_id)?;
     Ok(test
         .thread_manager
@@ -2705,6 +2733,8 @@ async fn multi_agent_v2_spawn_agent_explicit_identity_fields_override_role_defau
         &server,
         MultiAgentVersion::V2,
         spawn_args,
+        Some(expected_model),
+        expected_reasoning_effort.clone(),
         |builder| {
             builder.with_config(|config| {
                 let role_path = config.codex_home.join("custom-v2-role.toml");
