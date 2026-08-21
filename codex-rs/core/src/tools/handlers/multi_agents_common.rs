@@ -335,6 +335,7 @@ pub(crate) async fn apply_explicit_spawn_agent_identity_selection(
     }
 
     let requested_model_survives = selection.explicit_model.is_some()
+        || applied_role.model
         || (!applied_role.model && selection.configured_model.is_some());
     if requested_model_survives {
         let requested_model = config.model.as_deref().ok_or_else(|| {
@@ -363,7 +364,9 @@ pub(crate) async fn apply_explicit_spawn_agent_identity_selection(
                 .models_manager
                 .get_model_info(&selected_model_name, &config.to_models_manager_config())
                 .await;
-            config.model_reasoning_effort = selected_model_info.default_reasoning_level;
+            if let Some(default_reasoning_level) = selected_model_info.default_reasoning_level {
+                config.model_reasoning_effort = Some(default_reasoning_level);
+            }
         }
     }
     Ok(())

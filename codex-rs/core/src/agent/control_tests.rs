@@ -725,7 +725,7 @@ fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent_body(
         let role_path = home.path().join("reload-role.toml");
         tokio::fs::write(
             &role_path,
-            "model = \"gpt-5.6-terra\"\nmodel_reasoning_effort = \"high\"\n",
+            "developer_instructions = \"Reload role instructions\"\nmodel = \"gpt-5.6-terra\"\nmodel_reasoning_effort = \"xhigh\"\n",
         )
         .await
         .expect("reload role config should be written");
@@ -844,6 +844,16 @@ fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent_body(
                 harness.config.model_provider.clone()
             ),
             "residency reload must preserve the worker provider instead of inheriting its sender's provider",
+        );
+        assert_eq!(
+            reloaded_child
+                .session
+                .new_default_turn()
+                .await
+                .developer_instructions
+                .as_deref(),
+            Some("Reload role instructions"),
+            "residency reload must reapply non-identity role settings",
         );
 
         let communication = InterAgentCommunication::new(

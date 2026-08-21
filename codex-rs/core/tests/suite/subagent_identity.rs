@@ -1,4 +1,7 @@
 use super::*;
+use core_test_support::responses::mount_sse_once;
+use pretty_assertions::assert_eq;
+use test_case::test_case;
 
 #[test_case(
     Some(REQUESTED_MODEL),
@@ -286,7 +289,7 @@ async fn spawn_agent_tool_description_mentions_overridable_role_defaults() -> Re
     )
     .await;
 
-    let builder = test_codex().with_config(|config| {
+    let mut builder = test_codex().with_config(|config| {
         config
             .features
             .enable(Feature::Collab)
@@ -371,7 +374,7 @@ async fn direct_v2_spawn_agent_tool(expose_model_overrides: bool) -> Result<Valu
                 "custom".to_string(),
                 AgentRoleConfig {
                     description: Some("Custom role".to_string()),
-                    config_file: Some(role_path),
+                    config_file: Some(role_path.to_path_buf()),
                     nickname_candidates: None,
                 },
             );

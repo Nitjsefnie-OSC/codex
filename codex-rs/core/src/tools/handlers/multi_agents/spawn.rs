@@ -59,6 +59,8 @@ async fn handle_spawn_agent(
         .as_deref()
         .map(str::trim)
         .filter(|role| !role.is_empty());
+    let inherited_role_name = turn.session_source.get_agent_role();
+    let child_role_name = role_name.or(inherited_role_name.as_deref());
     let input_items = parse_collab_input(args.message, args.items)?;
     let prompt = render_input_preview(&input_items);
     let session_source = turn.session_source.clone();
@@ -69,23 +71,6 @@ async fn handle_spawn_agent(
             "Agent depth limit reached. Solve the task yourself.".to_string(),
         ));
     }
-    session
-        .emit_turn_item_started(
-            turn,
-            &TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
-                id: call_id.clone(),
-                tool: CollabAgentTool::SpawnAgent,
-                status: CollabAgentToolCallStatus::InProgress,
-                sender_thread_id: session.thread_id,
-                receiver_thread_ids: Vec::new(),
-                receiver_agents: Vec::new(),
-                prompt: Some(prompt.clone()),
-                model: Some(args.model.clone().unwrap_or_default()),
-                reasoning_effort: Some(args.reasoning_effort.clone().unwrap_or_default()),
-                agents_states: Default::default(),
-            }),
-        )
-        .await;
     let mut config =
         build_agent_spawn_config(&session.get_base_instructions().await, turn.as_ref())?;
     if let Some(service_tier) = args.service_tier.as_ref() {
@@ -136,16 +121,35 @@ async fn handle_spawn_agent(
     .await?;
     apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
 
+    let spawn_source = thread_spawn_source(
+        session.thread_id,
+        &turn.session_source,
+        child_depth,
+        child_role_name,
+        /*task_name*/ None,
+    )?;
+    session
+        .emit_turn_item_started(
+            turn,
+            &TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
+                id: call_id.clone(),
+                tool: CollabAgentTool::SpawnAgent,
+                status: CollabAgentToolCallStatus::InProgress,
+                sender_thread_id: session.thread_id,
+                receiver_thread_ids: Vec::new(),
+                receiver_agents: Vec::new(),
+                prompt: Some(prompt.clone()),
+                model: Some(args.model.clone().unwrap_or_default()),
+                reasoning_effort: Some(args.reasoning_effort.clone().unwrap_or_default()),
+                agents_states: Default::default(),
+            }),
+        )
+        .await;
+
     let result = Box::pin(session.services.agent_control.spawn_agent_with_metadata(
         config,
         input_items,
-        Some(thread_spawn_source(
-            session.thread_id,
-            &turn.session_source,
-            child_depth,
-            role_name,
-            /*task_name*/ None,
-        )?),
+        Some(spawn_source),
         SpawnAgentOptions {
             fork_parent_spawn_call_id: args.fork_context.then(|| call_id.clone()),
             fork_mode: args.fork_context.then_some(SpawnAgentForkMode::FullHistory),
@@ -229,7 +233,7 @@ async fn handle_spawn_agent(
         )
         .await;
     let new_thread_id = result?.thread_id;
-    let role_tag = role_name.unwrap_or(DEFAULT_ROLE_NAME);
+    let role_tag = child_role_name.unwrap_or(DEFAULT_ROLE_NAME);
     turn.session_telemetry.counter(
         "codex.multi_agent.spawn",
         /*inc*/ 1,

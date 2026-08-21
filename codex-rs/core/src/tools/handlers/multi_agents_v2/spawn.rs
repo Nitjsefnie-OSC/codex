@@ -116,6 +116,8 @@ async fn handle_spawn_agent(
         .as_deref()
         .map(str::trim)
         .filter(|role| !role.is_empty());
+    let inherited_role_name = turn.session_source.get_agent_role();
+    let child_role_name = role_name.or(inherited_role_name.as_deref());
 
     let session_source = turn.session_source.clone();
     let child_depth = next_thread_spawn_depth(&session_source);
@@ -174,7 +176,7 @@ async fn handle_spawn_agent(
         session.thread_id,
         &turn.session_source,
         child_depth,
-        role_name,
+        child_role_name,
         Some(args.task_name.clone()),
     )?;
     let new_agent_path = spawn_source.get_agent_path().ok_or_else(|| {
@@ -259,7 +261,7 @@ async fn handle_spawn_agent(
         },
     )
     .await;
-    let role_tag = role_name.unwrap_or(DEFAULT_ROLE_NAME);
+    let role_tag = child_role_name.unwrap_or(DEFAULT_ROLE_NAME);
     turn.session_telemetry.counter(
         "codex.multi_agent.spawn",
         /*inc*/ 1,

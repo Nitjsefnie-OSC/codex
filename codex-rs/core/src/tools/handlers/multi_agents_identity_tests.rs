@@ -1,5 +1,7 @@
 use super::*;
+use crate::session::tests::make_session_and_context_with_rx;
 use codex_protocol::protocol::MultiAgentVersion;
+use pretty_assertions::assert_eq;
 
 async fn spawn_v1_agent_with_role_identity(
     model: Option<&str>,
@@ -113,6 +115,129 @@ async fn spawn_agent_role_overrides_invalid_configured_identity_defaults() {
     assert_eq!(
         (snapshot.model.as_str(), snapshot.reasoning_effort),
         ("gpt-5-role-override", Some(ReasoningEffort::Low))
+    );
+}
+
+#[tokio::test]
+async fn spawn_agent_role_model_uses_selected_model_default_effort() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    turn.reasoning_effort = Some(ReasoningEffort::High);
+    let role_name = "model-only-role".to_string();
+    let role_path = turn
+        .config
+        .codex_home
+        .as_path()
+        .join("model-only-role.toml");
+    tokio::fs::write(&role_path, "model = \"gpt-5.6-sol\"\n")
+        .await
+        .expect("role config should be written");
+    let mut config = (*turn.config).clone();
+    config.agent_roles.insert(
+        role_name.clone(),
+        AgentRoleConfig {
+            description: Some("Model-only role".to_string()),
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    );
+    set_turn_config(&mut turn, config);
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+
+    let output = SpawnAgentHandler::default()
+        .handle(invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "inspect this repo",
+                "agent_type": role_name,
+            })),
+        ))
+        .await
+        .expect("spawn should resolve the selected model default effort");
+    let (content, _) = expect_text_output(output);
+    let result: serde_json::Value = serde_json::from_str(&content).expect("spawn result json");
+    let snapshot = manager
+        .get_thread(parse_agent_id(
+            result["agent_id"].as_str().expect("agent id"),
+        ))
+        .await
+        .expect("spawned agent thread should exist")
+        .config_snapshot()
+        .await;
+
+    assert_eq!(
+        (snapshot.model, snapshot.reasoning_effort),
+        ("gpt-5.6-sol".to_string(), Some(ReasoningEffort::Low))
+    );
+}
+
+#[tokio::test]
+async fn multi_agent_v2_role_model_uses_selected_model_default_effort() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    turn.reasoning_effort = Some(ReasoningEffort::High);
+    let role_name = "v2-model-only-role".to_string();
+    let role_path = turn
+        .config
+        .codex_home
+        .as_path()
+        .join("v2-model-only-role.toml");
+    tokio::fs::write(&role_path, "model = \"gpt-5.6-sol\"\n")
+        .await
+        .expect("role config should be written");
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    config.agent_roles.insert(
+        role_name.clone(),
+        AgentRoleConfig {
+            description: Some("V2 model-only role".to_string()),
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    );
+    set_turn_config(&mut turn, config);
+    let manager = thread_manager();
+    let root = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+
+    SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "inspect this repo",
+                "task_name": "v2_model_only",
+                "agent_type": role_name,
+                "fork_turns": "none",
+            })),
+        ))
+        .await
+        .expect("spawn should resolve the selected model default effort");
+    let child_id = manager
+        .captured_ops()
+        .into_iter()
+        .map(|(thread_id, _)| thread_id)
+        .find(|thread_id| *thread_id != root.thread_id)
+        .expect("spawned agent should receive an op");
+    let snapshot = manager
+        .get_thread(child_id)
+        .await
+        .expect("spawned agent thread should exist")
+        .config_snapshot()
+        .await;
+
+    assert_eq!(
+        (snapshot.model, snapshot.reasoning_effort),
+        ("gpt-5.6-sol".to_string(), Some(ReasoningEffort::Low))
     );
 }
 
@@ -305,6 +430,31 @@ async fn spawn_agent_full_history_rejects_identity_overrides() {
     }
 }
 
+#[tokio::test]
+async fn spawn_agent_rejection_does_not_emit_in_progress_item() {
+    let (session, turn, events) = make_session_and_context_with_rx().await;
+    let error = SpawnAgentHandler::default()
+        .handle(invocation(
+            session,
+            turn,
+            "spawn_agent",
+            function_payload(json!({
+                "message": "inspect this repo",
+                "model": "gpt-5.4",
+                "fork_context": true,
+            })),
+        ))
+        .await
+        .expect_err("full-history identity overrides should be rejected");
+
+    assert!(matches!(
+        error,
+        FunctionCallError::RespondToModel(message)
+            if message.contains("Full-history forked agents inherit")
+    ));
+    assert!(events.try_recv().is_err());
+}
+
 async fn reject_v2_full_history_identity_overrides(args: serde_json::Value) -> FunctionCallError {
     let (session, mut turn) = make_session_and_context().await;
     let mut config = (*turn.config).clone();
@@ -350,7 +500,11 @@ async fn spawn_agent_full_history_inherits_parent_identity() {
         agent_id: String,
     }
 
-    let (mut session, turn) = make_session_and_context().await;
+    let (mut session, mut turn) = make_session_and_context().await;
+    let mut config = (*turn.config).clone();
+    config.agent_default_subagent_model = Some("gpt-5.6-luna".to_string());
+    config.agent_default_subagent_reasoning_effort = Some(ReasoningEffort::Low);
+    set_turn_config(&mut turn, config);
     let expected_identity = (
         turn.model_info.slug.clone(),
         turn.reasoning_effort
@@ -389,6 +543,104 @@ async fn spawn_agent_full_history_inherits_parent_identity() {
         (snapshot.model, snapshot.reasoning_effort),
         expected_identity
     );
+}
+
+#[tokio::test]
+async fn spawn_agent_inherits_parent_role_metadata() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let role_name = install_role_with_model_override(&mut turn).await;
+    let manager = thread_manager();
+    let root = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+    turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id: root.thread_id,
+        depth: 0,
+        agent_path: Some(AgentPath::root()),
+        agent_nickname: None,
+        agent_role: Some(role_name.clone()),
+    });
+
+    let output = SpawnAgentHandler::default()
+        .handle(invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "inspect this repo",
+            })),
+        ))
+        .await
+        .expect("spawn should inherit the parent role metadata");
+    let (content, _) = expect_text_output(output);
+    let result: serde_json::Value = serde_json::from_str(&content).expect("spawn result json");
+    let snapshot = manager
+        .get_thread(parse_agent_id(
+            result["agent_id"].as_str().expect("agent id"),
+        ))
+        .await
+        .expect("spawned agent thread should exist")
+        .config_snapshot()
+        .await;
+
+    assert_eq!(snapshot.session_source.get_agent_role(), Some(role_name));
+}
+
+#[tokio::test]
+async fn multi_agent_v2_spawn_inherits_parent_role_metadata() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let role_name = install_role_with_model_override(&mut turn).await;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    set_turn_config(&mut turn, config);
+    let manager = thread_manager();
+    let root = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+    turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id: root.thread_id,
+        depth: 0,
+        agent_path: Some(AgentPath::root()),
+        agent_nickname: None,
+        agent_role: Some(role_name.clone()),
+    });
+
+    SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "inspect this repo",
+                "task_name": "inherited_role",
+                "fork_turns": "none",
+            })),
+        ))
+        .await
+        .expect("spawn should inherit the parent role metadata");
+    let child_id = manager
+        .captured_ops()
+        .into_iter()
+        .map(|(thread_id, _)| thread_id)
+        .find(|thread_id| *thread_id != root.thread_id)
+        .expect("spawned agent should receive an op");
+    let snapshot = manager
+        .get_thread(child_id)
+        .await
+        .expect("spawned agent thread should exist")
+        .config_snapshot()
+        .await;
+
+    assert_eq!(snapshot.session_source.get_agent_role(), Some(role_name));
 }
 
 #[tokio::test]

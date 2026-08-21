@@ -369,6 +369,7 @@ pub(crate) mod spawn_tool_spec {
     }
 
     /// Builds the spawn-agent tool description text from built-in and configured roles.
+    #[cfg(test)]
     pub(crate) fn build(user_defined_agent_roles: &BTreeMap<String, AgentRoleConfig>) -> String {
         build_with_model_overrides(user_defined_agent_roles, ModelOverrideExposure::Exposed)
     }
