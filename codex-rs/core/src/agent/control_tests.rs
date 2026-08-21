@@ -697,11 +697,26 @@ async fn send_inter_agent_communication_without_turn_queues_message_without_trig
 
 #[tokio::test]
 async fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent() {
-    ensure_v2_agent_loaded_reloads_registered_unloaded_agent_body().await;
+    ensure_v2_agent_loaded_reloads_registered_unloaded_agent_body(
+        Some(ReasoningEffort::High),
+        Some(ReasoningEffort::Minimal),
+    )
+    .await;
 }
 
-fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent_body()
--> futures::future::BoxFuture<'static, ()> {
+#[tokio::test]
+async fn ensure_v2_agent_loaded_preserves_absent_reasoning_effort() {
+    ensure_v2_agent_loaded_reloads_registered_unloaded_agent_body(
+        /*child_reasoning_effort*/ None,
+        Some(ReasoningEffort::Minimal),
+    )
+    .await;
+}
+
+fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent_body(
+    child_reasoning_effort: Option<ReasoningEffort>,
+    sender_reasoning_effort: Option<ReasoningEffort>,
+) -> futures::future::BoxFuture<'static, ()> {
     Box::pin(async move {
         let (home, mut config) = test_config().await;
         let _ = config.features.enable(Feature::MultiAgentV2);
@@ -712,7 +727,7 @@ fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent_body()
         let agent_path = AgentPath::try_from("/root/worker").expect("agent path");
         let mut child_config = harness.config.clone();
         child_config.model = Some("gpt-5.6-luna".to_string());
-        child_config.model_reasoning_effort = Some(ReasoningEffort::High);
+        child_config.model_reasoning_effort = child_reasoning_effort.clone();
         let spawned_agent = harness
             .control
             .spawn_agent_with_metadata(
@@ -755,7 +770,7 @@ fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent_body()
             .await
             .expect("child metadata should be readable");
         assert_eq!(stored_child.history_mode, ThreadHistoryMode::Paginated);
-        assert_eq!(stored_child.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(stored_child.reasoning_effort, child_reasoning_effort);
 
         assert!(
             harness
@@ -773,7 +788,7 @@ fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent_body()
         }
 
         let mut sender_config = harness.config.clone();
-        sender_config.model_reasoning_effort = Some(ReasoningEffort::Minimal);
+        sender_config.model_reasoning_effort = sender_reasoning_effort;
         sender_config.model_provider_id = "ollama".to_string();
         sender_config.model_provider = sender_config
             .model_providers
@@ -794,7 +809,7 @@ fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent_body()
         let reloaded_snapshot = reloaded_child.config_snapshot().await;
         assert_eq!(
             (reloaded_snapshot.model, reloaded_snapshot.reasoning_effort),
-            ("gpt-5.6-luna".to_string(), Some(ReasoningEffort::High)),
+            ("gpt-5.6-luna".to_string(), child_reasoning_effort),
             "residency reload must preserve the worker identity instead of inheriting its sender's identity",
         );
         assert_eq!(

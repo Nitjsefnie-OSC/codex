@@ -210,6 +210,9 @@ jobs:
             agent::control::tests::ensure_v2_agent_loaded_reloads_registered_unloaded_agent \
             -- --exact --nocapture
           run_exact cargo test -p codex-core --lib \
+            agent::control::tests::ensure_v2_agent_loaded_preserves_absent_reasoning_effort \
+            -- --exact --nocapture
+          run_exact cargo test -p codex-core --lib \
             agent::control::tests::multi_agent_v2_completion_queues_message_for_direct_parent \
             -- --exact --nocapture
           run_exact cargo test -p codex-core --lib \
@@ -391,7 +394,15 @@ jobs:
             agent::role::tests::apply_exec_agent_role_uses_role_identity_and_preserves_runtime_state \
             agent::role::tests::apply_exec_agent_role_rejects_unknown_role \
             tools::handlers::multi_agents::tests::spawn_agent_explicit_model_and_effort_override_role_defaults \
-            tools::handlers::multi_agents::tests::multi_agent_v2_spawn_explicit_model_and_effort_override_role_defaults
+            tools::handlers::multi_agents::tests::spawn_agent_explicit_model_preserves_role_effort_default \
+            tools::handlers::multi_agents::tests::spawn_agent_explicit_effort_preserves_role_model_default \
+            tools::handlers::multi_agents::tests::spawn_agent_role_overrides_invalid_configured_identity_defaults \
+            tools::handlers::multi_agents::tests::spawn_agent_rejects_invalid_final_model_effort_pair \
+            tools::handlers::multi_agents::tests::multi_agent_v2_spawn_explicit_model_and_effort_override_role_defaults \
+            tools::handlers::multi_agents::tests::multi_agent_v2_spawn_explicit_model_preserves_role_effort_default \
+            tools::handlers::multi_agents::tests::multi_agent_v2_spawn_explicit_effort_preserves_role_model_default \
+            tools::handlers::multi_agents::tests::multi_agent_v2_role_overrides_invalid_configured_identity_defaults \
+            tools::handlers::multi_agents::tests::multi_agent_v2_rejects_invalid_final_model_effort_pair
           do
             output=$(cargo test -p codex-core --lib "$test_name" -- --exact --nocapture 2>&1)
             result=$?
@@ -400,6 +411,22 @@ jobs:
               status=1
             fi
           done
+          output=$(cargo test -p codex-core --test all \
+            suite::subagent_notifications::spawn_agent_explicit_identity_fields_override_role_defaults \
+            -- --nocapture --test-threads=1 2>&1)
+          result=$?
+          printf '%s\n' "$output"
+          if [ "$result" -ne 0 ] || ! printf '%s\n' "$output" | grep -Eq 'test result: ok\. 4 passed'; then
+            status=1
+          fi
+          output=$(cargo test -p codex-core --test all \
+            suite::subagent_notifications::spawn_agent_tool_description_mentions_overridable_role_defaults \
+            -- --exact --nocapture --test-threads=1 2>&1)
+          result=$?
+          printf '%s\n' "$output"
+          if [ "$result" -ne 0 ] || ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
+            status=1
+          fi
           exit "$status"
 
       - name: headless agent role integration tests
@@ -413,6 +440,8 @@ jobs:
           for test_name in \
             suite::headless_agent_role::exec_agent_role_preserves_explicit_model_and_effort_overrides \
             suite::headless_agent_role::exec_agent_role_preserves_config_model_override_and_role_effort \
+            suite::headless_agent_role::exec_agent_role_preserves_role_model_and_explicit_effort \
+            suite::headless_agent_role::exec_agent_role_rejects_invalid_final_model_effort_pair \
             suite::headless_agent_role::exec_unknown_agent_role_fails_before_responses_request
           do
             output=$(cargo test -p codex-exec --test all "$test_name" -- --exact --nocapture --test-threads=1 2>&1)

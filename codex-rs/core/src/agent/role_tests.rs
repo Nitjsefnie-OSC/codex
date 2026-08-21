@@ -88,7 +88,7 @@ include_permissions_instructions = false
     let runtime_cwd = config.cwd.clone();
     let runtime_workspace_roots = config.workspace_roots.clone();
 
-    apply_exec_agent_role(&mut config, "adversary", AgentRoleOverrideMask::default())
+    apply_exec_agent_role(&mut config, "adversary")
         .await
         .expect("exec role should apply");
 
@@ -120,13 +120,9 @@ include_permissions_instructions = false
 async fn apply_exec_agent_role_rejects_unknown_role() {
     let (_home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
 
-    let error = apply_exec_agent_role(
-        &mut config,
-        "missing-role",
-        AgentRoleOverrideMask::default(),
-    )
-    .await
-    .expect_err("unknown exec role should fail");
+    let error = apply_exec_agent_role(&mut config, "missing-role")
+        .await
+        .expect_err("unknown exec role should fail");
 
     assert_eq!(error, "unknown agent_type 'missing-role'");
 }

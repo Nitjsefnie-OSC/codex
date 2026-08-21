@@ -86,6 +86,7 @@ const V2_REQUESTED_MODEL: &str = "gpt-5.6-sol";
 const V2_REQUESTED_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Low;
 const ROLE_MODEL: &str = "gpt-5.4";
 const ROLE_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::High;
+const OVERRIDABLE_ROLE_MODEL: &str = "gpt-5.2";
 const SUBAGENT_START_CONTEXT: &str = "subagent start context reaches child";
 const SUBAGENT_STOP_CONTINUATION: &str = "continue only the child";
 const INTERNAL_SUBAGENT_PROMPT: &str = "internal subagent: review";
@@ -2530,26 +2531,64 @@ async fn skills_toggle_skips_instructions_for_parent_and_spawned_child() -> Resu
     Ok(())
 }
 
+#[test_case(
+    Some(REQUESTED_MODEL),
+    Some(REQUESTED_REASONING_EFFORT),
+    REQUESTED_MODEL,
+    Some(REQUESTED_REASONING_EFFORT);
+    "both explicit"
+)]
+#[test_case(
+    Some(REQUESTED_MODEL),
+    None,
+    REQUESTED_MODEL,
+    Some(ROLE_REASONING_EFFORT);
+    "model only"
+)]
+#[test_case(
+    None,
+    Some(REQUESTED_REASONING_EFFORT),
+    OVERRIDABLE_ROLE_MODEL,
+    Some(REQUESTED_REASONING_EFFORT);
+    "reasoning effort only"
+)]
+#[test_case(
+    None,
+    None,
+    OVERRIDABLE_ROLE_MODEL,
+    Some(ROLE_REASONING_EFFORT);
+    "role replaces configured defaults"
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn spawn_agent_role_overrides_requested_model_and_reasoning_settings() -> Result<()> {
+async fn spawn_agent_explicit_identity_fields_override_role_defaults(
+    requested_model: Option<&str>,
+    requested_reasoning_effort: Option<ReasoningEffort>,
+    expected_model: &str,
+    expected_reasoning_effort: Option<ReasoningEffort>,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
+    let mut spawn_args = json!({
+        "message": CHILD_PROMPT,
+        "agent_type": "custom",
+    });
+    if let Some(requested_model) = requested_model {
+        spawn_args["model"] = json!(requested_model);
+    }
+    if let Some(requested_reasoning_effort) = requested_reasoning_effort {
+        spawn_args["reasoning_effort"] = json!(requested_reasoning_effort);
+    }
     let child_snapshot = spawn_child_and_capture_snapshot(
         &server,
-        json!({
-            "message": CHILD_PROMPT,
-            "agent_type": "custom",
-            "model": REQUESTED_MODEL,
-            "reasoning_effort": REQUESTED_REASONING_EFFORT,
-        }),
+        spawn_args,
         |builder| {
             builder.with_config(|config| {
                 let role_path = config.codex_home.join("custom-role.toml");
                 std::fs::write(
                     &role_path,
                     format!(
-                        "model = \"{ROLE_MODEL}\"\nmodel_reasoning_effort = \"{ROLE_REASONING_EFFORT}\"\n",
+                        "model = \"{OVERRIDABLE_ROLE_MODEL}\"\nmodel_reasoning_effort = \"{ROLE_REASONING_EFFORT}\"\n",
                     ),
                 )
                 .expect("write role config");
@@ -2561,13 +2600,18 @@ async fn spawn_agent_role_overrides_requested_model_and_reasoning_settings() -> 
                         nickname_candidates: None,
                     },
                 );
+                config.agent_default_subagent_model =
+                    Some("missing-configured-model".to_string());
+                config.agent_default_subagent_reasoning_effort = Some(ReasoningEffort::Minimal);
             })
         },
     )
     .await?;
 
-    assert_eq!(child_snapshot.model, ROLE_MODEL);
-    assert_eq!(child_snapshot.reasoning_effort, Some(ROLE_REASONING_EFFORT));
+    assert_eq!(
+        (child_snapshot.model, child_snapshot.reasoning_effort),
+        (expected_model.to_string(), expected_reasoning_effort)
+    );
 
     Ok(())
 }
@@ -2686,7 +2730,7 @@ async fn spawn_agent_rejects_reasoning_effort_unsupported_by_role_model() -> Res
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn spawn_agent_tool_description_mentions_role_locked_settings() -> Result<()> {
+async fn spawn_agent_tool_description_mentions_overridable_role_defaults() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -2752,7 +2796,7 @@ async fn spawn_agent_tool_description_mentions_role_locked_settings() -> Result<
         role_block(&agent_type_description, "custom").expect("custom role description");
     assert_eq!(
         custom_role_description,
-        "custom: {\nCustom role\n- This role's model is set to `gpt-5.4` and its reasoning effort is set to `high`. These settings cannot be changed.\n}"
+        "custom: {\nCustom role\n- This role's model defaults to `gpt-5.4` and its reasoning effort defaults to `high`. Explicit `model` and `reasoning_effort` spawn arguments override these defaults.\n}"
     );
 
     Ok(())

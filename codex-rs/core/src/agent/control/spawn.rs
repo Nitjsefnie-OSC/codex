@@ -1,6 +1,7 @@
 use super::residency::is_v2_resident_session_source;
 use super::*;
-use crate::agent::role::apply_role_to_config_for_multi_agent_v2;
+use crate::agent::role::AgentRoleOverrideMask;
+use crate::agent::role::apply_role_to_config_with_mask;
 use crate::config::PermissionProfileSnapshot;
 use crate::context::ContextualUserFragment;
 use crate::context::CurrentTimeReminder;
@@ -351,7 +352,10 @@ impl AgentControl {
                 ),
             };
 
-            apply_role_to_config_for_multi_agent_v2(&mut config, role_name.as_deref())
+            let mut stored_identity_mask = AgentRoleOverrideMask::default();
+            stored_identity_mask.preserve_model();
+            stored_identity_mask.preserve_reasoning_effort();
+            apply_role_to_config_with_mask(&mut config, role_name.as_deref(), stored_identity_mask)
                 .await
                 .map_err(CodexErr::InvalidRequest)?;
             config
@@ -373,9 +377,7 @@ impl AgentControl {
         if let Some(model) = stored_model {
             config.model = Some(model);
         }
-        if let Some(reasoning_effort) = stored_reasoning_effort {
-            config.model_reasoning_effort = Some(reasoning_effort);
-        }
+        config.model_reasoning_effort = stored_reasoning_effort;
         if config.model_provider_id != stored_model_provider {
             config.model_provider = config
                 .model_providers

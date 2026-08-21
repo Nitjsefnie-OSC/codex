@@ -94,18 +94,32 @@ async fn handle_spawn_agent(
     if args.fork_context {
         reject_full_fork_agent_type_override(role_name)?;
     }
-    let agent_role_override_mask = apply_requested_spawn_agent_model_overrides(
-        &session,
+    let identity_selection = prepare_spawn_agent_identity_selection(
         turn.as_ref(),
         &mut config,
         args.model.as_deref(),
         args.reasoning_effort.clone(),
+    );
+    let role_override_mask = identity_selection.role_override_mask();
+    let applied_role = if !args.fork_context {
+        apply_spawn_agent_role(&mut config, role_name, role_override_mask).await?
+    } else {
+        Default::default()
+    };
+    let should_validate_identity = identity_selection.selects_identity()
+        || applied_role.model
+        || applied_role.reasoning_effort;
+    apply_explicit_spawn_agent_identity_selection(
+        &session,
+        turn.as_ref(),
+        &mut config,
+        identity_selection,
+        applied_role,
     )
     .await?;
-    if !args.fork_context {
-        apply_spawn_agent_role(&mut config, role_name, agent_role_override_mask).await?;
+    if should_validate_identity {
+        validate_spawn_agent_model_reasoning_effort(&session, &config).await?;
     }
-    validate_spawn_agent_model_reasoning_effort(&session, &config).await?;
     apply_spawn_agent_service_tier(
         &session,
         &mut config,

@@ -125,23 +125,39 @@ async fn handle_spawn_agent(
         config.service_tier = Some(service_tier.clone());
     }
     let is_full_history_fork = matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory));
-    let agent_role_override_mask = apply_requested_spawn_agent_model_overrides(
-        &session,
+    let identity_selection = prepare_spawn_agent_identity_selection(
         turn.as_ref(),
         &mut config,
         args.model.as_deref(),
         args.reasoning_effort.clone(),
-    )
-    .await?;
-    if !is_full_history_fork || role_name.is_some() {
-        apply_spawn_agent_role(&mut config, role_name, agent_role_override_mask).await?;
+    );
+    let role_override_mask = identity_selection.role_override_mask();
+    let applied_role = if !is_full_history_fork || role_name.is_some() {
+        let applied_role =
+            apply_spawn_agent_role(&mut config, role_name, role_override_mask).await?;
         if is_full_history_fork && config.developer_instructions.is_none() {
             config
                 .developer_instructions
                 .clone_from(&turn.developer_instructions);
         }
+        applied_role
+    } else {
+        Default::default()
+    };
+    let should_validate_identity = identity_selection.selects_identity()
+        || applied_role.model
+        || applied_role.reasoning_effort;
+    apply_explicit_spawn_agent_identity_selection(
+        &session,
+        turn.as_ref(),
+        &mut config,
+        identity_selection,
+        applied_role,
+    )
+    .await?;
+    if should_validate_identity {
+        validate_spawn_agent_model_reasoning_effort(&session, &config).await?;
     }
-    validate_spawn_agent_model_reasoning_effort(&session, &config).await?;
     apply_spawn_agent_service_tier(
         &session,
         &mut config,

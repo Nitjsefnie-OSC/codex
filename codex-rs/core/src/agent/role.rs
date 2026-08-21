@@ -40,6 +40,12 @@ pub struct AgentRoleOverrideMask {
     preserve_reasoning_effort: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AppliedAgentRoleOverrides {
+    pub(crate) model: bool,
+    pub(crate) reasoning_effort: bool,
+}
+
 impl AgentRoleOverrideMask {
     /// Preserves the model selected explicitly by the caller.
     pub fn preserve_model(&mut self) {
@@ -80,14 +86,16 @@ pub(crate) async fn apply_role_to_config(
     config: &mut Config,
     role_name: Option<&str>,
 ) -> Result<(), String> {
-    apply_role_to_config_with_mask(config, role_name, AgentRoleOverrideMask::default()).await
+    apply_role_to_config_with_mask(config, role_name, AgentRoleOverrideMask::default())
+        .await
+        .map(|_| ())
 }
 
 pub(crate) async fn apply_role_to_config_with_mask(
     config: &mut Config,
     role_name: Option<&str>,
     override_mask: AgentRoleOverrideMask,
-) -> Result<(), String> {
+) -> Result<AppliedAgentRoleOverrides, String> {
     let role_name = role_name.unwrap_or(DEFAULT_ROLE_NAME);
 
     let role = resolve_role_config(config, role_name)
@@ -102,20 +110,14 @@ pub(crate) async fn apply_role_to_config_with_mask(
         })
 }
 
-/// Applies a v2 role while retaining the caller-selected developer instructions.
-///
-/// The current role overlay preserves caller-owned fields unless the role explicitly overrides
-/// them, so v2 uses the same overlay path while keeping this call site's intent explicit.
-pub(crate) async fn apply_role_to_config_for_multi_agent_v2(
-    config: &mut Config,
-    role_name: Option<&str>,
-) -> Result<(), String> {
-    apply_role_to_config(config, role_name).await
-}
-
 /// Applies a named role to a new headless exec session without dropping the
 /// invocation's runtime safety and process state.
-pub async fn apply_exec_agent_role(
+pub async fn apply_exec_agent_role(config: &mut Config, role_name: &str) -> Result<(), String> {
+    apply_exec_agent_role_with_overrides(config, role_name, AgentRoleOverrideMask::default()).await
+}
+
+/// Applies a named role while preserving caller-selected identity fields.
+pub async fn apply_exec_agent_role_with_overrides(
     config: &mut Config,
     role_name: &str,
     override_mask: AgentRoleOverrideMask,
@@ -157,10 +159,10 @@ async fn apply_role_to_config_inner(
     role_name: &str,
     role: &AgentRoleConfig,
     override_mask: AgentRoleOverrideMask,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<AppliedAgentRoleOverrides> {
     let is_built_in = !config.agent_roles.contains_key(role_name);
     let Some(config_file) = role.config_file.as_ref() else {
-        return Ok(());
+        return Ok(AppliedAgentRoleOverrides::default());
     };
     let role_layer_toml = load_role_layer_toml(config, config_file, is_built_in, role_name).await?;
     let role_config = deserialize_config_toml_with_base(role_layer_toml, &config.codex_home)?;
@@ -175,6 +177,10 @@ async fn apply_role_to_config_inner(
         ..Default::default()
     };
     override_mask.apply(&mut overrides);
+    let applied_overrides = AppliedAgentRoleOverrides {
+        model: overrides.model.is_some(),
+        reasoning_effort: overrides.model_reasoning_effort.is_some(),
+    };
 
     if let Some(features) = role_config.features {
         for (key, enabled) in features.entries() {
@@ -210,10 +216,10 @@ async fn apply_role_to_config_inner(
         .as_table()
         .is_some_and(toml::map::Map::is_empty)
     {
-        return Ok(());
+        return Ok(applied_overrides);
     }
     *config = role_overrides::build_next_config(config, role_layer_toml, &overrides)?;
-    Ok(())
+    Ok(applied_overrides)
 }
 
 async fn load_role_layer_toml(
