@@ -84,6 +84,7 @@ const V2_DEFAULT_MODEL: &str = "gpt-5.6-terra";
 const V2_DEFAULT_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::High;
 const V2_REQUESTED_MODEL: &str = "gpt-5.6-sol";
 const V2_REQUESTED_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Low;
+const V2_ROLE_MODEL: &str = "gpt-5.6-luna";
 const ROLE_MODEL: &str = "gpt-5.4";
 const ROLE_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::High;
 const OVERRIDABLE_ROLE_MODEL: &str = "gpt-5.2";
@@ -410,6 +411,7 @@ async fn setup_turn_one_with_spawned_child(
 ) -> Result<(TestCodex, String)> {
     let (test, spawned_id, _child_request_log) = setup_turn_one_with_custom_spawned_child(
         server,
+        MultiAgentVersion::V1,
         json!({
             "message": CHILD_PROMPT,
         }),
@@ -423,6 +425,7 @@ async fn setup_turn_one_with_spawned_child(
 
 async fn setup_turn_one_with_custom_spawned_child(
     server: &MockServer,
+    multi_agent_version: MultiAgentVersion,
     spawn_args: serde_json::Value,
     child_response_delay: Option<Duration>,
     wait_for_parent_notification: bool,
@@ -434,6 +437,11 @@ async fn setup_turn_one_with_custom_spawned_child(
     String,
     core_test_support::responses::ResponseMock,
 )> {
+    let namespace = match multi_agent_version {
+        MultiAgentVersion::V1 => MULTI_AGENT_V1_NAMESPACE,
+        MultiAgentVersion::V2 => MULTI_AGENT_V2_NAMESPACE,
+        MultiAgentVersion::Disabled => anyhow::bail!("multi-agent version must be enabled"),
+    };
     let spawn_args = serde_json::to_string(&spawn_args)?;
 
     mount_sse_once_match(
@@ -441,12 +449,7 @@ async fn setup_turn_one_with_custom_spawned_child(
         |req: &wiremock::Request| body_contains(req, TURN_1_PROMPT),
         sse(vec![
             ev_response_created("resp-turn1-1"),
-            ev_function_call_with_namespace(
-                SPAWN_CALL_ID,
-                MULTI_AGENT_V1_NAMESPACE,
-                "spawn_agent",
-                &spawn_args,
-            ),
+            ev_function_call_with_namespace(SPAWN_CALL_ID, namespace, "spawn_agent", &spawn_args),
             ev_completed("resp-turn1-1"),
         ]),
     )
@@ -493,8 +496,21 @@ async fn setup_turn_one_with_custom_spawned_child(
             .features
             .enable(Feature::Collab)
             .expect("test config should allow feature update");
-        config.model = Some(INHERITED_MODEL.to_string());
-        config.model_reasoning_effort = Some(INHERITED_REASONING_EFFORT);
+        match multi_agent_version {
+            MultiAgentVersion::V1 => {
+                config.model = Some(INHERITED_MODEL.to_string());
+                config.model_reasoning_effort = Some(INHERITED_REASONING_EFFORT);
+            }
+            MultiAgentVersion::V2 => {
+                config
+                    .features
+                    .enable(Feature::MultiAgentV2)
+                    .expect("test config should allow feature update");
+                config.model = Some(V2_DEFAULT_MODEL.to_string());
+                config.model_reasoning_effort = Some(V2_DEFAULT_REASONING_EFFORT);
+            }
+            MultiAgentVersion::Disabled => unreachable!("validated above"),
+        }
     }));
     let test = builder.build_with_auto_env(server).await?;
     test.submit_turn(TURN_1_PROMPT).await?;
@@ -532,8 +548,26 @@ async fn spawn_child_and_capture_snapshot(
         core_test_support::test_codex::TestCodexBuilder,
     ) -> core_test_support::test_codex::TestCodexBuilder,
 ) -> Result<ThreadConfigSnapshot> {
+    spawn_child_and_capture_snapshot_with_version(
+        server,
+        MultiAgentVersion::V1,
+        spawn_args,
+        configure_test,
+    )
+    .await
+}
+
+async fn spawn_child_and_capture_snapshot_with_version(
+    server: &MockServer,
+    multi_agent_version: MultiAgentVersion,
+    spawn_args: serde_json::Value,
+    configure_test: impl FnOnce(
+        core_test_support::test_codex::TestCodexBuilder,
+    ) -> core_test_support::test_codex::TestCodexBuilder,
+) -> Result<ThreadConfigSnapshot> {
     let (test, spawned_id, _child_request_log) = setup_turn_one_with_custom_spawned_child(
         server,
+        multi_agent_version,
         spawn_args,
         /*child_response_delay*/ None,
         /*wait_for_parent_notification*/ false,
@@ -1620,6 +1654,7 @@ async fn spawned_agent_uses_summary_support_for_final_model(
 
     let (_test, _spawned_id, child_request_log) = setup_turn_one_with_custom_spawned_child(
         &server,
+        MultiAgentVersion::V1,
         json!({
             "message": CHILD_PROMPT,
             "model": REQUESTED_MODEL,
@@ -2612,6 +2647,172 @@ async fn spawn_agent_explicit_identity_fields_override_role_defaults(
         (child_snapshot.model, child_snapshot.reasoning_effort),
         (expected_model.to_string(), expected_reasoning_effort)
     );
+
+    Ok(())
+}
+
+#[test_case(
+    Some(V2_REQUESTED_MODEL),
+    Some(V2_REQUESTED_REASONING_EFFORT),
+    V2_REQUESTED_MODEL,
+    Some(V2_REQUESTED_REASONING_EFFORT);
+    "both explicit"
+)]
+#[test_case(
+    Some(V2_REQUESTED_MODEL),
+    None,
+    V2_REQUESTED_MODEL,
+    Some(ROLE_REASONING_EFFORT);
+    "model only"
+)]
+#[test_case(
+    None,
+    Some(V2_REQUESTED_REASONING_EFFORT),
+    V2_ROLE_MODEL,
+    Some(V2_REQUESTED_REASONING_EFFORT);
+    "reasoning effort only"
+)]
+#[test_case(
+    None,
+    None,
+    V2_ROLE_MODEL,
+    Some(ROLE_REASONING_EFFORT);
+    "role replaces configured defaults"
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_agent_v2_spawn_agent_explicit_identity_fields_override_role_defaults(
+    requested_model: Option<&str>,
+    requested_reasoning_effort: Option<ReasoningEffort>,
+    expected_model: &str,
+    expected_reasoning_effort: Option<ReasoningEffort>,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let mut spawn_args = json!({
+        "message": CHILD_PROMPT,
+        "agent_type": "custom",
+    });
+    if let Some(requested_model) = requested_model {
+        spawn_args["model"] = json!(requested_model);
+    }
+    if let Some(requested_reasoning_effort) = requested_reasoning_effort {
+        spawn_args["reasoning_effort"] = json!(requested_reasoning_effort);
+    }
+    let child_snapshot = spawn_child_and_capture_snapshot_with_version(
+        &server,
+        MultiAgentVersion::V2,
+        spawn_args,
+        |builder| {
+            builder.with_config(|config| {
+                let role_path = config.codex_home.join("custom-v2-role.toml");
+                std::fs::write(
+                    &role_path,
+                    format!(
+                        "model = \"{V2_ROLE_MODEL}\"\nmodel_reasoning_effort = \"{ROLE_REASONING_EFFORT}\"\n",
+                    ),
+                )
+                .expect("write V2 role config");
+                config.agent_roles.insert(
+                    "custom".to_string(),
+                    AgentRoleConfig {
+                        description: Some("Custom V2 role".to_string()),
+                        config_file: Some(role_path.to_path_buf()),
+                        nickname_candidates: None,
+                    },
+                );
+                config.agent_default_subagent_model =
+                    Some("missing-configured-v2-model".to_string());
+                config.agent_default_subagent_reasoning_effort = Some(ReasoningEffort::Minimal);
+            })
+        },
+    )
+    .await?;
+
+    assert_eq!(
+        (child_snapshot.model, child_snapshot.reasoning_effort),
+        (expected_model.to_string(), expected_reasoning_effort)
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_agent_v2_spawn_agent_rejects_invalid_final_model_effort_pair() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let spawn_args = serde_json::to_string(&json!({
+        "message": CHILD_PROMPT,
+        "agent_type": "custom",
+        "reasoning_effort": ReasoningEffort::Minimal,
+    }))?;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| body_contains(request, TURN_1_PROMPT),
+        sse(vec![
+            ev_response_created("resp-v2-turn1-1"),
+            ev_function_call_with_namespace(
+                SPAWN_CALL_ID,
+                MULTI_AGENT_V2_NAMESPACE,
+                "spawn_agent",
+                &spawn_args,
+            ),
+            ev_completed("resp-v2-turn1-1"),
+        ]),
+    )
+    .await;
+    let tool_output = mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| body_contains(request, SPAWN_CALL_ID),
+        sse(vec![
+            ev_response_created("resp-v2-turn1-2"),
+            ev_completed("resp-v2-turn1-2"),
+        ]),
+    )
+    .await;
+
+    let test = test_codex()
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::Collab)
+                .expect("test config should allow feature update");
+            config
+                .features
+                .enable(Feature::MultiAgentV2)
+                .expect("test config should allow feature update");
+            config.model = Some(V2_DEFAULT_MODEL.to_string());
+            config.model_reasoning_effort = Some(V2_DEFAULT_REASONING_EFFORT);
+            let role_path = config.codex_home.join("invalid-v2-role.toml");
+            std::fs::write(
+                &role_path,
+                format!(
+                    "model = \"{V2_ROLE_MODEL}\"\nmodel_reasoning_effort = \"{ROLE_REASONING_EFFORT}\"\n",
+                ),
+            )
+            .expect("write invalid V2 role config");
+            config.agent_roles.insert(
+                "custom".to_string(),
+                AgentRoleConfig {
+                    description: Some("Custom V2 role".to_string()),
+                    config_file: Some(role_path.to_path_buf()),
+                    nickname_candidates: None,
+                },
+            );
+        })
+        .build_with_auto_env(&server)
+        .await?;
+
+    test.submit_turn(TURN_1_PROMPT).await?;
+
+    let (output, _) = tool_output
+        .single_request()
+        .function_call_output_content_and_success(SPAWN_CALL_ID)
+        .expect("spawn_agent output");
+    assert!(output.as_deref().is_some_and(|output| {
+        output.contains("Reasoning effort `minimal` is not supported for model `gpt-5.6-luna`")
+    }));
 
     Ok(())
 }
