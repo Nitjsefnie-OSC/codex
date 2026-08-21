@@ -100,7 +100,7 @@ impl WhoamiOutput {
 }
 
 impl ToolOutput for WhoamiOutput {
-    fn log_preview(&self) -> String {
+    fn log_output(&self) -> String {
         self.fragment()
     }
 
