@@ -312,6 +312,7 @@ impl AgentControl {
             })
             .await?;
         let stored_model = stored_thread.model.clone();
+        let stored_reasoning_effort = stored_thread.reasoning_effort.clone();
         let stored_model_provider = stored_thread.model_provider.clone();
         let stored_source = stored_thread.source.clone();
         let stored_parent_thread_id = stored_thread.parent_thread_id;
@@ -371,6 +372,9 @@ impl AgentControl {
         }
         if let Some(model) = stored_model {
             config.model = Some(model);
+        }
+        if let Some(reasoning_effort) = stored_reasoning_effort {
+            config.model_reasoning_effort = Some(reasoning_effort);
         }
         if config.model_provider_id != stored_model_provider {
             config.model_provider = config

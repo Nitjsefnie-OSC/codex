@@ -88,7 +88,7 @@ include_permissions_instructions = false
     let runtime_cwd = config.cwd.clone();
     let runtime_workspace_roots = config.workspace_roots.clone();
 
-    apply_exec_agent_role(&mut config, "adversary")
+    apply_exec_agent_role(&mut config, "adversary", AgentRoleOverrideMask::default())
         .await
         .expect("exec role should apply");
 
@@ -120,9 +120,13 @@ include_permissions_instructions = false
 async fn apply_exec_agent_role_rejects_unknown_role() {
     let (_home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
 
-    let error = apply_exec_agent_role(&mut config, "missing-role")
-        .await
-        .expect_err("unknown exec role should fail");
+    let error = apply_exec_agent_role(
+        &mut config,
+        "missing-role",
+        AgentRoleOverrideMask::default(),
+    )
+    .await
+    .expect_err("unknown exec role should fail");
 
     assert_eq!(error, "unknown agent_type 'missing-role'");
 }
@@ -750,7 +754,7 @@ fn spawn_tool_spec_lists_user_defined_roles_before_built_ins() {
 }
 
 #[test]
-fn spawn_tool_spec_marks_role_locked_model_and_reasoning_effort() {
+fn spawn_tool_spec_marks_role_model_and_reasoning_effort_defaults() {
     let tempdir = TempDir::new().expect("create temp dir");
     let role_path = tempdir.path().join("researcher.toml");
     fs::write(
@@ -770,12 +774,12 @@ fn spawn_tool_spec_marks_role_locked_model_and_reasoning_effort() {
     let spec = spawn_tool_spec::build(&user_defined_roles);
 
     assert!(spec.contains(
-            "Research carefully.\n- This role's model is set to `gpt-5` and its reasoning effort is set to `high`. These settings cannot be changed."
+            "Research carefully.\n- This role's model defaults to `gpt-5` and its reasoning effort defaults to `high`. Explicit `model` and `reasoning_effort` spawn arguments override these defaults."
         ));
 }
 
 #[test]
-fn spawn_tool_spec_marks_role_locked_reasoning_effort_only() {
+fn spawn_tool_spec_marks_role_reasoning_effort_default() {
     let tempdir = TempDir::new().expect("create temp dir");
     let role_path = tempdir.path().join("reviewer.toml");
     fs::write(
@@ -795,7 +799,7 @@ fn spawn_tool_spec_marks_role_locked_reasoning_effort_only() {
     let spec = spawn_tool_spec::build(&user_defined_roles);
 
     assert!(spec.contains(
-            "Review carefully.\n- This role's reasoning effort is set to `medium` and cannot be changed."
+            "Review carefully.\n- This role's reasoning effort defaults to `medium`. An explicit `reasoning_effort` spawn argument overrides this default."
         ));
 }
 

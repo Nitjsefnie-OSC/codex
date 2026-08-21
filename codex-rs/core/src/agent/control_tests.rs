@@ -39,6 +39,7 @@ use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
@@ -711,6 +712,7 @@ fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent_body()
         let agent_path = AgentPath::try_from("/root/worker").expect("agent path");
         let mut child_config = harness.config.clone();
         child_config.model = Some("gpt-5.6-luna".to_string());
+        child_config.model_reasoning_effort = Some(ReasoningEffort::High);
         let spawned_agent = harness
             .control
             .spawn_agent_with_metadata(
@@ -753,6 +755,7 @@ fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent_body()
             .await
             .expect("child metadata should be readable");
         assert_eq!(stored_child.history_mode, ThreadHistoryMode::Paginated);
+        assert_eq!(stored_child.reasoning_effort, Some(ReasoningEffort::High));
 
         assert!(
             harness
@@ -770,6 +773,7 @@ fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent_body()
         }
 
         let mut sender_config = harness.config.clone();
+        sender_config.model_reasoning_effort = Some(ReasoningEffort::Minimal);
         sender_config.model_provider_id = "ollama".to_string();
         sender_config.model_provider = sender_config
             .model_providers
@@ -787,10 +791,11 @@ fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent_body()
             .get_thread(spawned_agent.thread_id)
             .await
             .expect("reloaded child thread should exist");
+        let reloaded_snapshot = reloaded_child.config_snapshot().await;
         assert_eq!(
-            reloaded_child.config_snapshot().await.model,
-            "gpt-5.6-luna",
-            "residency reload must preserve the worker model instead of inheriting its parent model",
+            (reloaded_snapshot.model, reloaded_snapshot.reasoning_effort),
+            ("gpt-5.6-luna".to_string(), Some(ReasoningEffort::High)),
+            "residency reload must preserve the worker identity instead of inheriting its sender's identity",
         );
         assert_eq!(
             (

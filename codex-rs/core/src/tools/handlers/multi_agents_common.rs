@@ -1,4 +1,5 @@
-use crate::agent::role::apply_role_to_config;
+use crate::agent::role::AgentRoleOverrideMask;
+use crate::agent::role::apply_role_to_config_with_mask;
 use crate::config::Config;
 use crate::config::DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS;
 use crate::config::HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS;
@@ -266,12 +267,19 @@ pub(crate) async fn apply_requested_spawn_agent_model_overrides(
     config: &mut Config,
     requested_model: Option<&str>,
     requested_reasoning_effort: Option<ReasoningEffort>,
-) -> Result<(), FunctionCallError> {
+) -> Result<AgentRoleOverrideMask, FunctionCallError> {
+    let mut override_mask = AgentRoleOverrideMask::default();
+    if requested_model.is_some() {
+        override_mask.preserve_model();
+    }
+    if requested_reasoning_effort.is_some() {
+        override_mask.preserve_reasoning_effort();
+    }
     let requested_model = requested_model.or(turn.config.agent_default_subagent_model.as_deref());
     let requested_reasoning_effort = requested_reasoning_effort
         .or_else(|| turn.config.agent_default_subagent_reasoning_effort.clone());
     if requested_model.is_none() && requested_reasoning_effort.is_none() {
-        return Ok(());
+        return Ok(override_mask);
     }
 
     if let Some(requested_model) = requested_model {
@@ -293,29 +301,19 @@ pub(crate) async fn apply_requested_spawn_agent_model_overrides(
 
         config.model = Some(selected_model_name.clone());
         if let Some(reasoning_effort) = requested_reasoning_effort {
-            validate_spawn_agent_reasoning_effort(
-                &selected_model_name,
-                &selected_model_info.supported_reasoning_levels,
-                &reasoning_effort,
-            )?;
             config.model_reasoning_effort = Some(reasoning_effort);
         } else {
             config.model_reasoning_effort = selected_model_info.default_reasoning_level;
         }
 
-        return Ok(());
+        return Ok(override_mask);
     }
 
     if let Some(reasoning_effort) = requested_reasoning_effort {
-        validate_spawn_agent_reasoning_effort(
-            &turn.model_info.slug,
-            &turn.model_info.supported_reasoning_levels,
-            &reasoning_effort,
-        )?;
         config.model_reasoning_effort = Some(reasoning_effort);
     }
 
-    Ok(())
+    Ok(override_mask)
 }
 
 pub(crate) async fn apply_spawn_agent_service_tier(
@@ -374,20 +372,19 @@ pub(crate) async fn apply_spawn_agent_service_tier(
 }
 
 pub(crate) async fn apply_spawn_agent_role(
-    session: &Session,
     config: &mut Config,
     role_name: Option<&str>,
+    override_mask: AgentRoleOverrideMask,
 ) -> Result<(), FunctionCallError> {
-    let previous_model = config.model.clone();
-    let previous_reasoning_effort = config.model_reasoning_effort.clone();
-    apply_role_to_config(config, role_name)
+    apply_role_to_config_with_mask(config, role_name, override_mask)
         .await
-        .map_err(FunctionCallError::RespondToModel)?;
-    if config.model == previous_model && config.model_reasoning_effort == previous_reasoning_effort
-    {
-        return Ok(());
-    }
+        .map_err(FunctionCallError::RespondToModel)
+}
 
+pub(crate) async fn validate_spawn_agent_model_reasoning_effort(
+    session: &Session,
+    config: &Config,
+) -> Result<(), FunctionCallError> {
     let Some(reasoning_effort) = config.model_reasoning_effort.clone() else {
         return Ok(());
     };

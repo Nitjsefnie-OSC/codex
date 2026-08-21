@@ -61,6 +61,7 @@ use codex_config::ConfigLoadError;
 use codex_config::ConfigLoadOptions;
 use codex_config::LoaderOverrides;
 use codex_config::format_config_error_with_source;
+use codex_core::AgentRoleOverrideMask;
 use codex_core::StateDbHandle;
 use codex_core::apply_exec_agent_role;
 use codex_core::check_execpolicy_for_warnings;
@@ -310,6 +311,16 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
             std::process::exit(1);
         }
     };
+    let mut agent_role_override_mask = AgentRoleOverrideMask::default();
+    if model_cli_arg.is_some() || cli_kv_overrides.iter().any(|(key, _)| key == "model") {
+        agent_role_override_mask.preserve_model();
+    }
+    if cli_kv_overrides
+        .iter()
+        .any(|(key, _)| key == "model_reasoning_effort")
+    {
+        agent_role_override_mask.preserve_reasoning_effort();
+    }
 
     let resolved_cwd = cwd.clone();
     let config_cwd = match resolved_cwd.as_deref() {
@@ -454,7 +465,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     )
     .await?;
     if let Some(agent) = agent.as_deref() {
-        apply_exec_agent_role(&mut config, agent)
+        apply_exec_agent_role(&mut config, agent, agent_role_override_mask)
             .await
             .map_err(anyhow::Error::msg)?;
     }

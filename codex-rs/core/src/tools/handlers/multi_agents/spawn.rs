@@ -94,7 +94,7 @@ async fn handle_spawn_agent(
     if args.fork_context {
         reject_full_fork_agent_type_override(role_name)?;
     }
-    apply_requested_spawn_agent_model_overrides(
+    let agent_role_override_mask = apply_requested_spawn_agent_model_overrides(
         &session,
         turn.as_ref(),
         &mut config,
@@ -103,8 +103,9 @@ async fn handle_spawn_agent(
     )
     .await?;
     if !args.fork_context {
-        apply_spawn_agent_role(&session, &mut config, role_name).await?;
+        apply_spawn_agent_role(&mut config, role_name, agent_role_override_mask).await?;
     }
+    validate_spawn_agent_model_reasoning_effort(&session, &config).await?;
     apply_spawn_agent_service_tier(
         &session,
         &mut config,

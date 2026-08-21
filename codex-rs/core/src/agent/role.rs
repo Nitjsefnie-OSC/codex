@@ -33,6 +33,34 @@ use toml::Value as TomlValue;
 pub const DEFAULT_ROLE_NAME: &str = "default";
 const AGENT_TYPE_UNAVAILABLE_ERROR: &str = "agent type is currently not available";
 
+/// Identifies caller-selected identity fields that a role must not replace.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AgentRoleOverrideMask {
+    preserve_model: bool,
+    preserve_reasoning_effort: bool,
+}
+
+impl AgentRoleOverrideMask {
+    /// Preserves the model selected explicitly by the caller.
+    pub fn preserve_model(&mut self) {
+        self.preserve_model = true;
+    }
+
+    /// Preserves the reasoning effort selected explicitly by the caller.
+    pub fn preserve_reasoning_effort(&mut self) {
+        self.preserve_reasoning_effort = true;
+    }
+
+    fn apply(self, overrides: &mut AgentRoleOverrides) {
+        if self.preserve_model {
+            overrides.model = None;
+        }
+        if self.preserve_reasoning_effort {
+            overrides.model_reasoning_effort = None;
+        }
+    }
+}
+
 #[derive(Default, Serialize)]
 struct AgentRoleOverrides {
     developer_instructions: Option<String>,
@@ -52,13 +80,21 @@ pub(crate) async fn apply_role_to_config(
     config: &mut Config,
     role_name: Option<&str>,
 ) -> Result<(), String> {
+    apply_role_to_config_with_mask(config, role_name, AgentRoleOverrideMask::default()).await
+}
+
+pub(crate) async fn apply_role_to_config_with_mask(
+    config: &mut Config,
+    role_name: Option<&str>,
+    override_mask: AgentRoleOverrideMask,
+) -> Result<(), String> {
     let role_name = role_name.unwrap_or(DEFAULT_ROLE_NAME);
 
     let role = resolve_role_config(config, role_name)
         .cloned()
         .ok_or_else(|| format!("unknown agent_type '{role_name}'"))?;
 
-    apply_role_to_config_inner(config, role_name, &role)
+    apply_role_to_config_inner(config, role_name, &role, override_mask)
         .await
         .map_err(|err| {
             tracing::warn!("failed to apply role to config: {err}");
@@ -79,7 +115,11 @@ pub(crate) async fn apply_role_to_config_for_multi_agent_v2(
 
 /// Applies a named role to a new headless exec session without dropping the
 /// invocation's runtime safety and process state.
-pub async fn apply_exec_agent_role(config: &mut Config, role_name: &str) -> Result<(), String> {
+pub async fn apply_exec_agent_role(
+    config: &mut Config,
+    role_name: &str,
+    override_mask: AgentRoleOverrideMask,
+) -> Result<(), String> {
     let runtime_permissions = config.permissions.clone();
     let runtime_explicit_permission_profile_mode = config.explicit_permission_profile_mode;
     let runtime_include_permissions_instructions = config.include_permissions_instructions;
@@ -94,7 +134,7 @@ pub async fn apply_exec_agent_role(config: &mut Config, role_name: &str) -> Resu
     let runtime_main_execve_wrapper_exe = config.main_execve_wrapper_exe.clone();
     let runtime_zsh_path = config.zsh_path.clone();
 
-    apply_role_to_config(config, Some(role_name)).await?;
+    apply_role_to_config_with_mask(config, Some(role_name), override_mask).await?;
 
     config.permissions = runtime_permissions;
     config.explicit_permission_profile_mode = runtime_explicit_permission_profile_mode;
@@ -116,6 +156,7 @@ async fn apply_role_to_config_inner(
     config: &mut Config,
     role_name: &str,
     role: &AgentRoleConfig,
+    override_mask: AgentRoleOverrideMask,
 ) -> anyhow::Result<()> {
     let is_built_in = !config.agent_roles.contains_key(role_name);
     let Some(config_file) = role.config_file.as_ref() else {
@@ -133,6 +174,7 @@ async fn apply_role_to_config_inner(
         service_tier: role_config.service_tier,
         ..Default::default()
     };
+    override_mask.apply(&mut overrides);
 
     if let Some(features) = role_config.features {
         for (key, enabled) in features.entries() {
@@ -341,7 +383,7 @@ pub(crate) mod spawn_tool_spec {
 
     fn format_role(name: &str, declaration: &AgentRoleConfig) -> String {
         if let Some(description) = &declaration.description {
-            let locked_settings_note = declaration
+            let role_settings_note = declaration
                 .config_file
                 .as_ref()
                 .and_then(|config_file| {
@@ -363,16 +405,16 @@ pub(crate) mod spawn_tool_spec {
 
                     let model_and_reasoning_note = match (model, reasoning_effort) {
                         (Some(model), Some(reasoning_effort)) => format!(
-                            "\n- This role's model is set to `{model}` and its reasoning effort is set to `{reasoning_effort}`. These settings cannot be changed."
+                            "\n- This role's model defaults to `{model}` and its reasoning effort defaults to `{reasoning_effort}`. Explicit `model` and `reasoning_effort` spawn arguments override these defaults."
                         ),
                         (Some(model), None) => {
                             format!(
-                                "\n- This role's model is set to `{model}` and cannot be changed."
+                                "\n- This role's model defaults to `{model}`. An explicit `model` spawn argument overrides this default."
                             )
                         }
                         (None, Some(reasoning_effort)) => {
                             format!(
-                                "\n- This role's reasoning effort is set to `{reasoning_effort}` and cannot be changed."
+                                "\n- This role's reasoning effort defaults to `{reasoning_effort}`. An explicit `reasoning_effort` spawn argument overrides this default."
                             )
                         }
                         (None, None) => String::new(),
@@ -387,7 +429,7 @@ pub(crate) mod spawn_tool_spec {
                     format!("{model_and_reasoning_note}{service_tier_note}")
                 })
                 .unwrap_or_default();
-            format!("{name}: {{\n{description}{locked_settings_note}\n}}")
+            format!("{name}: {{\n{description}{role_settings_note}\n}}")
         } else {
             format!("{name}: no description")
         }
