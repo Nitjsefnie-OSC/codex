@@ -722,6 +722,21 @@ fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent_body(
         let _ = config.features.enable(Feature::MultiAgentV2);
         let _ = config.features.enable(Feature::Sqlite);
         config.model = Some("gpt-5.6-sol".to_string());
+        let role_path = home.path().join("reload-role.toml");
+        tokio::fs::write(
+            &role_path,
+            "model = \"gpt-5.6-terra\"\nmodel_reasoning_effort = \"high\"\n",
+        )
+        .await
+        .expect("reload role config should be written");
+        config.agent_roles.insert(
+            "reload-role".to_string(),
+            AgentRoleConfig {
+                description: Some("Reload role".to_string()),
+                config_file: Some(role_path),
+                nickname_candidates: None,
+            },
+        );
         let harness = AgentControlHarness::new_with_config(home, config).await;
         let (parent_thread_id, _parent_thread) = harness.start_paginated_thread().await;
         let agent_path = AgentPath::try_from("/root/worker").expect("agent path");
@@ -738,7 +753,7 @@ fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent_body(
                     depth: 1,
                     agent_path: Some(agent_path.clone()),
                     agent_nickname: None,
-                    agent_role: None,
+                    agent_role: Some("reload-role".to_string()),
                 })),
                 SpawnAgentOptions {
                     parent_thread_id: Some(parent_thread_id),
@@ -771,6 +786,7 @@ fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent_body(
             .expect("child metadata should be readable");
         assert_eq!(stored_child.history_mode, ThreadHistoryMode::Paginated);
         assert_eq!(stored_child.reasoning_effort, child_reasoning_effort);
+        assert_eq!(stored_child.agent_role.as_deref(), Some("reload-role"));
 
         assert!(
             harness

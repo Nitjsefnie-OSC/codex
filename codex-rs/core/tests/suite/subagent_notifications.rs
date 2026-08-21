@@ -82,8 +82,6 @@ const REQUESTED_MODEL: &str = "gpt-5.4";
 const REQUESTED_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Low;
 const V2_DEFAULT_MODEL: &str = "gpt-5.6-terra";
 const V2_DEFAULT_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::High;
-const V2_REQUESTED_MODEL: &str = "gpt-5.6-sol";
-const V2_REQUESTED_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Low;
 const V2_ROLE_MODEL: &str = "gpt-5.6-luna";
 const ROLE_MODEL: &str = "gpt-5.4";
 const ROLE_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::High;
@@ -372,33 +370,24 @@ async fn wait_for_spawned_thread_id(test: &TestCodex) -> Result<String> {
 async fn wait_for_requests(
     mock: &core_test_support::responses::ResponseMock,
 ) -> Result<Vec<ResponsesRequest>> {
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        let requests = mock.requests();
-        if !requests.is_empty() {
-            return Ok(requests);
-        }
-        if Instant::now() >= deadline {
-            anyhow::bail!("expected at least 1 request, got {}", requests.len());
-        }
-        sleep(Duration::from_millis(10)).await;
-    }
+    wait_for_requests_matching(mock, |_| true, "expected at least 1 request")
+        .await
+        .map_err(|err| anyhow::anyhow!("{err}; got {}", mock.requests().len()))
 }
 
-async fn wait_for_v2_child_request(
+async fn wait_for_requests_matching(
     mock: &core_test_support::responses::ResponseMock,
+    predicate: impl Fn(&ResponsesRequest) -> bool,
+    timeout_message: &str,
 ) -> Result<Vec<ResponsesRequest>> {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         let requests = mock.requests();
-        if requests
-            .iter()
-            .any(|request| !request.inputs_of_type("agent_message").is_empty())
-        {
+        if requests.iter().any(|request| predicate(request)) {
             return Ok(requests);
         }
         if Instant::now() >= deadline {
-            anyhow::bail!("timed out waiting for V2 child agent message request");
+            anyhow::bail!("{timeout_message}");
         }
         sleep(Duration::from_millis(10)).await;
     }
@@ -556,7 +545,12 @@ async fn setup_turn_one_with_custom_spawned_child(
         }
     }
     if multi_agent_version == MultiAgentVersion::V2 {
-        let _ = wait_for_v2_child_request(&child_request_log).await?;
+        let _ = wait_for_requests_matching(
+            &child_request_log,
+            |request| !request.inputs_of_type("agent_message").is_empty(),
+            "timed out waiting for V2 child agent message request",
+        )
+        .await?;
     }
 
     let spawned_id = wait_for_spawned_thread_id(&test).await?;
@@ -1062,7 +1056,7 @@ async fn spawned_child_receives_forked_parent_context(
     test.submit_turn(TURN_1_PROMPT).await?;
     let parent_body = spawn_turn.single_request().body_json();
 
-    let child_request = wait_for_request_with_model(&child_request_log, REQUESTED_MODEL).await?;
+    let child_request = wait_for_request_with_model(&child_request_log, INHERITED_MODEL).await?;
     assert!(child_request.body_contains_text(TURN_0_FORK_PROMPT));
     let child_body = child_request.body_json();
     let original_parent_turn_id = parent_body["client_metadata"]["turn_id"]
@@ -1078,8 +1072,8 @@ async fn spawned_child_receives_forked_parent_context(
             child_body["reasoning"]["effort"].clone(),
         ),
         (
-            json!(REQUESTED_MODEL),
-            json!(REQUESTED_REASONING_EFFORT.to_string()),
+            json!(INHERITED_MODEL),
+            json!(INHERITED_REASONING_EFFORT.to_string()),
         )
     );
     let child_thread_id = ThreadId::from_string(
@@ -1143,7 +1137,6 @@ async fn spawned_child_receives_forked_parent_context(
 #[derive(Clone, Copy)]
 enum FullHistoryV2ModelSelection {
     ConfiguredDefault,
-    ExplicitOverride,
     WorldStateIdentity,
     CurrentTimeReminders,
     MultiAgentModeInstructions,
@@ -1151,7 +1144,6 @@ enum FullHistoryV2ModelSelection {
 }
 
 #[test_case(FullHistoryV2ModelSelection::ConfiguredDefault; "configured default with omitted fork_turns")]
-#[test_case(FullHistoryV2ModelSelection::ExplicitOverride; "explicit override with fork_turns all")]
 #[test_case(FullHistoryV2ModelSelection::WorldStateIdentity; "world state appends context window when agent identity changes")]
 #[test_case(FullHistoryV2ModelSelection::CurrentTimeReminders; "full fork drops inherited current-time reminders")]
 #[test_case(FullHistoryV2ModelSelection::MultiAgentModeInstructions; "full fork drops inherited multi-agent mode instructions")]
@@ -1183,19 +1175,8 @@ async fn spawned_full_history_v2_child_uses_model_precedence_without_dropping_co
                 "message": CHILD_PROMPT,
                 "task_name": "worker",
             }),
-            V2_DEFAULT_MODEL,
-            V2_DEFAULT_REASONING_EFFORT,
-        ),
-        FullHistoryV2ModelSelection::ExplicitOverride => (
-            json!({
-                "message": CHILD_PROMPT,
-                "task_name": "worker",
-                "fork_turns": "all",
-                "model": V2_REQUESTED_MODEL,
-                "reasoning_effort": V2_REQUESTED_REASONING_EFFORT,
-            }),
-            V2_REQUESTED_MODEL,
-            V2_REQUESTED_REASONING_EFFORT,
+            INHERITED_MODEL,
+            INHERITED_REASONING_EFFORT,
         ),
     };
     let spawn_args = serde_json::to_string(&spawn_args)?;
@@ -1277,7 +1258,7 @@ async fn spawned_full_history_v2_child_uses_model_precedence_without_dropping_co
         let model_catalog = config.model_catalog.get_or_insert_with(|| {
             bundled_models_response().expect("bundled models.json should parse")
         });
-        for model in [INHERITED_MODEL, V2_DEFAULT_MODEL, V2_REQUESTED_MODEL] {
+        for model in [INHERITED_MODEL, V2_DEFAULT_MODEL] {
             let model_info = model_catalog
                 .models
                 .iter_mut()
@@ -1423,10 +1404,11 @@ async fn spawned_full_history_v2_child_uses_model_precedence_without_dropping_co
             1
         );
     }
-    assert!(!child_developer_messages.iter().any(|message| {
-        message.contains(&format!("{INHERITED_MODEL} root role."))
-            || message.contains(&format!("{INHERITED_MODEL} subagent role."))
-    }));
+    assert!(
+        !child_developer_messages
+            .iter()
+            .any(|message| message.contains(&format!("{INHERITED_MODEL} root role.")))
+    );
     if matches!(
         selection,
         FullHistoryV2ModelSelection::MultiAgentModeInstructions
@@ -2613,263 +2595,6 @@ async fn skills_toggle_skips_instructions_for_parent_and_spawned_child() -> Resu
     Ok(())
 }
 
-#[test_case(
-    Some(REQUESTED_MODEL),
-    Some(REQUESTED_REASONING_EFFORT),
-    REQUESTED_MODEL,
-    Some(REQUESTED_REASONING_EFFORT);
-    "both explicit"
-)]
-#[test_case(
-    Some(REQUESTED_MODEL),
-    None,
-    REQUESTED_MODEL,
-    Some(ROLE_REASONING_EFFORT);
-    "model only"
-)]
-#[test_case(
-    None,
-    Some(REQUESTED_REASONING_EFFORT),
-    OVERRIDABLE_ROLE_MODEL,
-    Some(REQUESTED_REASONING_EFFORT);
-    "reasoning effort only"
-)]
-#[test_case(
-    None,
-    None,
-    OVERRIDABLE_ROLE_MODEL,
-    Some(ROLE_REASONING_EFFORT);
-    "role replaces configured defaults"
-)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn spawn_agent_explicit_identity_fields_override_role_defaults(
-    requested_model: Option<&str>,
-    requested_reasoning_effort: Option<ReasoningEffort>,
-    expected_model: &str,
-    expected_reasoning_effort: Option<ReasoningEffort>,
-) -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-    let mut spawn_args = json!({
-        "message": CHILD_PROMPT,
-        "agent_type": "custom",
-    });
-    if let Some(requested_model) = requested_model {
-        spawn_args["model"] = json!(requested_model);
-    }
-    if let Some(requested_reasoning_effort) = requested_reasoning_effort {
-        spawn_args["reasoning_effort"] = json!(requested_reasoning_effort);
-    }
-    let child_snapshot = spawn_child_and_capture_snapshot(
-        &server,
-        spawn_args,
-        |builder| {
-            builder.with_config(|config| {
-                let role_path = config.codex_home.join("custom-role.toml");
-                std::fs::write(
-                    &role_path,
-                    format!(
-                        "model = \"{OVERRIDABLE_ROLE_MODEL}\"\nmodel_reasoning_effort = \"{ROLE_REASONING_EFFORT}\"\n",
-                    ),
-                )
-                .expect("write role config");
-                config.agent_roles.insert(
-                    "custom".to_string(),
-                    AgentRoleConfig {
-                        description: Some("Custom role".to_string()),
-                        config_file: Some(role_path.to_path_buf()),
-                        nickname_candidates: None,
-                    },
-                );
-                config.agent_default_subagent_model =
-                    Some("missing-configured-model".to_string());
-                config.agent_default_subagent_reasoning_effort = Some(ReasoningEffort::Minimal);
-            })
-        },
-    )
-    .await?;
-
-    assert_eq!(
-        (child_snapshot.model, child_snapshot.reasoning_effort),
-        (expected_model.to_string(), expected_reasoning_effort)
-    );
-
-    Ok(())
-}
-
-#[test_case(
-    Some(V2_REQUESTED_MODEL),
-    Some(V2_REQUESTED_REASONING_EFFORT),
-    V2_REQUESTED_MODEL,
-    Some(V2_REQUESTED_REASONING_EFFORT);
-    "both explicit"
-)]
-#[test_case(
-    Some(V2_REQUESTED_MODEL),
-    None,
-    V2_REQUESTED_MODEL,
-    Some(ROLE_REASONING_EFFORT);
-    "model only"
-)]
-#[test_case(
-    None,
-    Some(V2_REQUESTED_REASONING_EFFORT),
-    V2_ROLE_MODEL,
-    Some(V2_REQUESTED_REASONING_EFFORT);
-    "reasoning effort only"
-)]
-#[test_case(
-    None,
-    None,
-    V2_ROLE_MODEL,
-    Some(ROLE_REASONING_EFFORT);
-    "role replaces configured defaults"
-)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn multi_agent_v2_spawn_agent_explicit_identity_fields_override_role_defaults(
-    requested_model: Option<&str>,
-    requested_reasoning_effort: Option<ReasoningEffort>,
-    expected_model: &str,
-    expected_reasoning_effort: Option<ReasoningEffort>,
-) -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-    let mut spawn_args = json!({
-        "message": CHILD_PROMPT,
-        "agent_type": "custom",
-        "task_name": "v2_role_override",
-        "fork_turns": "none",
-    });
-    if let Some(requested_model) = requested_model {
-        spawn_args["model"] = json!(requested_model);
-    }
-    if let Some(requested_reasoning_effort) = requested_reasoning_effort {
-        spawn_args["reasoning_effort"] = json!(requested_reasoning_effort);
-    }
-    let child_snapshot = spawn_child_and_capture_snapshot_with_version(
-        &server,
-        MultiAgentVersion::V2,
-        spawn_args,
-        Some(expected_model),
-        expected_reasoning_effort.clone(),
-        |builder| {
-            builder.with_config(|config| {
-                let role_path = config.codex_home.join("custom-v2-role.toml");
-                std::fs::write(
-                    &role_path,
-                    format!(
-                        "model = \"{V2_ROLE_MODEL}\"\nmodel_reasoning_effort = \"{ROLE_REASONING_EFFORT}\"\n",
-                    ),
-                )
-                .expect("write V2 role config");
-                config.agent_roles.insert(
-                    "custom".to_string(),
-                    AgentRoleConfig {
-                        description: Some("Custom V2 role".to_string()),
-                        config_file: Some(role_path.to_path_buf()),
-                        nickname_candidates: None,
-                    },
-                );
-                config.agent_default_subagent_model =
-                    Some("missing-configured-v2-model".to_string());
-                config.agent_default_subagent_reasoning_effort = Some(ReasoningEffort::Minimal);
-            })
-        },
-    )
-    .await?;
-
-    assert_eq!(
-        (child_snapshot.model, child_snapshot.reasoning_effort),
-        (expected_model.to_string(), expected_reasoning_effort)
-    );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn multi_agent_v2_spawn_agent_rejects_invalid_final_model_effort_pair() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-    let spawn_args = serde_json::to_string(&json!({
-        "message": CHILD_PROMPT,
-        "agent_type": "custom",
-        "task_name": "v2-invalid-pair",
-        "fork_turns": "none",
-        "reasoning_effort": ReasoningEffort::Minimal,
-    }))?;
-    mount_sse_once_match(
-        &server,
-        |request: &wiremock::Request| body_contains(request, TURN_1_PROMPT),
-        sse(vec![
-            ev_response_created("resp-v2-turn1-1"),
-            ev_function_call_with_namespace(
-                SPAWN_CALL_ID,
-                MULTI_AGENT_V2_NAMESPACE,
-                "spawn_agent",
-                &spawn_args,
-            ),
-            ev_completed("resp-v2-turn1-1"),
-        ]),
-    )
-    .await;
-    let tool_output = mount_sse_once_match(
-        &server,
-        |request: &wiremock::Request| body_contains(request, SPAWN_CALL_ID),
-        sse(vec![
-            ev_response_created("resp-v2-turn1-2"),
-            ev_completed("resp-v2-turn1-2"),
-        ]),
-    )
-    .await;
-
-    let test = test_codex()
-        .with_config(|config| {
-            config
-                .features
-                .enable(Feature::Collab)
-                .expect("test config should allow feature update");
-            config
-                .features
-                .enable(Feature::MultiAgentV2)
-                .expect("test config should allow feature update");
-            config.model = Some(V2_DEFAULT_MODEL.to_string());
-            config.model_reasoning_effort = Some(V2_DEFAULT_REASONING_EFFORT);
-            let role_path = config.codex_home.join("invalid-v2-role.toml");
-            std::fs::write(
-                &role_path,
-                format!(
-                    "model = \"{V2_ROLE_MODEL}\"\nmodel_reasoning_effort = \"{ROLE_REASONING_EFFORT}\"\n",
-                ),
-            )
-            .expect("write invalid V2 role config");
-            config.agent_roles.insert(
-                "custom".to_string(),
-                AgentRoleConfig {
-                    description: Some("Custom V2 role".to_string()),
-                    config_file: Some(role_path.to_path_buf()),
-                    nickname_candidates: None,
-                },
-            );
-        })
-        .build_with_auto_env(&server)
-        .await?;
-
-    test.submit_turn(TURN_1_PROMPT).await?;
-
-    let (output, _) = tool_output
-        .single_request()
-        .function_call_output_content_and_success(SPAWN_CALL_ID)
-        .expect("spawn_agent output");
-    assert!(output.as_deref().is_some_and(|output| {
-        output.contains("Reasoning effort `minimal` is not supported for model `gpt-5.6-luna`")
-    }));
-
-    Ok(())
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_agent_preserves_configured_defaults_through_unrelated_role() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -2983,75 +2708,5 @@ async fn spawn_agent_rejects_reasoning_effort_unsupported_by_role_model() -> Res
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn spawn_agent_tool_description_mentions_overridable_role_defaults() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-    let call_id = "tool-search-spawn-agent";
-    let resp_mock = mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
-                ev_response_created("resp-turn1-1"),
-                ev_tool_search_call(
-                    call_id,
-                    &json!({
-                        "query": "spawn agent custom role",
-                        "limit": 1,
-                    }),
-                ),
-                ev_completed("resp-turn1-1"),
-            ]),
-            sse(vec![
-                ev_response_created("resp-turn1-2"),
-                ev_assistant_message("msg-turn1-2", "done"),
-                ev_completed("resp-turn1-2"),
-            ]),
-        ],
-    )
-    .await;
-
-    let mut builder = test_codex().with_config(|config| {
-        config
-            .features
-            .enable(Feature::Collab)
-            .expect("test config should allow feature update");
-        config.multi_agent_v2.hide_spawn_agent_metadata = false;
-        let role_path = config.codex_home.join("custom-role.toml");
-        std::fs::write(
-            &role_path,
-            format!(
-                "developer_instructions = \"Stay focused\"\nmodel = \"{ROLE_MODEL}\"\nmodel_reasoning_effort = \"{ROLE_REASONING_EFFORT}\"\n",
-            ),
-        )
-        .expect("write role config");
-        config.agent_roles.insert(
-            "custom".to_string(),
-            AgentRoleConfig {
-                description: Some("Custom role".to_string()),
-                config_file: Some(role_path.to_path_buf()),
-                nickname_candidates: None,
-            },
-        );
-    });
-    let test = builder.build(&server).await?;
-
-    test.submit_turn(TURN_1_PROMPT).await?;
-
-    let requests = resp_mock.requests();
-    assert_eq!(requests.len(), 2);
-    let output = requests[1].tool_search_output(call_id);
-    let spawn_agent = namespace_child_tool(&output, "multi_agent_v1", "spawn_agent")
-        .expect("tool_search should return multi_agent_v1.spawn_agent");
-    let agent_type_description = tool_parameter_description(spawn_agent, "agent_type")
-        .expect("spawn_agent agent_type description");
-    let custom_role_description =
-        role_block(&agent_type_description, "custom").expect("custom role description");
-    assert_eq!(
-        custom_role_description,
-        "custom: {\nCustom role\n- This role's model defaults to `gpt-5.4` and its reasoning effort defaults to `high`. Explicit `model` and `reasoning_effort` spawn arguments override these defaults.\n}"
-    );
-
-    Ok(())
-}
+#[path = "subagent_identity.rs"]
+mod identity;

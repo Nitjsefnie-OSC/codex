@@ -81,7 +81,8 @@ struct AgentRoleOverrides {
     skills: Option<SkillsConfig>,
 }
 
-/// Applies typed role overrides to the existing parent-derived configuration.
+#[cfg(test)]
+/// Applies typed role overrides to the existing parent-derived configuration in tests.
 pub(crate) async fn apply_role_to_config(
     config: &mut Config,
     role_name: Option<&str>,
@@ -360,34 +361,58 @@ mod role_overrides {
 pub(crate) mod spawn_tool_spec {
     use super::*;
 
+    /// Controls whether role text advertises explicit model and effort fields.
+    #[derive(Clone, Copy)]
+    pub(crate) enum ModelOverrideExposure {
+        Exposed,
+        Hidden,
+    }
+
     /// Builds the spawn-agent tool description text from built-in and configured roles.
     pub(crate) fn build(user_defined_agent_roles: &BTreeMap<String, AgentRoleConfig>) -> String {
+        build_with_model_overrides(user_defined_agent_roles, ModelOverrideExposure::Exposed)
+    }
+
+    /// Builds role descriptions with identity override guidance matching the exposed tool fields.
+    pub(crate) fn build_with_model_overrides(
+        user_defined_agent_roles: &BTreeMap<String, AgentRoleConfig>,
+        model_override_exposure: ModelOverrideExposure,
+    ) -> String {
         let built_in_roles = built_in::configs();
-        build_from_configs(built_in_roles, user_defined_agent_roles)
+        build_from_configs(
+            built_in_roles,
+            user_defined_agent_roles,
+            model_override_exposure,
+        )
     }
 
     // This function is not inlined for testing purpose.
     fn build_from_configs(
         built_in_roles: &BTreeMap<String, AgentRoleConfig>,
         user_defined_roles: &BTreeMap<String, AgentRoleConfig>,
+        model_override_exposure: ModelOverrideExposure,
     ) -> String {
         let mut seen = BTreeSet::new();
         let mut formatted_roles = Vec::new();
         for (name, declaration) in user_defined_roles {
             if seen.insert(name.as_str()) {
-                formatted_roles.push(format_role(name, declaration));
+                formatted_roles.push(format_role(name, declaration, model_override_exposure));
             }
         }
         for (name, declaration) in built_in_roles {
             if seen.insert(name.as_str()) {
-                formatted_roles.push(format_role(name, declaration));
+                formatted_roles.push(format_role(name, declaration, model_override_exposure));
             }
         }
 
         format!("Available roles:\n{}", formatted_roles.join("\n"))
     }
 
-    fn format_role(name: &str, declaration: &AgentRoleConfig) -> String {
+    fn format_role(
+        name: &str,
+        declaration: &AgentRoleConfig,
+        model_override_exposure: ModelOverrideExposure,
+    ) -> String {
         if let Some(description) = &declaration.description {
             let role_settings_note = declaration
                 .config_file
@@ -410,18 +435,35 @@ pub(crate) mod spawn_tool_spec {
                         .and_then(TomlValue::as_str);
 
                     let model_and_reasoning_note = match (model, reasoning_effort) {
-                        (Some(model), Some(reasoning_effort)) => format!(
+                        (Some(model), Some(reasoning_effort))
+                            if matches!(
+                                model_override_exposure,
+                                ModelOverrideExposure::Exposed
+                            ) => format!(
                             "\n- This role's model defaults to `{model}` and its reasoning effort defaults to `{reasoning_effort}`. Explicit `model` and `reasoning_effort` spawn arguments override these defaults."
                         ),
+                        (Some(model), None)
+                            if matches!(
+                                model_override_exposure,
+                                ModelOverrideExposure::Exposed
+                            ) => format!(
+                            "\n- This role's model defaults to `{model}`. An explicit `model` spawn argument overrides this default."
+                        ),
+                        (None, Some(reasoning_effort))
+                            if matches!(
+                                model_override_exposure,
+                                ModelOverrideExposure::Exposed
+                            ) => format!(
+                            "\n- This role's reasoning effort defaults to `{reasoning_effort}`. An explicit `reasoning_effort` spawn argument overrides this default."
+                        ),
+                        (Some(model), Some(reasoning_effort)) => format!(
+                            "\n- This role's model defaults to `{model}` and its reasoning effort defaults to `{reasoning_effort}`."
+                        ),
                         (Some(model), None) => {
-                            format!(
-                                "\n- This role's model defaults to `{model}`. An explicit `model` spawn argument overrides this default."
-                            )
+                            format!("\n- This role's model defaults to `{model}`.")
                         }
                         (None, Some(reasoning_effort)) => {
-                            format!(
-                                "\n- This role's reasoning effort defaults to `{reasoning_effort}`. An explicit `reasoning_effort` spawn argument overrides this default."
-                            )
+                            format!("\n- This role's reasoning effort defaults to `{reasoning_effort}`.")
                         }
                         (None, None) => String::new(),
                     };

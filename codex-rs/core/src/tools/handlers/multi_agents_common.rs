@@ -218,15 +218,23 @@ fn build_agent_shared_config(turn: &TurnContext) -> Result<Config, FunctionCallE
     Ok(config)
 }
 
-pub(crate) fn reject_full_fork_agent_type_override(
+pub(crate) fn reject_full_fork_identity_overrides(
     agent_type: Option<&str>,
+    model: Option<&str>,
+    reasoning_effort: Option<&ReasoningEffort>,
 ) -> Result<(), FunctionCallError> {
-    if agent_type.is_some() {
-        return Err(FunctionCallError::RespondToModel(
-            "Full-history forked agents inherit the parent agent type; omit agent_type, or spawn without a full-history fork.".to_string(),
-        ));
-    }
-    Ok(())
+    let field = if agent_type.is_some() {
+        "agent_type"
+    } else if model.is_some() {
+        "model"
+    } else if reasoning_effort.is_some() {
+        "reasoning_effort"
+    } else {
+        return Ok(());
+    };
+    Err(FunctionCallError::RespondToModel(format!(
+        "Full-history forked agents inherit the parent role, model, and reasoning effort; omit {field}, or spawn without a full-history fork."
+    )))
 }
 
 /// Copies runtime-only turn state onto a child config before it is handed to `AgentControl`.
@@ -262,6 +270,7 @@ pub(crate) fn apply_spawn_agent_runtime_overrides(
     Ok(())
 }
 
+#[derive(Default)]
 pub(crate) struct SpawnAgentIdentitySelection {
     explicit_model: Option<String>,
     explicit_reasoning_effort: Option<ReasoningEffort>,
