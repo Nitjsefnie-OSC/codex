@@ -386,8 +386,8 @@ jobs:
           for test_name in \
             agent::role::tests::apply_exec_agent_role_uses_role_identity_and_preserves_runtime_state \
             agent::role::tests::apply_exec_agent_role_rejects_unknown_role \
-            tools::handlers::multi_agents_tests::spawn_agent_explicit_model_and_effort_override_role_defaults \
-            tools::handlers::multi_agents_tests::multi_agent_v2_spawn_explicit_model_and_effort_override_role_defaults
+            tools::handlers::multi_agents::tests::spawn_agent_explicit_model_and_effort_override_role_defaults \
+            tools::handlers::multi_agents::tests::multi_agent_v2_spawn_explicit_model_and_effort_override_role_defaults
           do
             output=$(cargo test -p codex-core --lib "$test_name" -- --exact --nocapture 2>&1)
             result=$?
