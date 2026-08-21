@@ -9,6 +9,9 @@ async fn install_uncatalogued_model_only_role(turn: &mut TurnContext) -> String 
         .codex_home
         .as_path()
         .join("uncatalogued-model-only-role.toml");
+    tokio::fs::create_dir_all(&turn.config.codex_home)
+        .await
+        .expect("codex home should be created");
     tokio::fs::write(
         &role_path,
         "model = \"custom-provider/uncatalogued-role-model\"\nmodel_provider = \"ollama\"\n",
@@ -153,6 +156,9 @@ async fn spawn_agent_role_model_uses_selected_model_default_effort() {
         .codex_home
         .as_path()
         .join("model-only-role.toml");
+    tokio::fs::create_dir_all(&turn.config.codex_home)
+        .await
+        .expect("codex home should be created");
     tokio::fs::write(&role_path, "model = \"gpt-5.6-sol\"\n")
         .await
         .expect("role config should be written");
@@ -248,6 +254,9 @@ async fn multi_agent_v2_role_model_uses_selected_model_default_effort() {
         .codex_home
         .as_path()
         .join("v2-model-only-role.toml");
+    tokio::fs::create_dir_all(&turn.config.codex_home)
+        .await
+        .expect("codex home should be created");
     tokio::fs::write(&role_path, "model = \"gpt-5.6-sol\"\n")
         .await
         .expect("role config should be written");
@@ -805,6 +814,9 @@ async fn multi_agent_v2_full_history_inherits_parent_role_metadata() {
         .expect("test config should allow sqlite");
     let role_name = "full-history-role".to_string();
     let role_path = config.codex_home.as_path().join("full-history-role.toml");
+    tokio::fs::create_dir_all(&config.codex_home)
+        .await
+        .expect("codex home should be created");
     tokio::fs::write(
         &role_path,
         "developer_instructions = \"Full-history role instructions\"\nmodel = \"gpt-5.6-terra\"\nmodel_reasoning_effort = \"xhigh\"\n",
