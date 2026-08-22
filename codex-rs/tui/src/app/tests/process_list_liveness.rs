@@ -491,6 +491,18 @@ enabled = true
             /*output_schema*/ None,
         )
         .await?;
+    // `turn/start` submits a separately spawned turn task and can return before either model
+    // request reaches the mock server. Wait for both requests before enforcing exact cardinality;
+    // otherwise these checks race the turn task and can report a false fixture failure.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while resumed_parent_request.requests().is_empty()
+            || resumed_child_request.requests().is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(/*millis*/ 25)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for resumed parent and child model requests");
     resumed_parent_request.single_request();
     resumed_child_request.single_request();
     wait_for_child_thread_status(
