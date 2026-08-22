@@ -356,6 +356,22 @@ impl App {
         }
     }
 
+    pub(super) async fn refresh_process_list_agent_liveness(
+        &mut self,
+        app_server: &mut AppServerSession,
+    ) {
+        let thread_ids: Vec<_> = self
+            .agent_navigation
+            .ordered_path_backed_subagent_threads(self.primary_thread_id)
+            .into_iter()
+            .map(|(thread_id, _)| thread_id)
+            .collect();
+        for thread_id in thread_ids {
+            self.refresh_agent_picker_thread_liveness(app_server, thread_id)
+                .await;
+        }
+    }
+
     /// Materializes a live thread into local replay state when the picker knows about it but the
     /// TUI has not cached a local event channel yet.
     ///
