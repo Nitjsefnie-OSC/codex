@@ -267,7 +267,7 @@ enabled = true
     // `spawn_agent` tool, and the child's own first turn completes normally.
     let spawn_args = serde_json::to_string(&serde_json::json!({
         "message": CHILD_TASK,
-        "task_name": "resumed-worker",
+        "task_name": "resumed_worker",
         "fork_turns": "none",
     }))?;
     mount_sse_once_match(
