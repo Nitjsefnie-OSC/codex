@@ -30,8 +30,8 @@ const COLLABORATION_NAMESPACE: &str = "collaboration";
 // Distinctive, never-otherwise-occurring markers used to route each mocked model exchange to the
 // exact real HTTP request it is meant to answer. Requests can include the full prior conversation,
 // so later requests may retain earlier markers; correctness here comes from staging each mock only
-// once its predecessor is consumed, plus the `agent_message` input-type check that always separates
-// the parent's own conversation from the child's.
+// once its predecessor is consumed, plus current-turn markers and the `agent_message` input type
+// when identifying child requests.
 const SPAWN_PROMPT: &str = "codex-ps-liveness: spawn the worker";
 const SPAWN_CALL_ID: &str = "codex-ps-liveness-spawn-call";
 const CHILD_TASK: &str = "codex-ps-liveness: do the first task";
@@ -51,8 +51,9 @@ fn body_contains(request: &Request, text: &str) -> bool {
         .is_some_and(|body| body.contains(text))
 }
 
-/// True only for a request that carries an `agent_message`-typed input item — the wire marker a
-/// spawned child's own conversation carries that the parent's own conversation never does.
+/// Returns whether a request carries an input item of `input_type`. The `agent_message` type is the
+/// wire marker used to identify a spawned child's own conversation before completed child messages
+/// enter parent history.
 fn request_has_input_type(request: &Request, input_type: &str) -> bool {
     request_body(request)
         .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
@@ -439,9 +440,11 @@ enabled = true
         "target": child_thread_id.to_string(),
         "message": FOLLOWUP_TASK,
     }))?;
-    mount_sse_once_match(
+    let resumed_parent_request = mount_sse_once_match(
         &server,
-        |request: &Request| body_contains(request, RESUME_PROMPT) && is_parent_request(request),
+        |request: &Request| {
+            body_contains(request, RESUME_PROMPT) && !body_contains(request, FOLLOWUP_CALL_ID)
+        },
         sse(vec![
             ev_response_created("resp-followup-1"),
             ev_function_call_with_namespace(
@@ -454,11 +457,13 @@ enabled = true
         ]),
     )
     .await;
-    mount_response_once_match(
+    let child_thread_identity = child_thread_id.to_string();
+    let resumed_child_request = mount_response_once_match(
         &server,
-        |request: &Request| {
+        move |request: &Request| {
             request_has_input_type(request, "agent_message")
                 && body_contains(request, FOLLOWUP_TASK)
+                && body_contains(request, &child_thread_identity)
         },
         sse_response(immediate_child_turn_body("resp-child-turn-2"))
             .set_delay(Duration::from_secs(60)),
@@ -486,6 +491,8 @@ enabled = true
             /*output_schema*/ None,
         )
         .await?;
+    resumed_parent_request.single_request();
+    resumed_child_request.single_request();
     wait_for_child_thread_status(
         &mut app_server,
         child_thread_id,
