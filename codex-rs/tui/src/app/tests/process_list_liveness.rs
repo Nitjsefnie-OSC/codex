@@ -18,6 +18,7 @@ use core_test_support::responses::mount_sse_once_match;
 use core_test_support::responses::sse;
 use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
+use pretty_assertions::assert_eq;
 use std::time::Duration;
 use wiremock::Request;
 
@@ -134,42 +135,37 @@ async fn wait_for_spawned_child(
     panic!("expected a SubAgentActivity::Started item for the spawned child");
 }
 
-async fn wait_for_turn_completed(app_server: &mut AppServerSession, thread_id: ThreadId) {
-    for _ in 0..40 {
-        let event = tokio::time::timeout(
-            std::time::Duration::from_secs(/*secs*/ 10),
-            app_server.next_event(),
-        )
-        .await
-        .expect("app-server should emit a turn/completed event")
-        .expect("app-server event stream should remain open");
-        if let codex_app_server_client::AppServerEvent::ServerNotification(notification) = event
-            && let ServerNotification::TurnCompleted(notification) = *notification
-            && notification.thread_id == thread_id.to_string()
-        {
+/// Polls the child's real, authoritative `thread_read` status until `is_expected_status` matches.
+///
+/// The internally spawned child is never a thread this client itself started or subscribed to, so
+/// nothing guarantees the embedded app server routes the child's own notifications to this
+/// connection. Observing liveness through a direct `thread_read` call — the same authoritative
+/// source `/subagents` already refreshes from — sidesteps that assumption entirely, so this can
+/// never itself become a false-RED wait: it either observes the real status or the deadline panic
+/// fires as an explicit fixture-setup failure, distinct from the intended `/ps` assertion failure.
+async fn wait_for_child_thread_status(
+    app_server: &mut AppServerSession,
+    thread_id: ThreadId,
+    what: &'static str,
+    mut is_expected_status: impl FnMut(&codex_app_server_protocol::ThreadStatus) -> bool,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let thread = app_server
+            .thread_read(thread_id, /*include_turns*/ false)
+            .await
+            .unwrap_or_else(|err| panic!("thread_read failed while waiting for {what}: {err}"));
+        if is_expected_status(&thread.status) {
             return;
         }
-    }
-    panic!("expected TurnCompleted for thread {thread_id}");
-}
-
-async fn wait_for_turn_started(app_server: &mut AppServerSession, thread_id: ThreadId) {
-    for _ in 0..40 {
-        let event = tokio::time::timeout(
-            std::time::Duration::from_secs(/*secs*/ 10),
-            app_server.next_event(),
-        )
-        .await
-        .expect("app-server should emit a turn/start event")
-        .expect("app-server event stream should remain open");
-        if let codex_app_server_client::AppServerEvent::ServerNotification(notification) = event
-            && let ServerNotification::TurnStarted(notification) = *notification
-            && notification.thread_id == thread_id.to_string()
-        {
-            return;
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "timed out waiting for {what} (thread {thread_id}); last status: {:?}",
+                thread.status
+            );
         }
+        tokio::time::sleep(Duration::from_millis(/*millis*/ 25)).await;
     }
-    panic!("expected TurnStarted for thread {thread_id}");
 }
 
 /// `/ps` must list the agents that are running right now, per the authoritative agent controller,
@@ -311,7 +307,13 @@ stream_max_retries = 0
 
     let (child_thread_id, discovered_agent_path) =
         wait_for_spawned_child(&mut app_server, parent_thread_id).await;
-    wait_for_turn_completed(&mut app_server, child_thread_id).await;
+    wait_for_child_thread_status(
+        &mut app_server,
+        child_thread_id,
+        "the child's first turn to finish",
+        |status| matches!(status, codex_app_server_protocol::ThreadStatus::Idle),
+    )
+    .await;
 
     // Stage 2: populate `agent_navigation` the same way `/subagents` already does — a single real
     // `thread_read`-backed refresh, taken while the child is genuinely idle. This is the only
@@ -328,11 +330,19 @@ stream_max_retries = 0
         "child must be genuinely idle at this snapshot"
     );
     assert!(!stale_entry.is_closed);
+    // No fallback: if the authoritative refresh failed to populate a real `agent_path`, that is a
+    // fixture-setup failure and must be reported as one here, not masked into a later, misleading
+    // `/ps` assertion failure.
     let agent_path = stale_entry
         .agent_path
         .clone()
         .filter(|path| !path.trim().is_empty())
-        .unwrap_or(discovered_agent_path);
+        .expect("a real thread_read-backed refresh should populate the child's real agent_path");
+    assert_eq!(
+        agent_path, discovered_agent_path,
+        "the refreshed cached agent_path must match the real path discovered from \
+         SubAgentActivity::Started"
+    );
     let expected_label = format_agent_picker_item_name(
         stale_entry.agent_nickname.as_deref(),
         stale_entry.agent_role.as_deref(),
@@ -414,7 +424,18 @@ stream_max_retries = 0
             /*output_schema*/ None,
         )
         .await?;
-    wait_for_turn_started(&mut app_server, child_thread_id).await;
+    wait_for_child_thread_status(
+        &mut app_server,
+        child_thread_id,
+        "the child's resumed turn to start",
+        |status| {
+            matches!(
+                status,
+                codex_app_server_protocol::ThreadStatus::Active { .. }
+            )
+        },
+    )
+    .await;
 
     // Historical TUI state is unchanged since stage 2: `agent_navigation` still says not-running,
     // and the child still has no `ThreadEventChannel`.
