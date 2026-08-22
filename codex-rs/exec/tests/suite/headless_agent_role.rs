@@ -8,8 +8,18 @@ use serde_json::json;
 const ROLE_MODEL: &str = "role-model";
 const ROLE_DEVELOPER_MARKER: &str = "ROLE-DEVELOPER-MARKER";
 const ROLE_EFFORT: &str = "low";
+const CLI_MODEL: &str = "cli-model";
+const CLI_EFFORT: &str = "high";
 
 fn install_adversary_role(home: &std::path::Path) -> anyhow::Result<()> {
+    install_adversary_role_with_identity(home, ROLE_MODEL, ROLE_EFFORT)
+}
+
+fn install_adversary_role_with_identity(
+    home: &std::path::Path,
+    model: &str,
+    reasoning_effort: &str,
+) -> anyhow::Result<()> {
     let agents_dir = home.join("agents");
     std::fs::create_dir_all(&agents_dir)?;
     std::fs::write(
@@ -17,8 +27,8 @@ fn install_adversary_role(home: &std::path::Path) -> anyhow::Result<()> {
         format!(
             r#"name = "adversary"
 description = "Adversarial reviewer"
-model = "{ROLE_MODEL}"
-model_reasoning_effort = "{ROLE_EFFORT}"
+model = "{model}"
+model_reasoning_effort = "{reasoning_effort}"
 developer_instructions = "{ROLE_DEVELOPER_MARKER}"
 "#,
         ),
@@ -27,7 +37,7 @@ developer_instructions = "{ROLE_DEVELOPER_MARKER}"
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn exec_agent_role_reaches_request_and_preserves_headless_safety() -> anyhow::Result<()> {
+async fn exec_agent_role_preserves_explicit_model_and_effort_overrides() -> anyhow::Result<()> {
     let test = test_codex_exec();
     install_adversary_role(test.home_path())?;
     let server = responses::start_mock_server().await;
@@ -43,7 +53,9 @@ async fn exec_agent_role_reaches_request_and_preserves_headless_safety() -> anyh
         .arg("--agent")
         .arg("adversary")
         .arg("--model")
-        .arg("cli-model-must-not-win")
+        .arg(CLI_MODEL)
+        .arg("-c")
+        .arg(format!("model_reasoning_effort=\"{CLI_EFFORT}\""))
         .arg("--dangerously-bypass-approvals-and-sandbox")
         .arg("--skip-git-repo-check")
         .arg("Review this claim")
@@ -51,10 +63,10 @@ async fn exec_agent_role_reaches_request_and_preserves_headless_safety() -> anyh
 
     assert!(output.status.success(), "exec run failed: {output:?}");
     let request = response_mock.single_request();
-    assert_eq!(request.body_json()["model"], json!(ROLE_MODEL));
+    assert_eq!(request.body_json()["model"], json!(CLI_MODEL));
     assert_eq!(
         request.body_json()["reasoning"]["effort"],
-        json!(ROLE_EFFORT)
+        json!(CLI_EFFORT)
     );
     assert!(
         request.body_contains_text(ROLE_DEVELOPER_MARKER),
@@ -70,6 +82,137 @@ async fn exec_agent_role_reaches_request_and_preserves_headless_safety() -> anyh
         stderr.contains("sandbox: danger-full-access"),
         "unexpected stderr: {stderr}"
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_agent_role_preserves_cli_model_and_role_effort() -> anyhow::Result<()> {
+    let test = test_codex_exec();
+    install_adversary_role(test.home_path())?;
+    let server = responses::start_mock_server().await;
+    let body = responses::sse(vec![
+        responses::ev_response_created("response_1"),
+        responses::ev_assistant_message("message_1", "done"),
+        responses::ev_completed("response_1"),
+    ]);
+    let response_mock = responses::mount_sse_once(&server, body).await;
+
+    let output = test
+        .cmd_with_server(&server)
+        .arg("--agent")
+        .arg("adversary")
+        .arg("--model")
+        .arg(CLI_MODEL)
+        .arg("--dangerously-bypass-approvals-and-sandbox")
+        .arg("--skip-git-repo-check")
+        .arg("Review this claim")
+        .output()?;
+
+    assert!(output.status.success(), "exec run failed: {output:?}");
+    let request = response_mock.single_request();
+    assert_eq!(request.body_json()["model"], json!(CLI_MODEL));
+    assert_eq!(
+        request.body_json()["reasoning"]["effort"],
+        json!(ROLE_EFFORT)
+    );
+    assert!(request.body_contains_text(ROLE_DEVELOPER_MARKER));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_agent_role_preserves_config_model_override_and_role_effort() -> anyhow::Result<()> {
+    let test = test_codex_exec();
+    install_adversary_role(test.home_path())?;
+    let server = responses::start_mock_server().await;
+    let body = responses::sse(vec![
+        responses::ev_response_created("response_1"),
+        responses::ev_assistant_message("message_1", "done"),
+        responses::ev_completed("response_1"),
+    ]);
+    let response_mock = responses::mount_sse_once(&server, body).await;
+
+    let output = test
+        .cmd_with_server(&server)
+        .arg("--agent")
+        .arg("adversary")
+        .arg("-c")
+        .arg(format!("model=\"{CLI_MODEL}\""))
+        .arg("--skip-git-repo-check")
+        .arg("Review this claim")
+        .output()?;
+
+    assert!(output.status.success(), "exec run failed: {output:?}");
+    let request = response_mock.single_request();
+    assert_eq!(request.body_json()["model"], json!(CLI_MODEL));
+    assert_eq!(
+        request.body_json()["reasoning"]["effort"],
+        json!(ROLE_EFFORT)
+    );
+    assert!(request.body_contains_text(ROLE_DEVELOPER_MARKER));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_agent_role_preserves_role_model_and_explicit_effort() -> anyhow::Result<()> {
+    let test = test_codex_exec();
+    install_adversary_role(test.home_path())?;
+    let server = responses::start_mock_server().await;
+    let body = responses::sse(vec![
+        responses::ev_response_created("response_1"),
+        responses::ev_assistant_message("message_1", "done"),
+        responses::ev_completed("response_1"),
+    ]);
+    let response_mock = responses::mount_sse_once(&server, body).await;
+
+    let output = test
+        .cmd_with_server(&server)
+        .arg("--agent")
+        .arg("adversary")
+        .arg("-c")
+        .arg(format!("model_reasoning_effort=\"{CLI_EFFORT}\""))
+        .arg("--skip-git-repo-check")
+        .arg("Review this claim")
+        .output()?;
+
+    assert!(output.status.success(), "exec run failed: {output:?}");
+    let request = response_mock.single_request();
+    assert_eq!(request.body_json()["model"], json!(ROLE_MODEL));
+    assert_eq!(
+        request.body_json()["reasoning"]["effort"],
+        json!(CLI_EFFORT)
+    );
+    assert!(request.body_contains_text(ROLE_DEVELOPER_MARKER));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_agent_role_rejects_invalid_final_model_effort_pair() -> anyhow::Result<()> {
+    let test = test_codex_exec();
+    install_adversary_role_with_identity(test.home_path(), "gpt-5.4", "low")?;
+    let server = responses::start_mock_server().await;
+
+    let output = test
+        .cmd_with_server(&server)
+        .arg("--agent")
+        .arg("adversary")
+        .arg("-c")
+        .arg("model_reasoning_effort=\"minimal\"")
+        .arg("--skip-git-repo-check")
+        .arg("Review this claim")
+        .output()?;
+
+    assert!(!output.status.success(), "invalid pair unexpectedly ran");
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("Reasoning effort `minimal` is not supported for model `gpt-5.4`"),
+        "unexpected stderr: {stderr}"
+    );
+    let requests = server.received_requests().await.unwrap_or_default();
+    assert!(requests.is_empty(), "unexpected requests: {requests:?}");
 
     Ok(())
 }
