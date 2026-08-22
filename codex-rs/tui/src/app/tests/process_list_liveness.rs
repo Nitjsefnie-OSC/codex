@@ -28,13 +28,14 @@ const MODEL_PROVIDER_ID: &str = "ps-liveness-test";
 const COLLABORATION_NAMESPACE: &str = "collaboration";
 
 // Distinctive, never-otherwise-occurring markers used to route each mocked model exchange to the
-// exact real HTTP request it is meant to answer. Because a request's body includes the full prior
-// conversation, later requests remain a superset of earlier markers; correctness here comes from
-// staging each mock only once its predecessor is consumed, plus the `agent_message` input-type
-// check that always separates the parent's own conversation from the child's.
+// exact real HTTP request it is meant to answer. Requests can include the full prior conversation,
+// so later requests may retain earlier markers; correctness here comes from staging each mock only
+// once its predecessor is consumed, plus the `agent_message` input-type check that always separates
+// the parent's own conversation from the child's.
 const SPAWN_PROMPT: &str = "codex-ps-liveness: spawn the worker";
 const SPAWN_CALL_ID: &str = "codex-ps-liveness-spawn-call";
 const CHILD_TASK: &str = "codex-ps-liveness: do the first task";
+const FOLLOWUP_TASK: &str = "codex-ps-liveness: do the followup task";
 const RESUME_PROMPT: &str = "codex-ps-liveness: resume the worker";
 const FOLLOWUP_CALL_ID: &str = "codex-ps-liveness-followup-call";
 
@@ -436,7 +437,7 @@ enabled = true
     // response, so it is genuinely `InProgress` on the app server for the rest of this test.
     let followup_args = serde_json::to_string(&serde_json::json!({
         "target": child_thread_id.to_string(),
-        "message": "keep going",
+        "message": FOLLOWUP_TASK,
     }))?;
     mount_sse_once_match(
         &server,
@@ -456,7 +457,8 @@ enabled = true
     mount_response_once_match(
         &server,
         |request: &Request| {
-            request_has_input_type(request, "agent_message") && body_contains(request, CHILD_TASK)
+            request_has_input_type(request, "agent_message")
+                && body_contains(request, FOLLOWUP_TASK)
         },
         sse_response(immediate_child_turn_body("resp-child-turn-2"))
             .set_delay(Duration::from_secs(60)),
