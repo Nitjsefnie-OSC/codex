@@ -38,8 +38,8 @@ use codex_utils_path_uri::PathUri;
 use rand::Rng;
 use rand::rng;
 use tokio::sync::Mutex;
-use tokio_util::sync::CancellationToken;
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 use crate::sandboxing::SandboxPermissions;
 use crate::session::session::Session;

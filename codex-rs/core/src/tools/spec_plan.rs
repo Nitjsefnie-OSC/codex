@@ -126,7 +126,10 @@ pub(crate) fn build_tool_router(
     tool_suggest_candidates: Option<&crate::tools::router::ToolSuggestCandidates>,
 ) -> CodexResult<ToolRouter> {
     let default_agent_type_description =
-        crate::agent::role::spawn_tool_spec::build(&std::collections::BTreeMap::new());
+        crate::agent::role::spawn_tool_spec::build_with_model_overrides(
+            &std::collections::BTreeMap::new(),
+            crate::agent::role::spawn_tool_spec::ModelOverrideExposure::Exposed,
+        );
     let wait_for_environment_tool_config = session
         .services
         .thread_extension_data
@@ -256,7 +259,10 @@ pub(crate) fn build_core_tool_registry(
     wait_for_environment_tool_config: Option<&Arc<crate::WaitForEnvironmentToolConfig>>,
 ) -> ToolRegistry {
     let default_agent_type_description =
-        crate::agent::role::spawn_tool_spec::build(&std::collections::BTreeMap::new());
+        crate::agent::role::spawn_tool_spec::build_with_model_overrides(
+            &std::collections::BTreeMap::new(),
+            crate::agent::role::spawn_tool_spec::ModelOverrideExposure::Exposed,
+        );
     let context = CoreToolPlanContext {
         turn_context,
         environments,
@@ -671,9 +677,12 @@ fn wait_agent_timeout_options(turn_context: &TurnContext) -> WaitAgentTimeoutOpt
 fn agent_type_description(
     turn_context: &TurnContext,
     default_agent_type_description: &str,
+    model_override_exposure: crate::agent::role::spawn_tool_spec::ModelOverrideExposure,
 ) -> String {
-    let agent_type_description =
-        crate::agent::role::spawn_tool_spec::build(&turn_context.config.agent_roles);
+    let agent_type_description = crate::agent::role::spawn_tool_spec::build_with_model_overrides(
+        &turn_context.config.agent_roles,
+        model_override_exposure,
+    );
     if agent_type_description.is_empty() {
         default_agent_type_description.to_string()
     } else {
@@ -1135,8 +1144,20 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
             let tool_namespace = namespace_tools_enabled(turn_context)
                 .then_some(turn_context.config.multi_agent_v2.tool_namespace.as_deref())
                 .flatten();
-            let agent_type_description =
-                agent_type_description(turn_context, context.default_agent_type_description);
+            let model_override_exposure = if turn_context
+                .config
+                .multi_agent_v2
+                .expose_spawn_agent_model_overrides
+            {
+                crate::agent::role::spawn_tool_spec::ModelOverrideExposure::Exposed
+            } else {
+                crate::agent::role::spawn_tool_spec::ModelOverrideExposure::Hidden
+            };
+            let agent_type_description = agent_type_description(
+                turn_context,
+                context.default_agent_type_description,
+                model_override_exposure,
+            );
             let hide_spawn_agent_metadata =
                 turn_context.config.multi_agent_v2.hide_spawn_agent_metadata;
             registry.register_trusted_with_exposure(
@@ -1183,8 +1204,11 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
                 exposure,
             );
         } else {
-            let agent_type_description =
-                agent_type_description(turn_context, context.default_agent_type_description);
+            let agent_type_description = agent_type_description(
+                turn_context,
+                context.default_agent_type_description,
+                crate::agent::role::spawn_tool_spec::ModelOverrideExposure::Exposed,
+            );
             let exposure = if search_tool_enabled(turn_context) {
                 ToolExposure::Deferred
             } else {

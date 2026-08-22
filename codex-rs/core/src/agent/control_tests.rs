@@ -39,6 +39,7 @@ use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
@@ -696,21 +697,52 @@ async fn send_inter_agent_communication_without_turn_queues_message_without_trig
 
 #[tokio::test]
 async fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent() {
-    ensure_v2_agent_loaded_reloads_registered_unloaded_agent_body().await;
+    ensure_v2_agent_loaded_reloads_registered_unloaded_agent_body(
+        Some(ReasoningEffort::High),
+        Some(ReasoningEffort::Minimal),
+    )
+    .await;
 }
 
-fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent_body()
--> futures::future::BoxFuture<'static, ()> {
+#[tokio::test]
+async fn ensure_v2_agent_loaded_preserves_absent_reasoning_effort() {
+    ensure_v2_agent_loaded_reloads_registered_unloaded_agent_body(
+        /*child_reasoning_effort*/ None,
+        Some(ReasoningEffort::Minimal),
+    )
+    .await;
+}
+
+fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent_body(
+    child_reasoning_effort: Option<ReasoningEffort>,
+    sender_reasoning_effort: Option<ReasoningEffort>,
+) -> futures::future::BoxFuture<'static, ()> {
     Box::pin(async move {
         let (home, mut config) = test_config().await;
         let _ = config.features.enable(Feature::MultiAgentV2);
         let _ = config.features.enable(Feature::Sqlite);
         config.model = Some("gpt-5.6-sol".to_string());
+        let role_path = home.path().join("reload-role.toml");
+        tokio::fs::write(
+            &role_path,
+            "developer_instructions = \"Reload role instructions\"\nmodel = \"gpt-5.6-terra\"\nmodel_reasoning_effort = \"xhigh\"\n",
+        )
+        .await
+        .expect("reload role config should be written");
+        config.agent_roles.insert(
+            "reload-role".to_string(),
+            AgentRoleConfig {
+                description: Some("Reload role".to_string()),
+                config_file: Some(role_path),
+                nickname_candidates: None,
+            },
+        );
         let harness = AgentControlHarness::new_with_config(home, config).await;
         let (parent_thread_id, _parent_thread) = harness.start_paginated_thread().await;
         let agent_path = AgentPath::try_from("/root/worker").expect("agent path");
         let mut child_config = harness.config.clone();
         child_config.model = Some("gpt-5.6-luna".to_string());
+        child_config.model_reasoning_effort = child_reasoning_effort.clone();
         let spawned_agent = harness
             .control
             .spawn_agent_with_metadata(
@@ -721,7 +753,7 @@ fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent_body()
                     depth: 1,
                     agent_path: Some(agent_path.clone()),
                     agent_nickname: None,
-                    agent_role: None,
+                    agent_role: Some("reload-role".to_string()),
                 })),
                 SpawnAgentOptions {
                     parent_thread_id: Some(parent_thread_id),
@@ -753,6 +785,8 @@ fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent_body()
             .await
             .expect("child metadata should be readable");
         assert_eq!(stored_child.history_mode, ThreadHistoryMode::Paginated);
+        assert_eq!(stored_child.reasoning_effort, child_reasoning_effort);
+        assert_eq!(stored_child.agent_role.as_deref(), Some("reload-role"));
 
         assert!(
             harness
@@ -770,6 +804,7 @@ fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent_body()
         }
 
         let mut sender_config = harness.config.clone();
+        sender_config.model_reasoning_effort = sender_reasoning_effort;
         sender_config.model_provider_id = "ollama".to_string();
         sender_config.model_provider = sender_config
             .model_providers
@@ -787,10 +822,11 @@ fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent_body()
             .get_thread(spawned_agent.thread_id)
             .await
             .expect("reloaded child thread should exist");
+        let reloaded_snapshot = reloaded_child.config_snapshot().await;
         assert_eq!(
-            reloaded_child.config_snapshot().await.model,
-            "gpt-5.6-luna",
-            "residency reload must preserve the worker model instead of inheriting its parent model",
+            (reloaded_snapshot.model, reloaded_snapshot.reasoning_effort),
+            ("gpt-5.6-luna".to_string(), child_reasoning_effort),
+            "residency reload must preserve the worker identity instead of inheriting its sender's identity",
         );
         assert_eq!(
             (
@@ -808,6 +844,16 @@ fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent_body()
                 harness.config.model_provider.clone()
             ),
             "residency reload must preserve the worker provider instead of inheriting its sender's provider",
+        );
+        assert_eq!(
+            reloaded_child
+                .session
+                .new_default_turn()
+                .await
+                .developer_instructions
+                .as_deref(),
+            Some("Reload role instructions"),
+            "residency reload must reapply non-identity role settings",
         );
 
         let communication = InterAgentCommunication::new(

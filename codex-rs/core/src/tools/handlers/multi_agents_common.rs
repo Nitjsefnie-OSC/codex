@@ -1,4 +1,7 @@
-use crate::agent::role::apply_role_to_config;
+use crate::agent::model_reasoning::validate_model_reasoning_effort;
+use crate::agent::role::AgentRoleOverrideMask;
+use crate::agent::role::AppliedAgentRoleOverrides;
+use crate::agent::role::apply_role_to_config_with_mask;
 use crate::config::Config;
 use crate::config::DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS;
 use crate::config::HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS;
@@ -17,7 +20,6 @@ use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ReasoningEffort;
-use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -216,15 +218,23 @@ fn build_agent_shared_config(turn: &TurnContext) -> Result<Config, FunctionCallE
     Ok(config)
 }
 
-pub(crate) fn reject_full_fork_agent_type_override(
+pub(crate) fn reject_full_fork_identity_overrides(
     agent_type: Option<&str>,
+    model: Option<&str>,
+    reasoning_effort: Option<&ReasoningEffort>,
 ) -> Result<(), FunctionCallError> {
-    if agent_type.is_some() {
-        return Err(FunctionCallError::RespondToModel(
-            "Full-history forked agents inherit the parent agent type; omit agent_type, or spawn without a full-history fork.".to_string(),
-        ));
-    }
-    Ok(())
+    let field = if agent_type.is_some() {
+        "agent_type"
+    } else if model.is_some() {
+        "model"
+    } else if reasoning_effort.is_some() {
+        "reasoning_effort"
+    } else {
+        return Ok(());
+    };
+    Err(FunctionCallError::RespondToModel(format!(
+        "Full-history forked agents inherit the parent role, model, and reasoning effort; omit {field}, or spawn without a full-history fork."
+    )))
 }
 
 /// Copies runtime-only turn state onto a child config before it is handed to `AgentControl`.
@@ -260,21 +270,78 @@ pub(crate) fn apply_spawn_agent_runtime_overrides(
     Ok(())
 }
 
-pub(crate) async fn apply_requested_spawn_agent_model_overrides(
-    session: &Session,
+#[derive(Default)]
+pub(crate) struct SpawnAgentIdentitySelection {
+    explicit_model: Option<String>,
+    explicit_reasoning_effort: Option<ReasoningEffort>,
+    configured_model: Option<String>,
+    configured_reasoning_effort: Option<ReasoningEffort>,
+}
+
+impl SpawnAgentIdentitySelection {
+    pub(crate) fn selects_identity(&self) -> bool {
+        self.explicit_model.is_some()
+            || self.explicit_reasoning_effort.is_some()
+            || self.configured_model.is_some()
+            || self.configured_reasoning_effort.is_some()
+    }
+
+    pub(crate) fn role_override_mask(&self) -> AgentRoleOverrideMask {
+        let mut override_mask = AgentRoleOverrideMask::default();
+        if self.explicit_model.is_some() {
+            override_mask.preserve_model();
+        }
+        if self.explicit_reasoning_effort.is_some() {
+            override_mask.preserve_reasoning_effort();
+        }
+        override_mask
+    }
+}
+
+pub(crate) fn prepare_spawn_agent_identity_selection(
     turn: &TurnContext,
     config: &mut Config,
     requested_model: Option<&str>,
     requested_reasoning_effort: Option<ReasoningEffort>,
+) -> SpawnAgentIdentitySelection {
+    let configured_model = turn.config.agent_default_subagent_model.clone();
+    let configured_reasoning_effort = turn.config.agent_default_subagent_reasoning_effort.clone();
+    if let Some(model) = configured_model.as_ref() {
+        config.model = Some(model.clone());
+    }
+    if let Some(reasoning_effort) = configured_reasoning_effort.as_ref() {
+        config.model_reasoning_effort = Some(reasoning_effort.clone());
+    }
+    SpawnAgentIdentitySelection {
+        explicit_model: requested_model.map(str::to_string),
+        explicit_reasoning_effort: requested_reasoning_effort,
+        configured_model,
+        configured_reasoning_effort,
+    }
+}
+
+pub(crate) async fn apply_explicit_spawn_agent_identity_selection(
+    session: &Session,
+    turn: &TurnContext,
+    config: &mut Config,
+    selection: SpawnAgentIdentitySelection,
+    applied_role: AppliedAgentRoleOverrides,
 ) -> Result<(), FunctionCallError> {
-    let requested_model = requested_model.or(turn.config.agent_default_subagent_model.as_deref());
-    let requested_reasoning_effort = requested_reasoning_effort
-        .or_else(|| turn.config.agent_default_subagent_reasoning_effort.clone());
-    if requested_model.is_none() && requested_reasoning_effort.is_none() {
-        return Ok(());
+    if let Some(model) = selection.explicit_model.as_ref() {
+        config.model = Some(model.clone());
+    }
+    if let Some(reasoning_effort) = selection.explicit_reasoning_effort.as_ref() {
+        config.model_reasoning_effort = Some(reasoning_effort.clone());
     }
 
-    if let Some(requested_model) = requested_model {
+    let strict_model_selection = selection.explicit_model.is_some()
+        || (!applied_role.model && selection.configured_model.is_some());
+    let selected_model_name = if strict_model_selection {
+        let requested_model = config.model.as_deref().ok_or_else(|| {
+            FunctionCallError::RespondToModel(
+                "spawn_agent could not resolve the requested child model".to_string(),
+            )
+        })?;
         let available_models = session
             .services
             .models_manager
@@ -285,36 +352,29 @@ pub(crate) async fn apply_requested_spawn_agent_model_overrides(
             requested_model,
             turn.multi_agent_version,
         )?;
+        config.model = Some(selected_model_name.clone());
+        Some(selected_model_name)
+    } else if applied_role.model {
+        config.model.clone()
+    } else {
+        None
+    };
+
+    let effort_selected_by_higher_precedence_source = selection.explicit_reasoning_effort.is_some()
+        || applied_role.reasoning_effort
+        || selection.configured_reasoning_effort.is_some();
+    if let Some(selected_model_name) = selected_model_name
+        && !effort_selected_by_higher_precedence_source
+    {
         let selected_model_info = session
             .services
             .models_manager
             .get_model_info(&selected_model_name, &config.to_models_manager_config())
             .await;
-
-        config.model = Some(selected_model_name.clone());
-        if let Some(reasoning_effort) = requested_reasoning_effort {
-            validate_spawn_agent_reasoning_effort(
-                &selected_model_name,
-                &selected_model_info.supported_reasoning_levels,
-                &reasoning_effort,
-            )?;
-            config.model_reasoning_effort = Some(reasoning_effort);
-        } else {
-            config.model_reasoning_effort = selected_model_info.default_reasoning_level;
+        if let Some(default_reasoning_level) = selected_model_info.default_reasoning_level {
+            config.model_reasoning_effort = Some(default_reasoning_level);
         }
-
-        return Ok(());
     }
-
-    if let Some(reasoning_effort) = requested_reasoning_effort {
-        validate_spawn_agent_reasoning_effort(
-            &turn.model_info.slug,
-            &turn.model_info.supported_reasoning_levels,
-            &reasoning_effort,
-        )?;
-        config.model_reasoning_effort = Some(reasoning_effort);
-    }
-
     Ok(())
 }
 
@@ -374,43 +434,22 @@ pub(crate) async fn apply_spawn_agent_service_tier(
 }
 
 pub(crate) async fn apply_spawn_agent_role(
-    session: &Session,
     config: &mut Config,
     role_name: Option<&str>,
-) -> Result<(), FunctionCallError> {
-    let previous_model = config.model.clone();
-    let previous_reasoning_effort = config.model_reasoning_effort.clone();
-    apply_role_to_config(config, role_name)
+    override_mask: AgentRoleOverrideMask,
+) -> Result<AppliedAgentRoleOverrides, FunctionCallError> {
+    apply_role_to_config_with_mask(config, role_name, override_mask)
         .await
-        .map_err(FunctionCallError::RespondToModel)?;
-    if config.model == previous_model && config.model_reasoning_effort == previous_reasoning_effort
-    {
-        return Ok(());
-    }
+        .map_err(FunctionCallError::RespondToModel)
+}
 
-    let Some(reasoning_effort) = config.model_reasoning_effort.clone() else {
-        return Ok(());
-    };
-    let model = config.model.clone().ok_or_else(|| {
-        FunctionCallError::RespondToModel(
-            "spawn_agent could not resolve the child model for reasoning effort validation"
-                .to_string(),
-        )
-    })?;
-    let model_info = session
-        .services
-        .models_manager
-        .get_model_info(&model, &config.to_models_manager_config())
-        .await;
-    if model_info.used_fallback_model_metadata {
-        return Ok(());
-    }
-
-    validate_spawn_agent_reasoning_effort(
-        &model,
-        &model_info.supported_reasoning_levels,
-        &reasoning_effort,
-    )
+pub(crate) async fn validate_spawn_agent_model_reasoning_effort(
+    session: &Session,
+    config: &Config,
+) -> Result<(), FunctionCallError> {
+    validate_model_reasoning_effort(config, &session.services.models_manager)
+        .await
+        .map_err(FunctionCallError::RespondToModel)
 }
 
 fn find_spawn_agent_model_name(
@@ -438,26 +477,4 @@ fn find_spawn_agent_model_name(
                 "Unknown model `{requested_model}` for spawn_agent. Available models: {available}"
             ))
         })
-}
-
-fn validate_spawn_agent_reasoning_effort(
-    model: &str,
-    supported_reasoning_levels: &[ReasoningEffortPreset],
-    requested_reasoning_effort: &ReasoningEffort,
-) -> Result<(), FunctionCallError> {
-    if supported_reasoning_levels
-        .iter()
-        .any(|preset| &preset.effort == requested_reasoning_effort)
-    {
-        return Ok(());
-    }
-
-    let supported = supported_reasoning_levels
-        .iter()
-        .map(|preset| preset.effort.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    Err(FunctionCallError::RespondToModel(format!(
-        "Reasoning effort `{requested_reasoning_effort}` is not supported for model `{model}`. Supported reasoning efforts: {supported}"
-    )))
 }

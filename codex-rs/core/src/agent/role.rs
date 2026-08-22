@@ -33,6 +33,40 @@ use toml::Value as TomlValue;
 pub const DEFAULT_ROLE_NAME: &str = "default";
 const AGENT_TYPE_UNAVAILABLE_ERROR: &str = "agent type is currently not available";
 
+/// Identifies caller-selected identity fields that a role must not replace.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AgentRoleOverrideMask {
+    preserve_model: bool,
+    preserve_reasoning_effort: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AppliedAgentRoleOverrides {
+    pub(crate) model: bool,
+    pub(crate) reasoning_effort: bool,
+}
+
+impl AgentRoleOverrideMask {
+    /// Preserves the model selected explicitly by the caller.
+    pub fn preserve_model(&mut self) {
+        self.preserve_model = true;
+    }
+
+    /// Preserves the reasoning effort selected explicitly by the caller.
+    pub fn preserve_reasoning_effort(&mut self) {
+        self.preserve_reasoning_effort = true;
+    }
+
+    fn apply(self, overrides: &mut AgentRoleOverrides) {
+        if self.preserve_model {
+            overrides.model = None;
+        }
+        if self.preserve_reasoning_effort {
+            overrides.model_reasoning_effort = None;
+        }
+    }
+}
+
 #[derive(Default, Serialize)]
 struct AgentRoleOverrides {
     developer_instructions: Option<String>,
@@ -47,18 +81,29 @@ struct AgentRoleOverrides {
     skills: Option<SkillsConfig>,
 }
 
-/// Applies typed role overrides to the existing parent-derived configuration.
+#[cfg(test)]
+/// Applies typed role overrides to the existing parent-derived configuration in tests.
 pub(crate) async fn apply_role_to_config(
     config: &mut Config,
     role_name: Option<&str>,
 ) -> Result<(), String> {
+    apply_role_to_config_with_mask(config, role_name, AgentRoleOverrideMask::default())
+        .await
+        .map(|_| ())
+}
+
+pub(crate) async fn apply_role_to_config_with_mask(
+    config: &mut Config,
+    role_name: Option<&str>,
+    override_mask: AgentRoleOverrideMask,
+) -> Result<AppliedAgentRoleOverrides, String> {
     let role_name = role_name.unwrap_or(DEFAULT_ROLE_NAME);
 
     let role = resolve_role_config(config, role_name)
         .cloned()
         .ok_or_else(|| format!("unknown agent_type '{role_name}'"))?;
 
-    apply_role_to_config_inner(config, role_name, &role)
+    apply_role_to_config_inner(config, role_name, &role, override_mask)
         .await
         .map_err(|err| {
             tracing::warn!("failed to apply role to config: {err}");
@@ -66,20 +111,18 @@ pub(crate) async fn apply_role_to_config(
         })
 }
 
-/// Applies a v2 role while retaining the caller-selected developer instructions.
-///
-/// The current role overlay preserves caller-owned fields unless the role explicitly overrides
-/// them, so v2 uses the same overlay path while keeping this call site's intent explicit.
-pub(crate) async fn apply_role_to_config_for_multi_agent_v2(
-    config: &mut Config,
-    role_name: Option<&str>,
-) -> Result<(), String> {
-    apply_role_to_config(config, role_name).await
-}
-
 /// Applies a named role to a new headless exec session without dropping the
 /// invocation's runtime safety and process state.
 pub async fn apply_exec_agent_role(config: &mut Config, role_name: &str) -> Result<(), String> {
+    apply_exec_agent_role_with_overrides(config, role_name, AgentRoleOverrideMask::default()).await
+}
+
+/// Applies a named role while preserving caller-selected identity fields.
+pub async fn apply_exec_agent_role_with_overrides(
+    config: &mut Config,
+    role_name: &str,
+    override_mask: AgentRoleOverrideMask,
+) -> Result<(), String> {
     let runtime_permissions = config.permissions.clone();
     let runtime_explicit_permission_profile_mode = config.explicit_permission_profile_mode;
     let runtime_include_permissions_instructions = config.include_permissions_instructions;
@@ -94,7 +137,7 @@ pub async fn apply_exec_agent_role(config: &mut Config, role_name: &str) -> Resu
     let runtime_main_execve_wrapper_exe = config.main_execve_wrapper_exe.clone();
     let runtime_zsh_path = config.zsh_path.clone();
 
-    apply_role_to_config(config, Some(role_name)).await?;
+    apply_role_to_config_with_mask(config, Some(role_name), override_mask).await?;
 
     config.permissions = runtime_permissions;
     config.explicit_permission_profile_mode = runtime_explicit_permission_profile_mode;
@@ -116,10 +159,11 @@ async fn apply_role_to_config_inner(
     config: &mut Config,
     role_name: &str,
     role: &AgentRoleConfig,
-) -> anyhow::Result<()> {
+    override_mask: AgentRoleOverrideMask,
+) -> anyhow::Result<AppliedAgentRoleOverrides> {
     let is_built_in = !config.agent_roles.contains_key(role_name);
     let Some(config_file) = role.config_file.as_ref() else {
-        return Ok(());
+        return Ok(AppliedAgentRoleOverrides::default());
     };
     let role_layer_toml = load_role_layer_toml(config, config_file, is_built_in, role_name).await?;
     let role_config = deserialize_config_toml_with_base(role_layer_toml, &config.codex_home)?;
@@ -132,6 +176,11 @@ async fn apply_role_to_config_inner(
         personality: role_config.personality,
         service_tier: role_config.service_tier,
         ..Default::default()
+    };
+    override_mask.apply(&mut overrides);
+    let applied_overrides = AppliedAgentRoleOverrides {
+        model: overrides.model.is_some(),
+        reasoning_effort: overrides.model_reasoning_effort.is_some(),
     };
 
     if let Some(features) = role_config.features {
@@ -168,10 +217,10 @@ async fn apply_role_to_config_inner(
         .as_table()
         .is_some_and(toml::map::Map::is_empty)
     {
-        return Ok(());
+        return Ok(applied_overrides);
     }
     *config = role_overrides::build_next_config(config, role_layer_toml, &overrides)?;
-    Ok(())
+    Ok(applied_overrides)
 }
 
 async fn load_role_layer_toml(
@@ -312,36 +361,61 @@ mod role_overrides {
 pub(crate) mod spawn_tool_spec {
     use super::*;
 
+    /// Controls whether role text advertises explicit model and effort fields.
+    #[derive(Clone, Copy)]
+    pub(crate) enum ModelOverrideExposure {
+        Exposed,
+        Hidden,
+    }
+
     /// Builds the spawn-agent tool description text from built-in and configured roles.
+    #[cfg(test)]
     pub(crate) fn build(user_defined_agent_roles: &BTreeMap<String, AgentRoleConfig>) -> String {
+        build_with_model_overrides(user_defined_agent_roles, ModelOverrideExposure::Exposed)
+    }
+
+    /// Builds role descriptions with identity override guidance matching the exposed tool fields.
+    pub(crate) fn build_with_model_overrides(
+        user_defined_agent_roles: &BTreeMap<String, AgentRoleConfig>,
+        model_override_exposure: ModelOverrideExposure,
+    ) -> String {
         let built_in_roles = built_in::configs();
-        build_from_configs(built_in_roles, user_defined_agent_roles)
+        build_from_configs(
+            built_in_roles,
+            user_defined_agent_roles,
+            model_override_exposure,
+        )
     }
 
     // This function is not inlined for testing purpose.
     fn build_from_configs(
         built_in_roles: &BTreeMap<String, AgentRoleConfig>,
         user_defined_roles: &BTreeMap<String, AgentRoleConfig>,
+        model_override_exposure: ModelOverrideExposure,
     ) -> String {
         let mut seen = BTreeSet::new();
         let mut formatted_roles = Vec::new();
         for (name, declaration) in user_defined_roles {
             if seen.insert(name.as_str()) {
-                formatted_roles.push(format_role(name, declaration));
+                formatted_roles.push(format_role(name, declaration, model_override_exposure));
             }
         }
         for (name, declaration) in built_in_roles {
             if seen.insert(name.as_str()) {
-                formatted_roles.push(format_role(name, declaration));
+                formatted_roles.push(format_role(name, declaration, model_override_exposure));
             }
         }
 
         format!("Available roles:\n{}", formatted_roles.join("\n"))
     }
 
-    fn format_role(name: &str, declaration: &AgentRoleConfig) -> String {
+    fn format_role(
+        name: &str,
+        declaration: &AgentRoleConfig,
+        model_override_exposure: ModelOverrideExposure,
+    ) -> String {
         if let Some(description) = &declaration.description {
-            let locked_settings_note = declaration
+            let role_settings_note = declaration
                 .config_file
                 .as_ref()
                 .and_then(|config_file| {
@@ -362,18 +436,35 @@ pub(crate) mod spawn_tool_spec {
                         .and_then(TomlValue::as_str);
 
                     let model_and_reasoning_note = match (model, reasoning_effort) {
+                        (Some(model), Some(reasoning_effort))
+                            if matches!(
+                                model_override_exposure,
+                                ModelOverrideExposure::Exposed
+                            ) => format!(
+                            "\n- This role's model defaults to `{model}` and its reasoning effort defaults to `{reasoning_effort}`. Explicit `model` and `reasoning_effort` spawn arguments override these defaults."
+                        ),
+                        (Some(model), None)
+                            if matches!(
+                                model_override_exposure,
+                                ModelOverrideExposure::Exposed
+                            ) => format!(
+                            "\n- This role's model defaults to `{model}`. An explicit `model` spawn argument overrides this default."
+                        ),
+                        (None, Some(reasoning_effort))
+                            if matches!(
+                                model_override_exposure,
+                                ModelOverrideExposure::Exposed
+                            ) => format!(
+                            "\n- This role's reasoning effort defaults to `{reasoning_effort}`. An explicit `reasoning_effort` spawn argument overrides this default."
+                        ),
                         (Some(model), Some(reasoning_effort)) => format!(
-                            "\n- This role's model is set to `{model}` and its reasoning effort is set to `{reasoning_effort}`. These settings cannot be changed."
+                            "\n- This role's model defaults to `{model}` and its reasoning effort defaults to `{reasoning_effort}`."
                         ),
                         (Some(model), None) => {
-                            format!(
-                                "\n- This role's model is set to `{model}` and cannot be changed."
-                            )
+                            format!("\n- This role's model defaults to `{model}`.")
                         }
                         (None, Some(reasoning_effort)) => {
-                            format!(
-                                "\n- This role's reasoning effort is set to `{reasoning_effort}` and cannot be changed."
-                            )
+                            format!("\n- This role's reasoning effort defaults to `{reasoning_effort}`.")
                         }
                         (None, None) => String::new(),
                     };
@@ -387,7 +478,7 @@ pub(crate) mod spawn_tool_spec {
                     format!("{model_and_reasoning_note}{service_tier_note}")
                 })
                 .unwrap_or_default();
-            format!("{name}: {{\n{description}{locked_settings_note}\n}}")
+            format!("{name}: {{\n{description}{role_settings_note}\n}}")
         } else {
             format!("{name}: no description")
         }

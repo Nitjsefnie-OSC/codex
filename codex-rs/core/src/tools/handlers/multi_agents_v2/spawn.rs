@@ -116,6 +116,7 @@ async fn handle_spawn_agent(
         .as_deref()
         .map(str::trim)
         .filter(|role| !role.is_empty());
+    let inherited_role_name = turn.session_source.get_agent_role();
 
     let session_source = turn.session_source.clone();
     let child_depth = next_thread_spawn_depth(&session_source);
@@ -125,21 +126,46 @@ async fn handle_spawn_agent(
         config.service_tier = Some(service_tier.clone());
     }
     let is_full_history_fork = matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory));
-    apply_requested_spawn_agent_model_overrides(
+    let child_role_name = if is_full_history_fork {
+        inherited_role_name.as_deref()
+    } else {
+        role_name
+    };
+    let (identity_selection, applied_role) = if is_full_history_fork {
+        reject_full_fork_identity_overrides(
+            role_name,
+            args.model.as_deref(),
+            args.reasoning_effort.as_ref(),
+        )?;
+        (SpawnAgentIdentitySelection::default(), Default::default())
+    } else {
+        let identity_selection = prepare_spawn_agent_identity_selection(
+            turn.as_ref(),
+            &mut config,
+            args.model.as_deref(),
+            args.reasoning_effort.clone(),
+        );
+        let applied_role = apply_spawn_agent_role(
+            &mut config,
+            role_name,
+            identity_selection.role_override_mask(),
+        )
+        .await?;
+        (identity_selection, applied_role)
+    };
+    let should_validate_identity = identity_selection.selects_identity()
+        || applied_role.model
+        || applied_role.reasoning_effort;
+    apply_explicit_spawn_agent_identity_selection(
         &session,
         turn.as_ref(),
         &mut config,
-        args.model.as_deref(),
-        args.reasoning_effort.clone(),
+        identity_selection,
+        applied_role,
     )
     .await?;
-    if !is_full_history_fork || role_name.is_some() {
-        apply_spawn_agent_role(&session, &mut config, role_name).await?;
-        if is_full_history_fork && config.developer_instructions.is_none() {
-            config
-                .developer_instructions
-                .clone_from(&turn.developer_instructions);
-        }
+    if should_validate_identity {
+        validate_spawn_agent_model_reasoning_effort(&session, &config).await?;
     }
     apply_spawn_agent_service_tier(
         &session,
@@ -154,7 +180,7 @@ async fn handle_spawn_agent(
         session.thread_id,
         &turn.session_source,
         child_depth,
-        role_name,
+        child_role_name,
         Some(args.task_name.clone()),
     )?;
     let new_agent_path = spawn_source.get_agent_path().ok_or_else(|| {
@@ -239,7 +265,7 @@ async fn handle_spawn_agent(
         },
     )
     .await;
-    let role_tag = role_name.unwrap_or(DEFAULT_ROLE_NAME);
+    let role_tag = child_role_name.unwrap_or(DEFAULT_ROLE_NAME);
     turn.session_telemetry.counter(
         "codex.multi_agent.spawn",
         /*inc*/ 1,

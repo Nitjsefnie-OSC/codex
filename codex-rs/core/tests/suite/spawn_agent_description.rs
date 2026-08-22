@@ -229,7 +229,7 @@ async fn spawn_agent_description_lists_visible_models_and_reasoning_efforts() ->
     );
     assert!(
         description.contains(
-            "Spawned agents inherit your current model by default. Omit `model` to use that preferred default; set `model` only when an explicit override is needed."
+            "Non-full-history spawned agents resolve the model from an explicit override, selected role default, configured sub-agent default, then the parent model; reasoning effort resolves from an explicit override, selected role default, configured sub-agent default, selected model default, then parent effort. Full-history forks inherit the parent role, model, and reasoning effort and reject `agent_type`, `model`, and `reasoning_effort` overrides."
         ),
         "expected inherited-model guidance in spawn_agent description: {description:?}"
     );

@@ -45,6 +45,7 @@ use super::ConfiguredHandler;
 use super::ConfiguredHandlerKind;
 use super::HandlerSourcePath;
 use super::HookListEntryHandler;
+use crate::BackgroundState;
 use crate::events::pre_tool_use::PreToolUseRequest;
 use crate::events::stop::StopHookTarget;
 use crate::events::stop::StopRequest;
@@ -2077,6 +2078,7 @@ fn executor_stop_hook_fixture() -> (
         model: "test-model".to_string(),
         permission_mode: "default".to_string(),
         request_metadata: request_metadata.clone(),
+        background: BackgroundState::default(),
         stop_hook_active: false,
         last_assistant_message: None,
         target: StopHookTarget::Stop,

@@ -3129,9 +3129,12 @@ impl Session {
             .filter_map(|item| match item {
                 ResponseItem::FunctionCallOutput {
                     call_id, output, ..
-                } => output
-                    .text_content()
-                    .map(|output| (call_id.clone(), output.to_string())),
+                } => {
+                    let call_id = call_id.as_ref()?;
+                    output
+                        .text_content()
+                        .map(|output| (call_id.clone(), output.to_string()))
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();

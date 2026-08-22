@@ -113,7 +113,7 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
         properties
             .get("reasoning_effort")
             .and_then(|schema| schema.description.as_deref()),
-        Some("Reasoning effort override for the new agent. Omit to inherit the parent effort.")
+        Some(SPAWN_AGENT_REASONING_EFFORT_OVERRIDE_DESCRIPTION)
     );
     assert_eq!(
         properties
