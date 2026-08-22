@@ -675,6 +675,7 @@ mod tests {
             transcript_path: None,
             model: "gpt-5".to_string(),
             permission_mode: "default".to_string(),
+            request_metadata: None,
             stop_hook_active: false,
             last_assistant_message: None,
             background: BackgroundState {

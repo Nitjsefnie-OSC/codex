@@ -150,7 +150,7 @@ async fn install_role_with_model_override(turn: &mut TurnContext) -> String {
         &role_config_path,
         r#"model = "gpt-5-role-override"
 model_provider = "ollama"
-model_reasoning_effort = "minimal"
+model_reasoning_effort = "low"
 "#,
     )
     .await
@@ -335,78 +335,6 @@ async fn spawn_agent_uses_explorer_role_and_preserves_approval_policy() {
         .await;
     assert_eq!(snapshot.approval_policy, AskForApproval::OnRequest);
     assert_eq!(snapshot.model_provider_id, "ollama");
-}
-
-#[tokio::test]
-async fn spawn_agent_fork_context_rejects_agent_type_override() {
-    let (mut session, mut turn) = make_session_and_context().await;
-    let role_name = install_role_with_model_override(&mut turn).await;
-    let manager = thread_manager();
-    let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
-        .await
-        .expect("root thread should start");
-    session.services.agent_control = manager.agent_control();
-    session.thread_id = root.thread_id;
-    let err = SpawnAgentHandler::default()
-        .handle(invocation(
-            Arc::new(session),
-            Arc::new(turn),
-            "spawn_agent",
-            function_payload(json!({
-                "message": "inspect this repo",
-                "agent_type": role_name,
-                "fork_context": true
-            })),
-        ))
-        .await
-        .err()
-        .expect("fork_context should reject agent_type overrides");
-
-    assert_eq!(
-        err,
-        FunctionCallError::RespondToModel(
-            "Full-history forked agents inherit the parent agent type; omit agent_type, or spawn without a full-history fork.".to_string(),
-        )
-    );
-}
-
-#[tokio::test]
-async fn multi_agent_v2_spawn_fork_turns_all_applies_agent_type_override() {
-    let (mut session, mut turn) = make_session_and_context().await;
-    let role_name = install_role_with_model_override(&mut turn).await;
-    let manager = thread_manager();
-    let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
-        .await
-        .expect("root thread should start");
-    session.services.agent_control = manager.agent_control();
-    session.thread_id = root.thread_id;
-    let mut config = (*turn.config).clone();
-    config
-        .features
-        .enable(Feature::MultiAgentV2)
-        .expect("test config should allow feature update");
-    let turn = TurnContext {
-        config: Arc::new(config),
-        multi_agent_version: codex_protocol::protocol::MultiAgentVersion::V2,
-        ..turn
-    };
-
-    SpawnAgentHandlerV2::default()
-        .handle(invocation(
-            Arc::new(session),
-            Arc::new(turn),
-            "spawn_agent",
-            function_payload(json!({
-                "message": "inspect this repo",
-                "task_name": "fork_context_v2",
-                "agent_type": role_name,
-                "fork_turns": "all"
-            })),
-        ))
-        .await
-        .expect("fork_turns=all should apply agent_type overrides");
 }
 
 #[tokio::test]
@@ -960,7 +888,8 @@ async fn multi_agent_v2_spawn_partial_fork_turns_allows_agent_type_override() {
 
     assert_eq!(snapshot.model, "gpt-5-role-override");
     assert_eq!(snapshot.model_provider_id, parent_provider_id);
-    assert_eq!(snapshot.reasoning_effort, Some(ReasoningEffort::Minimal));
+    assert_eq!(snapshot.reasoning_effort, Some(ReasoningEffort::Low));
+    assert_eq!(snapshot.session_source.get_agent_role(), Some(role_name));
 }
 
 #[tokio::test]
@@ -4663,6 +4592,9 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
         .expect("approval policy set");
     assert_eq!(config, expected);
 }
+
+#[path = "multi_agents_identity_tests.rs"]
+mod identity_tests;
 
 #[tokio::test]
 async fn build_agent_resume_config_clears_base_instructions() {
