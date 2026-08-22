@@ -194,6 +194,17 @@ async fn process_list_includes_resumed_agent_when_navigation_cache_is_stale() ->
     let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
     let mut tui = crate::tui::test_support::make_test_tui()?;
     let codex_home = tempdir()?;
+    // The embedded app server builds every thread's config through its `ConfigManager`, which
+    // loads from this on-disk `config.toml` (plus the request's own overrides) — never from the
+    // in-memory `app.config` mutated below (`thread_start_task` calls
+    // `config_manager.load_with_overrides(..)` in
+    // `app-server/src/request_processors/thread_processor.rs`). `multi_agent_v2` is default-off
+    // and must therefore be enabled HERE: without it the parent's turn runs multi-agent V1, whose
+    // registry has no namespaced `collaboration.spawn_agent`/`followup_task`, so the mocked
+    // function calls never reach the real AgentControl spawn path and no `SubAgentActivity` item
+    // ever appears on the parent thread. This is the same incantation the CI-proven app-server
+    // integration test `app-server/tests/suite/v2/multi_agent_v2_developer_instructions.rs` uses
+    // for the identical spawn/followup flow.
     std::fs::write(
         codex_home.path().join("config.toml"),
         format!(
@@ -207,6 +218,9 @@ base_url = "{}/v1"
 wire_api = "responses"
 request_max_retries = 0
 stream_max_retries = 0
+
+[features.multi_agent_v2]
+enabled = true
 "#,
             server.uri()
         ),
@@ -222,6 +236,9 @@ stream_max_retries = 0
         stream_max_retries: Some(0),
         ..ModelProviderInfo::default()
     };
+    // These in-memory flags shape only the TUI-side `App`'s own view of the world (e.g. the
+    // `Feature::Collab` gate in `session_lifecycle.rs`); the app-server side reads the on-disk
+    // `config.toml` written above. Keep both sides consistent.
     app.config
         .features
         .enable(Feature::Collab)
@@ -230,7 +247,6 @@ stream_max_retries = 0
         .features
         .enable(Feature::MultiAgentV2)
         .expect("test config should allow feature update");
-    app.config.multi_agent_v2.max_concurrent_threads_per_session = 3;
 
     let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
 
