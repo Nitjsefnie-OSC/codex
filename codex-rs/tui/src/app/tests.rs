@@ -37,6 +37,8 @@ mod patch_approval_tests;
 #[path = "tests/permission_shortcuts_tests.rs"]
 mod permission_shortcuts_tests;
 mod plugin_catalog;
+#[path = "tests/process_list_liveness.rs"]
+mod process_list_liveness;
 mod rate_limits;
 #[path = "tests/recap_generation_tests.rs"]
 mod recap_generation;

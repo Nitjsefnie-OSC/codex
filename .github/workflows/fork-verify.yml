@@ -323,6 +323,7 @@ jobs:
             "codex-tui|chatwidget::tests::exec_flow::ps_routes_exec_command_and_monitor_processes_to_distinct_sections" \
             "codex-tui|chatwidget::tests::slash_commands::slash_ps_requests_app_owned_process_list" \
             "codex-tui|app::tests::process_list_includes_only_live_path_backed_native_agents" \
+            "codex-tui|app::tests::process_list_liveness::process_list_includes_resumed_agent_when_navigation_cache_is_stale" \
             "codex-core|unified_exec::head_tail_buffer::tests::draining_resets_state_and_push_buffer_preserves_omissions"
           do
             package="${spec%%|*}"
