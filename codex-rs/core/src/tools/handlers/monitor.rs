@@ -5,6 +5,7 @@ use codex_shell_command::parse_command::shlex_join;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use serde::Deserialize;
+use tokio_util::sync::CancellationToken;
 
 use crate::function_tool::FunctionCallError;
 use crate::sandboxing::SandboxPermissions;
@@ -200,6 +201,7 @@ async fn start(
     let context = UnifiedExecContext::new(
         Arc::clone(&session),
         Arc::clone(&step_context),
+        CancellationToken::new(),
         call_id.clone(),
         crate::unified_exec::InitialExecCommandOutputDestination::Untracked,
     );
