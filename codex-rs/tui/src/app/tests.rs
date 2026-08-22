@@ -14,6 +14,8 @@ mod model_catalog;
 #[path = "tests/permission_shortcuts_tests.rs"]
 mod permission_shortcuts_tests;
 mod plugin_catalog;
+#[path = "tests/process_list_liveness.rs"]
+mod process_list_liveness;
 mod rate_limits;
 mod safety_buffering;
 #[path = "tests/session_lifecycle_requests.rs"]
