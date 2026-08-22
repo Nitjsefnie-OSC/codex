@@ -3,9 +3,10 @@
 //! The authoritative source for whether a native agent is running is the real
 //! AgentControl/multi-agent-v2 boundary, never the TUI's own historical caches
 //! (`AgentNavigationState` or a `ThreadEventChannel`). This module spawns a genuine native child
-//! through the real `spawn_agent` tool dispatch, lets its first turn complete for real, then
-//! resumes it through the real `followup_task` tool dispatch while the TUI's own caches stay
-//! stale, proving `/ps` cannot be satisfied without a fresh authoritative query.
+//! through the real `spawn_agent` tool dispatch, attaches app-server watch state to it through
+//! the production `thread/resume` rejoin RPC (never a TUI channel), lets its first turn complete
+//! for real, then resumes it through the real `followup_task` tool dispatch while the TUI's own
+//! caches stay stale, proving `/ps` cannot be satisfied without a fresh authoritative query.
 
 use super::*;
 use codex_app_server_protocol::SubAgentActivityKind;
@@ -137,12 +138,14 @@ async fn wait_for_spawned_child(
 
 /// Polls the child's real, authoritative `thread_read` status until `is_expected_status` matches.
 ///
-/// The internally spawned child is never a thread this client itself started or subscribed to, so
-/// nothing guarantees the embedded app server routes the child's own notifications to this
-/// connection. Observing liveness through a direct `thread_read` call — the same authoritative
-/// source `/subagents` already refreshes from — sidesteps that assumption entirely, so this can
-/// never itself become a false-RED wait: it either observes the real status or the deadline panic
-/// fires as an explicit fixture-setup failure, distinct from the intended `/ps` assertion failure.
+/// Observing liveness through a direct `thread_read` call — the same authoritative source
+/// `/subagents` already refreshes from — queries the resource itself instead of depending on
+/// notification-delivery timing, so this can never itself become a false-RED wait: it either
+/// observes the real status or the deadline panic fires as an explicit fixture-setup failure,
+/// distinct from the intended `/ps` assertion failure. The caller must first attach app-server
+/// watch state for the child (the `thread/resume` rejoin in the test body); a child that was only
+/// ever created by `spawn_agent`'s internal machinery has no `ThreadWatchManager` entry of its
+/// own, and an unwatched idle thread reads back as `NotLoaded`, never `Idle`.
 async fn wait_for_child_thread_status(
     app_server: &mut AppServerSession,
     thread_id: ThreadId,
@@ -173,7 +176,9 @@ async fn wait_for_child_thread_status(
 /// record.
 ///
 /// This drives the real lifecycle end to end: the parent's own turn calls the real `spawn_agent`
-/// tool, which creates a genuine native child through the real multi-agent-v2 path; the child's
+/// tool, which creates a genuine native child through the real multi-agent-v2 path; app-server
+/// watch state is attached to the child through the production `thread/resume` rejoin RPC, so
+/// authoritative `thread_read` reports the child's real status instead of `NotLoaded`; the child's
 /// first turn genuinely completes; the TUI's cache is populated and left stale by a single real
 /// `thread_read`-backed refresh (exactly the same call `/subagents` already uses, and exactly the
 /// gap a `followup_task` resume leaves behind, since the only signal the TUI would otherwise see is
@@ -307,6 +312,45 @@ stream_max_retries = 0
 
     let (child_thread_id, discovered_agent_path) =
         wait_for_spawned_child(&mut app_server, parent_thread_id).await;
+
+    // The child was created by `spawn_agent`'s internal machinery, never by this client's own
+    // `thread/start`, so the embedded app server may hold no listener or `ThreadWatchManager`
+    // entry for it. Without one, authoritative `thread_read` reports `NotLoaded` — which the
+    // production refresh below misclassifies as closed, and which the strict `Idle` poll would
+    // turn into a false-RED timeout. Attach app-server-side watch state through the same
+    // production rejoin RPC the TUI already uses for loaded threads it did not start itself
+    // (`thread_routing::refresh_snapshot_session_if_needed`): `resume_thread` with
+    // `PreserveExistingThread` sends a bare `thread/resume` carrying only the thread id, which
+    // the server answers via its running-thread rejoin path — ensuring the child's listener task
+    // is running, which drains the child's buffered turn lifecycle events into the watch state so
+    // `thread_read` reports the child's real `Idle`/`Active` status from here on. The call is
+    // app-server-only: it never touches `App`, creates no `ThreadEventChannel`, and writes
+    // nothing into any TUI cache. The bounded retry absorbs thread-store visibility lag right
+    // after the spawn; exhausting it panics as an explicit fixture-setup failure, distinct from
+    // the intended `/ps` assertion failure.
+    let attach_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match app_server
+            .resume_thread(
+                app.config.clone(),
+                child_thread_id,
+                crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
+            )
+            .await
+        {
+            Ok(_) => break,
+            Err(err) => {
+                if tokio::time::Instant::now() >= attach_deadline {
+                    panic!(
+                        "failed to attach app-server watch state to the spawned child \
+                         {child_thread_id}: {err}"
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(/*millis*/ 25)).await;
+            }
+        }
+    }
+
     wait_for_child_thread_status(
         &mut app_server,
         child_thread_id,
