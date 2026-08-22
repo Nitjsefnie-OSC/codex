@@ -1,87 +1,143 @@
 //! `/ps` liveness regression coverage for native agents.
 //!
 //! The authoritative source for whether a native agent is running is the real
-//! AgentControl/app-server boundary (a fresh `thread_read`-equivalent snapshot), never the TUI's
-//! own historical caches (`AgentNavigationState` or a `ThreadEventChannel`). This module drives two
-//! genuinely independent app-server threads through the real embedded app server, with neither
-//! thread ever attached to the TUI's own live event machinery, so the only way `/ps` can learn
-//! their true liveness is a fresh query against the app server itself.
+//! AgentControl/multi-agent-v2 boundary, never the TUI's own historical caches
+//! (`AgentNavigationState` or a `ThreadEventChannel`). This module spawns a genuine native child
+//! through the real `spawn_agent` tool dispatch, lets its first turn complete for real, then
+//! resumes it through the real `followup_task` tool dispatch while the TUI's own caches stay
+//! stale, proving `/ps` cannot be satisfied without a fresh authoritative query.
 
 use super::*;
-use codex_app_server_protocol::UserInput;
-use core_test_support::responses;
+use codex_app_server_protocol::SubAgentActivityKind;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_function_call_with_namespace;
 use core_test_support::responses::ev_response_created;
-use core_test_support::streaming_sse::StreamingSseChunk;
-use core_test_support::streaming_sse::start_streaming_sse_server;
-use tokio::sync::oneshot;
+use core_test_support::responses::mount_response_once_match;
+use core_test_support::responses::mount_sse_once_match;
+use core_test_support::responses::sse;
+use core_test_support::responses::sse_response;
+use core_test_support::responses::start_mock_server;
+use std::time::Duration;
+use wiremock::Request;
 
 const MODEL: &str = "gpt-5.4";
 const MODEL_PROVIDER_ID: &str = "ps-liveness-test";
+const COLLABORATION_NAMESPACE: &str = "collaboration";
 
-fn immediate_response_chunks(response_id: &str) -> Vec<StreamingSseChunk> {
-    [
+// Distinctive, never-otherwise-occurring markers used to route each mocked model exchange to the
+// exact real HTTP request it is meant to answer. Because a request's body includes the full prior
+// conversation, later requests remain a superset of earlier markers; correctness here comes from
+// staging each mock only once its predecessor is consumed, plus the `agent_message` input-type
+// check that always separates the parent's own conversation from the child's.
+const SPAWN_PROMPT: &str = "codex-ps-liveness: spawn the worker";
+const SPAWN_CALL_ID: &str = "codex-ps-liveness-spawn-call";
+const CHILD_TASK: &str = "codex-ps-liveness: do the first task";
+const RESUME_PROMPT: &str = "codex-ps-liveness: resume the worker";
+const FOLLOWUP_CALL_ID: &str = "codex-ps-liveness-followup-call";
+
+/// Reads a mocked request body as raw bytes. Loopback test traffic here is never
+/// content-encoded, so no decompression is needed.
+fn request_body(request: &Request) -> Option<Vec<u8>> {
+    Some(request.body.clone())
+}
+
+fn body_contains(request: &Request, text: &str) -> bool {
+    request_body(request)
+        .and_then(|body| String::from_utf8(body).ok())
+        .is_some_and(|body| body.contains(text))
+}
+
+/// True only for a request that carries an `agent_message`-typed input item — the wire marker a
+/// spawned child's own conversation carries that the parent's own conversation never does.
+fn request_has_input_type(request: &Request, input_type: &str) -> bool {
+    request_body(request)
+        .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
+        .and_then(|body| {
+            body.get("input")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+        })
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.get("type").and_then(serde_json::Value::as_str) == Some(input_type)
+            })
+        })
+}
+
+fn is_parent_request(request: &Request) -> bool {
+    !request_has_input_type(request, "agent_message")
+}
+
+fn immediate_child_turn_body(response_id: &str) -> String {
+    sse(vec![
         ev_response_created(response_id),
-        ev_assistant_message(&format!("message-{response_id}"), "done"),
+        ev_assistant_message(&format!("msg-{response_id}"), "first task done"),
         ev_completed(response_id),
-    ]
-    .into_iter()
-    .map(|event| StreamingSseChunk {
-        gate: None,
-        body: responses::sse(vec![event]),
-    })
-    .collect()
+    ])
 }
 
-/// Splits a response into an ungated `response_created` chunk followed by a gated `completed`
-/// chunk, so the caller can hold the turn genuinely `InProgress` on the app server until it
-/// chooses to release it.
-fn gated_response_chunks(response_id: &str) -> (Vec<StreamingSseChunk>, oneshot::Sender<()>) {
-    let (release_tx, release_rx) = oneshot::channel();
-    (
-        vec![
-            StreamingSseChunk {
-                gate: None,
-                body: responses::sse(vec![ev_response_created(response_id)]),
-            },
-            StreamingSseChunk {
-                gate: Some(release_rx),
-                body: responses::sse(vec![ev_completed(response_id)]),
-            },
-        ],
-        release_tx,
-    )
+/// Extracts the spawned child's real thread id and agent path from a `SubAgentActivity::Started`
+/// item, wherever it appears in a parent-thread notification.
+fn started_child_from_item(item: &ThreadItem) -> Option<(ThreadId, String)> {
+    let ThreadItem::SubAgentActivity {
+        kind: SubAgentActivityKind::Started,
+        agent_thread_id,
+        agent_path,
+        ..
+    } = item
+    else {
+        return None;
+    };
+    Some((
+        ThreadId::from_string(agent_thread_id).ok()?,
+        agent_path.clone(),
+    ))
 }
 
-/// Waits for the real app server to report that `thread_id`'s turn has started, without routing
-/// the notification through `App` — this deliberately never touches `agent_navigation` or any
-/// `ThreadEventChannel`, so the resumed thread's liveness stays known only to the app server.
-async fn wait_for_turn_started(app_server: &mut AppServerSession, thread_id: ThreadId) {
-    for _ in 0..20 {
+fn notification_item_for_thread<'a>(
+    notification: &'a ServerNotification,
+    parent_thread_id: ThreadId,
+) -> Option<&'a ThreadItem> {
+    match notification {
+        ServerNotification::ItemStarted(n) if n.thread_id == parent_thread_id.to_string() => {
+            Some(&n.item)
+        }
+        ServerNotification::ItemCompleted(n) if n.thread_id == parent_thread_id.to_string() => {
+            Some(&n.item)
+        }
+        _ => None,
+    }
+}
+
+/// Waits for the real app server to report a `SubAgentActivity::Started` item on the parent's own
+/// transcript, returning the spawned child's real thread id and agent path.
+async fn wait_for_spawned_child(
+    app_server: &mut AppServerSession,
+    parent_thread_id: ThreadId,
+) -> (ThreadId, String) {
+    for _ in 0..40 {
         let event = tokio::time::timeout(
-            std::time::Duration::from_secs(/*secs*/ 5),
+            std::time::Duration::from_secs(/*secs*/ 10),
             app_server.next_event(),
         )
         .await
-        .expect("app-server should emit a turn/start event")
+        .expect("app-server should emit an event while spawning the child")
         .expect("app-server event stream should remain open");
         if let codex_app_server_client::AppServerEvent::ServerNotification(notification) = event
-            && let ServerNotification::TurnStarted(notification) = *notification
-            && notification.thread_id == thread_id.to_string()
+            && let Some(item) = notification_item_for_thread(&notification, parent_thread_id)
+            && let Some(found) = started_child_from_item(item)
         {
-            return;
+            return found;
         }
     }
-    panic!("expected TurnStarted for thread {thread_id}");
+    panic!("expected a SubAgentActivity::Started item for the spawned child");
 }
 
-/// Waits for the real app server to report that `thread_id`'s turn has completed, without routing
-/// the notification through `App` (see `wait_for_turn_started`).
 async fn wait_for_turn_completed(app_server: &mut AppServerSession, thread_id: ThreadId) {
-    for _ in 0..20 {
+    for _ in 0..40 {
         let event = tokio::time::timeout(
-            std::time::Duration::from_secs(/*secs*/ 5),
+            std::time::Duration::from_secs(/*secs*/ 10),
             app_server.next_event(),
         )
         .await
@@ -97,27 +153,42 @@ async fn wait_for_turn_completed(app_server: &mut AppServerSession, thread_id: T
     panic!("expected TurnCompleted for thread {thread_id}");
 }
 
+async fn wait_for_turn_started(app_server: &mut AppServerSession, thread_id: ThreadId) {
+    for _ in 0..40 {
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(/*secs*/ 10),
+            app_server.next_event(),
+        )
+        .await
+        .expect("app-server should emit a turn/start event")
+        .expect("app-server event stream should remain open");
+        if let codex_app_server_client::AppServerEvent::ServerNotification(notification) = event
+            && let ServerNotification::TurnStarted(notification) = *notification
+            && notification.thread_id == thread_id.to_string()
+        {
+            return;
+        }
+    }
+    panic!("expected TurnStarted for thread {thread_id}");
+}
+
 /// `/ps` must list the agents that are running right now, per the authoritative agent controller,
 /// not the last liveness verdict the TUI's own navigation cache or event channels happened to
 /// record.
 ///
-/// Both threads here are started directly against the real embedded app server and never attached
-/// to `App` (no `thread_event_channels` entry, no `handle_app_server_event` routing), so their only
-/// representation inside `App` is a stale, explicitly-not-running `agent_navigation` entry — the
-/// same shape a `followup_task` resume leaves behind, since the only signal the TUI observes for
-/// that case is a `SubAgentActivity::Interacted` item, which `sub_agent_activity_display` maps to
-/// `None` and therefore never revives cached liveness. Meanwhile the resumed thread's turn is
-/// genuinely `InProgress` on the app server (held open by a gated SSE response) at the moment `/ps`
-/// is invoked, and the completed thread's turn has genuinely finished. A fix that reads only
-/// `agent_navigation` or only a `ThreadEventChannel` has no way to see either fact; a fix that
-/// queries the app server's authoritative current state for each candidate thread does.
+/// This drives the real lifecycle end to end: the parent's own turn calls the real `spawn_agent`
+/// tool, which creates a genuine native child through the real multi-agent-v2 path; the child's
+/// first turn genuinely completes; the TUI's cache is populated and left stale by a single real
+/// `thread_read`-backed refresh (exactly the same call `/subagents` already uses, and exactly the
+/// gap a `followup_task` resume leaves behind, since the only signal the TUI would otherwise see is
+/// a `SubAgentActivity::Interacted` item, which `sub_agent_activity_display` maps to `None`); the
+/// parent's second turn calls the real `followup_task` tool, which starts the child's second turn
+/// for real, held open by a delayed mock response. No `ThreadEventChannel` is ever created for the
+/// child. A fix that reads only `agent_navigation` or only a `ThreadEventChannel` cannot pass; only
+/// a fresh query against the real app server can.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn process_list_includes_resumed_agent_when_navigation_cache_is_stale() -> Result<()> {
-    let (running_chunks, release_running_response) =
-        gated_response_chunks("resumed-agent-response");
-    let finished_chunks = immediate_response_chunks("finished-agent-response");
-    let (server, _completions) =
-        start_streaming_sse_server(vec![running_chunks, finished_chunks]).await;
+    let server = start_mock_server().await;
 
     let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
     let mut tui = crate::tui::test_support::make_test_tui()?;
@@ -150,33 +221,77 @@ stream_max_retries = 0
         stream_max_retries: Some(0),
         ..ModelProviderInfo::default()
     };
+    app.config
+        .features
+        .enable(Feature::Collab)
+        .expect("test config should allow feature update");
+    app.config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    app.config.multi_agent_v2.max_concurrent_threads_per_session = 3;
 
     let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
 
-    // Two genuinely independent app-server threads. Neither is ever attached to `App`, so nothing
-    // here can populate `agent_navigation`'s liveness from real events, matching the resumed-child
-    // scenario where the TUI never watches the child thread directly.
-    let resumed_thread_id = app_server
+    // Parent thread. Never attached to `App` (no `thread_event_channels` entry) — it exists purely
+    // to drive real `spawn_agent`/`followup_task` tool calls.
+    let parent_thread_id = app_server
         .start_thread(&app.config)
         .await?
         .session
         .thread_id;
-    let completed_thread_id = app_server
-        .start_thread(&app.config)
-        .await?
-        .session
-        .thread_id;
-
     let workspace_roots = app
         .config
         .permissions
         .user_visible_workspace_roots()
         .to_vec();
+
+    // Stage 1: the parent's own turn spawns a real native child through the real
+    // `spawn_agent` tool, and the child's own first turn completes normally.
+    let spawn_args = serde_json::to_string(&serde_json::json!({
+        "message": CHILD_TASK,
+        "task_name": "resumed-worker",
+        "fork_turns": "none",
+    }))?;
+    mount_sse_once_match(
+        &server,
+        |request: &Request| body_contains(request, SPAWN_PROMPT) && is_parent_request(request),
+        sse(vec![
+            ev_response_created("resp-spawn-1"),
+            ev_function_call_with_namespace(
+                SPAWN_CALL_ID,
+                COLLABORATION_NAMESPACE,
+                "spawn_agent",
+                &spawn_args,
+            ),
+            ev_completed("resp-spawn-1"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |request: &Request| body_contains(request, SPAWN_CALL_ID) && is_parent_request(request),
+        sse(vec![
+            ev_response_created("resp-spawn-2"),
+            ev_assistant_message("msg-spawn-2", "worker spawned"),
+            ev_completed("resp-spawn-2"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |request: &Request| {
+            request_has_input_type(request, "agent_message") && body_contains(request, CHILD_TASK)
+        },
+        immediate_child_turn_body("resp-child-turn-1"),
+    )
+    .await;
+
     app_server
         .turn_start(
-            resumed_thread_id,
-            vec![UserInput::Text {
-                text: "keep this resumed turn running".to_string(),
+            parent_thread_id,
+            vec![codex_app_server_protocol::UserInput::Text {
+                text: SPAWN_PROMPT.to_string(),
                 text_elements: Vec::new(),
             }],
             app.config.cwd.to_path_buf(),
@@ -193,60 +308,46 @@ stream_max_retries = 0
             /*output_schema*/ None,
         )
         .await?;
-    server.wait_for_request_count(1).await;
-    wait_for_turn_started(&mut app_server, resumed_thread_id).await;
 
-    app_server
-        .turn_start(
-            completed_thread_id,
-            vec![UserInput::Text {
-                text: "finish this turn immediately".to_string(),
-                text_elements: Vec::new(),
-            }],
-            app.config.cwd.to_path_buf(),
-            AskForApproval::Never,
-            ApprovalsReviewer::User,
-            TurnPermissionsOverride::Preserve,
-            &workspace_roots,
-            MODEL.to_string(),
-            /*effort*/ None,
-            /*summary*/ None,
-            /*service_tier*/ None,
-            /*collaboration_mode*/ None,
-            /*personality*/ None,
-            /*output_schema*/ None,
-        )
-        .await?;
-    server.wait_for_request_count(2).await;
-    wait_for_turn_completed(&mut app_server, completed_thread_id).await;
+    let (child_thread_id, discovered_agent_path) =
+        wait_for_spawned_child(&mut app_server, parent_thread_id).await;
+    wait_for_turn_completed(&mut app_server, child_thread_id).await;
 
-    // Historical TUI state: both children are remembered as stale and explicitly not running,
-    // exactly what a `followup_task` resume leaves behind.
-    for (thread_id, agent_path, agent_nickname) in [
-        (resumed_thread_id, "/root/resumed", "Ada"),
-        (completed_thread_id, "/root/finished", "Grace"),
-    ] {
-        app.agent_navigation.upsert(
-            thread_id,
-            Some(agent_nickname.to_string()),
-            Some("explorer".to_string()),
-            /*is_closed*/ false,
-        );
-        app.agent_navigation
-            .record_sub_agent_activity(SubAgentActivityDisplay {
-                thread_id,
-                agent_path: agent_path.to_string(),
-                is_running_hint: false,
-            });
-    }
-    assert!(!app.thread_event_channels.contains_key(&resumed_thread_id));
-    assert!(!app.thread_event_channels.contains_key(&completed_thread_id));
+    // Stage 2: populate `agent_navigation` the same way `/subagents` already does — a single real
+    // `thread_read`-backed refresh, taken while the child is genuinely idle. This is the only
+    // identity/liveness source; nothing here is hand-labeled.
+    app.refresh_agent_picker_thread_liveness(&mut app_server, child_thread_id)
+        .await;
+    let stale_entry = app
+        .agent_navigation
+        .get(&child_thread_id)
+        .cloned()
+        .expect("spawned child should be cached after a real liveness refresh");
+    assert!(
+        !stale_entry.is_running,
+        "child must be genuinely idle at this snapshot"
+    );
+    assert!(!stale_entry.is_closed);
+    let agent_path = stale_entry
+        .agent_path
+        .clone()
+        .filter(|path| !path.trim().is_empty())
+        .unwrap_or(discovered_agent_path);
+    let expected_label = format_agent_picker_item_name(
+        stale_entry.agent_nickname.as_deref(),
+        stale_entry.agent_role.as_deref(),
+        /*is_primary*/ false,
+    );
+    assert!(
+        !app.thread_event_channels.contains_key(&child_thread_id),
+        "the child must never be attached to a ThreadEventChannel"
+    );
     while app_event_rx.try_recv().is_ok() {}
 
+    // Snapshot A: the child is genuinely completed (idle) right now, so it must be absent.
     app.handle_event(&mut tui, &mut app_server, AppEvent::OpenProcessList)
         .await?;
-
-    let rendered = std::iter::from_fn(|| app_event_rx.try_recv().ok())
+    let rendered_idle = std::iter::from_fn(|| app_event_rx.try_recv().ok())
         .filter_map(|event| match event {
             AppEvent::InsertHistoryCell(cell) => {
                 Some(lines_to_single_string(&cell.display_lines(/*width*/ 200)))
@@ -255,20 +356,96 @@ stream_max_retries = 0
         })
         .find(|rendered| rendered.contains("Native agents"))
         .expect("process list history cell");
-
     assert!(
-        rendered.contains("/root/resumed — Ada [explorer] — running"),
-        "resumed agent should be listed while its turn is genuinely in progress on the app \
-         server, even though the TUI's own cache still says stopped:\n{rendered}"
-    );
-    assert!(
-        !rendered.contains("/root/finished"),
-        "an agent whose turn has genuinely completed on the app server must stay out of the \
-         process list:\n{rendered}"
+        !rendered_idle.contains(&agent_path),
+        "a genuinely completed child must stay out of the process list:\n{rendered_idle}"
     );
 
-    let _ = release_running_response.send(());
+    // Stage 3: the parent's second turn resumes the same child through the real `followup_task`
+    // tool, targeting it by its real thread id. The child's second turn is held open by a delayed
+    // response, so it is genuinely `InProgress` on the app server for the rest of this test.
+    let followup_args = serde_json::to_string(&serde_json::json!({
+        "target": child_thread_id.to_string(),
+        "message": "keep going",
+    }))?;
+    mount_sse_once_match(
+        &server,
+        |request: &Request| body_contains(request, RESUME_PROMPT) && is_parent_request(request),
+        sse(vec![
+            ev_response_created("resp-followup-1"),
+            ev_function_call_with_namespace(
+                FOLLOWUP_CALL_ID,
+                COLLABORATION_NAMESPACE,
+                "followup_task",
+                &followup_args,
+            ),
+            ev_completed("resp-followup-1"),
+        ]),
+    )
+    .await;
+    mount_response_once_match(
+        &server,
+        |request: &Request| {
+            request_has_input_type(request, "agent_message") && body_contains(request, CHILD_TASK)
+        },
+        sse_response(immediate_child_turn_body("resp-child-turn-2"))
+            .set_delay(Duration::from_secs(60)),
+    )
+    .await;
+
+    app_server
+        .turn_start(
+            parent_thread_id,
+            vec![codex_app_server_protocol::UserInput::Text {
+                text: RESUME_PROMPT.to_string(),
+                text_elements: Vec::new(),
+            }],
+            app.config.cwd.to_path_buf(),
+            AskForApproval::Never,
+            ApprovalsReviewer::User,
+            TurnPermissionsOverride::Preserve,
+            &workspace_roots,
+            MODEL.to_string(),
+            /*effort*/ None,
+            /*summary*/ None,
+            /*service_tier*/ None,
+            /*collaboration_mode*/ None,
+            /*personality*/ None,
+            /*output_schema*/ None,
+        )
+        .await?;
+    wait_for_turn_started(&mut app_server, child_thread_id).await;
+
+    // Historical TUI state is unchanged since stage 2: `agent_navigation` still says not-running,
+    // and the child still has no `ThreadEventChannel`.
+    assert!(
+        !app.agent_navigation
+            .get(&child_thread_id)
+            .expect("child stays cached")
+            .is_running,
+        "the cache must remain stale across the resume"
+    );
+    assert!(!app.thread_event_channels.contains_key(&child_thread_id));
+    while app_event_rx.try_recv().is_ok() {}
+
+    // Snapshot B: the child's resumed turn is genuinely running on the app server right now.
+    app.handle_event(&mut tui, &mut app_server, AppEvent::OpenProcessList)
+        .await?;
+    let rendered_running = std::iter::from_fn(|| app_event_rx.try_recv().ok())
+        .filter_map(|event| match event {
+            AppEvent::InsertHistoryCell(cell) => {
+                Some(lines_to_single_string(&cell.display_lines(/*width*/ 200)))
+            }
+            _ => None,
+        })
+        .find(|rendered| rendered.contains("Native agents"))
+        .expect("process list history cell");
+    assert!(
+        rendered_running.contains(&format!("{agent_path} — {expected_label} — running")),
+        "resumed native agent should be listed while its turn is genuinely in progress on the \
+         app server, even though the TUI's own cache still says stopped:\n{rendered_running}"
+    );
+
     app_server.shutdown().await?;
-    server.shutdown().await;
     Ok(())
 }
