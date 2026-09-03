@@ -1,4 +1,5 @@
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentStatus;
 

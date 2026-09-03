@@ -33,6 +33,7 @@ impl UnifiedExecProcessManager {
             Arc::clone(&context.step_context),
             context.cancellation_token.child_token(),
             context.call_id.clone(),
+            context.initial_output_destination,
         );
         let _cancel_on_drop = context.cancellation_token.clone().drop_guard();
         tokio::spawn(async move {
@@ -52,8 +53,12 @@ impl UnifiedExecProcessManager {
                 process: &process,
             };
             let result = {
-                let mut execution =
-                    Box::pin(manager.exec_command_inner(request, &context, Some(&mut completion)));
+                let mut execution = Box::pin(manager.exec_command_inner(
+                    request,
+                    &context,
+                    Some(&mut completion),
+                    /*monitor*/ None,
+                ));
                 tokio::select! {
                     biased;
                     _ = context.cancellation_token.cancelled() => {

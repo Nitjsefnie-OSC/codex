@@ -10,7 +10,6 @@ use codex_code_mode_protocol::host::EncodedFrame;
 use codex_code_mode_protocol::host::HostToClient;
 use codex_code_mode_protocol::host::MAX_PENDING_DELEGATE_CALLS;
 use codex_code_mode_protocol::host::RequestId;
-use codex_code_mode_protocol::host::TransportLane;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -48,8 +47,7 @@ pub(super) struct ConnectionDriver {
     event_tx: mpsc::Sender<DriverEvent>,
     execute_claim_rx: mpsc::UnboundedReceiver<RequestId>,
     outgoing_tx: mpsc::Sender<EncodedFrame>,
-    bulk_tx: Option<mpsc::Sender<EncodedFrame>>,
-    deferred_outgoing: VecDeque<(EncodedFrame, TransportLane)>,
+    deferred_outgoing: VecDeque<EncodedFrame>,
     delegate_response_permits: Arc<Semaphore>,
     receipt_response_permits: Arc<Semaphore>,
     requests: RequestTracker,
@@ -78,7 +76,6 @@ impl ConnectionDriver {
                 event_tx: event_tx.clone(),
                 execute_claim_rx,
                 outgoing_tx,
-                bulk_tx: None,
                 deferred_outgoing: VecDeque::new(),
                 delegate_response_permits: Arc::new(Semaphore::new(MAX_PENDING_DELEGATE_CALLS)),
                 receipt_response_permits: Arc::new(Semaphore::new(1)),
@@ -162,15 +159,7 @@ impl ConnectionDriver {
     }
 
     async fn run_while_outgoing_is_blocked(&mut self) -> bool {
-        let lane = self
-            .deferred_outgoing
-            .front()
-            .expect("checked non-empty deferred outgoing queue")
-            .1;
-        let sender = match lane {
-            TransportLane::Control => self.outgoing_tx.clone(),
-            TransportLane::Bulk => self.bulk_tx.as_ref().unwrap_or(&self.outgoing_tx).clone(),
-        };
+        let sender = self.outgoing_tx.clone();
         tokio::select! {
             biased;
             _ = self.cancellation.cancelled() => {
@@ -182,11 +171,10 @@ impl ConnectionDriver {
                     self.fail("code-mode host writer closed".to_string());
                     return false;
                 };
-                let (frame, queued_lane) = self
+                let frame = self
                     .deferred_outgoing
                     .pop_front()
                     .expect("reserved capacity for queued outgoing frame");
-                debug_assert_eq!(queued_lane, lane);
                 permit.send(frame);
                 if self.deferred_outgoing.is_empty() {
                     if !self.cancel_dropped_callers() {
@@ -219,25 +207,16 @@ impl ConnectionDriver {
         }
     }
 
-    pub(super) fn with_bulk_sender(mut self, sender: mpsc::Sender<EncodedFrame>) -> Self {
-        self.bulk_tx = Some(sender);
-        self
-    }
-
-    fn queue_frame(&mut self, frame: EncodedFrame, lane: TransportLane) -> bool {
+    fn queue_frame(&mut self, frame: EncodedFrame) -> bool {
         if !self.deferred_outgoing.is_empty() {
             debug_assert!(self.deferred_outgoing.len() < MAX_DEFERRED_OUTGOING_FRAMES);
-            self.deferred_outgoing.push_back((frame, lane));
+            self.deferred_outgoing.push_back(frame);
             return true;
         }
-        let sender = match lane {
-            TransportLane::Control => &self.outgoing_tx,
-            TransportLane::Bulk => self.bulk_tx.as_ref().unwrap_or(&self.outgoing_tx),
-        };
-        match sender.try_send(frame) {
+        match self.outgoing_tx.try_send(frame) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(frame)) => {
-                self.deferred_outgoing.push_back((frame, lane));
+                self.deferred_outgoing.push_back(frame);
                 true
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {

@@ -44,7 +44,10 @@ async fn harness() -> Harness {
     };
     session
         .update_settings(crate::session::SessionSettingsUpdate {
-            collaboration_mode: Some(collaboration_mode),
+            step_settings: crate::session::step_settings::StepSettingsUpdate {
+                collaboration_mode: Some(collaboration_mode),
+                ..Default::default()
+            },
             ..Default::default()
         })
         .await

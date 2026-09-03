@@ -692,6 +692,11 @@ pub(crate) struct ChatWidget {
     #[cfg(test)]
     pet_image_support_override: Option<crate::pets::PetImageSupport>,
     thread_id: Option<ThreadId>,
+    /// Nudge dismissals that should survive draft edits within the current thread scope.
+    ///
+    /// Once dismissed or after Plan mode is entered, the discovery nudge remains hidden for the
+    /// current thread instead of resurfacing for every matching draft.
+    dismissed_plan_mode_nudge_scopes: HashSet<PlanModeNudgeScope>,
     thread_name: Option<String>,
     thread_rename_block_message: Option<String>,
     active_side_conversation: bool,
@@ -861,6 +866,21 @@ enum SessionConfiguredDisplay {
 pub(crate) enum TurnAbortReason {
     Interrupted,
     BudgetLimited,
+}
+
+/// Scope used to keep Plan-mode nudge dismissal local to one conversation context.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum PlanModeNudgeScope {
+    /// Drafts entered before the server has assigned a thread id.
+    NewThread,
+    /// Drafts associated with one configured thread.
+    Thread(ThreadId),
+}
+
+/// Returns whether `text` contains the standalone word `plan`.
+fn contains_plan_keyword(text: &str) -> bool {
+    text.split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+        .any(|word| word.eq_ignore_ascii_case("plan"))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

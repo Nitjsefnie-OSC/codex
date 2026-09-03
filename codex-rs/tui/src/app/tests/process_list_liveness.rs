@@ -309,6 +309,7 @@ enabled = true
     app_server
         .turn_start(
             parent_thread_id,
+            "spawn-parent-message".to_string(),
             vec![codex_app_server_protocol::UserInput::Text {
                 text: SPAWN_PROMPT.to_string(),
                 text_elements: Vec::new(),
@@ -350,6 +351,7 @@ enabled = true
     loop {
         match app_server
             .resume_thread(
+                &app.local_settings,
                 app.config.clone(),
                 child_thread_id,
                 crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
@@ -473,6 +475,7 @@ enabled = true
     app_server
         .turn_start(
             parent_thread_id,
+            "resume-parent-message".to_string(),
             vec![codex_app_server_protocol::UserInput::Text {
                 text: RESUME_PROMPT.to_string(),
                 text_elements: Vec::new(),

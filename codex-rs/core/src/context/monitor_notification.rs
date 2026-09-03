@@ -1,5 +1,6 @@
 use super::ContextualUserFragment;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::ResponseItem;
 use codex_utils_output_truncation::approx_bytes_for_tokens;
 use codex_utils_string::take_bytes_at_char_boundary;
@@ -41,6 +42,10 @@ pub(crate) struct MonitorNotification {
 }
 
 impl ContextualUserFragment for MonitorNotification {
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("exec.monitor_notification".to_string())
+    }
+
     fn role(&self) -> &'static str {
         "developer"
     }

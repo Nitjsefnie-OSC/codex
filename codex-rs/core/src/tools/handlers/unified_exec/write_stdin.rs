@@ -11,6 +11,9 @@ use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::PostToolUsePayload;
 use crate::tools::registry::PreToolUsePayload;
 use crate::tools::registry::ToolExecutor;
+use crate::tools::sandboxing::ToolError;
+use crate::unified_exec::InitialExecCommandOutputDestination;
+use crate::unified_exec::UnifiedExecContext;
 use crate::unified_exec::UnifiedExecError;
 use crate::unified_exec::WriteStdinInteractionEvent;
 use crate::unified_exec::WriteStdinRequest;
@@ -81,24 +84,43 @@ impl WriteStdinHandler {
         };
 
         let args: WriteStdinArgs = parse_arguments(&arguments)?;
+        let context = UnifiedExecContext::new(
+            session.clone(),
+            step_context,
+            cancellation_token,
+            call_id,
+            InitialExecCommandOutputDestination::Untracked,
+        );
         let result = session
             .services
             .unified_exec_manager
-            .write_stdin(WriteStdinRequest {
-                process_id: args.session_id,
-                input: &args.chars,
-                yield_time_ms: args.yield_time_ms,
-                max_output_tokens: args.max_output_tokens,
-                truncation_policy: turn.model_info.truncation_policy.into(),
-                interaction_event: Some(WriteStdinInteractionEvent {
-                    session: &session,
-                    turn: &turn,
-                }),
-            })
+            .write_stdin(
+                &context,
+                WriteStdinRequest {
+                    process_id: args.session_id,
+                    input: &args.chars,
+                    yield_time_ms: args.yield_time_ms,
+                    max_output_tokens: args.max_output_tokens,
+                    truncation_policy: turn.model_info().truncation_policy.into(),
+                    interaction_event: Some(WriteStdinInteractionEvent {
+                        session: &session,
+                        turn: &turn,
+                    }),
+                },
+            )
             .await;
         settle_write_stdin_implicit_skill_activation(&turn, args.session_id, result.as_ref());
         let response = result.map_err(|err| {
-            FunctionCallError::RespondToModel(format!("write_stdin failed: {err}"))
+            let message = match err {
+                UnifiedExecError::StdinApproval(ToolError::Rejected(reason)) => {
+                    format!("write_stdin rejected: {reason}")
+                }
+                UnifiedExecError::StdinApproval(ToolError::Codex(err)) => {
+                    format!("write_stdin approval failed: {err}")
+                }
+                err => format!("write_stdin failed: {err}"),
+            };
+            FunctionCallError::RespondToModel(message)
         })?;
 
         Ok(boxed_tool_output(response))

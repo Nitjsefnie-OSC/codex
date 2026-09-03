@@ -1,5 +1,6 @@
 use super::ContextualUserFragment;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::ResponseItem;
 use codex_utils_string::take_bytes_at_char_boundary;
 
@@ -26,6 +27,10 @@ pub(crate) struct ExecCommandCompletionNotification {
 }
 
 impl ContextualUserFragment for ExecCommandCompletionNotification {
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("exec.exec_command_completion_notification".to_string())
+    }
+
     fn role(&self) -> &'static str {
         "developer"
     }

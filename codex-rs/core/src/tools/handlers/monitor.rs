@@ -108,7 +108,10 @@ impl ToolExecutor<ToolInvocation> for MonitorHandler {
         create_monitor_tool()
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(handle_call(invocation))
     }
 }
@@ -229,7 +232,7 @@ async fn start(
     let attachment = MonitorAttachment {
         kind,
         owner: MonitorOwner {
-            model_slug: turn.model_info.slug.clone(),
+            model_slug: turn.model_info().slug.clone(),
             sub_id: turn.sub_id.clone(),
             call_id,
         },

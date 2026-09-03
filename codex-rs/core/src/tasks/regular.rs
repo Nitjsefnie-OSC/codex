@@ -85,6 +85,11 @@ impl SessionTask for RegularTask {
                 cancellation_token.child_token(),
             );
             let last_agent_message = run_turn_future.instrument(run_turn_span.clone()).await?;
+            // Terminal errors are already reported. Let task completion preserve pending
+            // input instead of restarting the failed turn for that same input.
+            if ctx.terminal_error.lock().await.is_some() {
+                return Ok(last_agent_message);
+            }
             if !sess.input_queue.has_pending_input(&sess.active_turn).await {
                 return Ok(last_agent_message);
             }

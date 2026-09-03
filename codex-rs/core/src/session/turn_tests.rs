@@ -181,16 +181,16 @@ async fn model_stream_future_boundary_is_pointer_sized() {
     );
     let inference_trace = sess.services.rollout_thread_trace.inference_trace_context(
         turn_context.sub_id.as_str(),
-        turn_context.model_info.slug.as_str(),
+        turn_context.model_info().slug.as_str(),
         turn_context.provider.info().name.as_str(),
     );
 
     let future = client_session.stream(
         &prompt,
-        &turn_context.model_info,
+        turn_context.model_info(),
         &turn_context.session_telemetry,
-        turn_context.reasoning_effort.clone(),
-        turn_context.reasoning_summary,
+        turn_context.reasoning_effort().cloned(),
+        turn_context.reasoning_summary(),
         turn_context.config.service_tier.clone(),
         &responses_metadata,
         &inference_trace,

@@ -72,7 +72,7 @@ impl Session {
                         self.record_inter_agent_communication(turn_context.as_ref(), communication)
                             .await;
                     }
-                    TurnInput::UserInput { .. } => {
+                    TurnInput::UserInput { .. } | TurnInput::FunctionCallOutput(_) => {
                         unreachable!("foreground input cannot enter background persistence")
                     }
                 }
@@ -150,7 +150,7 @@ impl Session {
                 input
                     .into_iter()
                     .map(ResponseItemEnvelope::new)
-                    .map(PendingTurnInput::ResponseItem)
+                    .map(TurnInput::ResponseItem)
                     .collect(),
             )
             .await;
@@ -357,7 +357,10 @@ impl Session {
             BackgroundTurnContext::Existing(turn_context) => turn_context,
             BackgroundTurnContext::Default => {
                 owned_turn_context = self
-                    .new_default_turn_with_sub_id(uuid::Uuid::new_v4().to_string())
+                    .new_turn_with_default_settings(
+                        uuid::Uuid::new_v4().to_string(),
+                        Default::default(),
+                    )
                     .await;
                 owned_turn_context.as_ref()
             }
@@ -373,7 +376,7 @@ impl Session {
                     self.record_inter_agent_communication(fallback_turn_context, communication)
                         .await;
                 }
-                TurnInput::UserInput { .. } => {
+                TurnInput::UserInput { .. } | TurnInput::FunctionCallOutput(_) => {
                     unreachable!("only mailbox and background input reach durable delivery")
                 }
             }

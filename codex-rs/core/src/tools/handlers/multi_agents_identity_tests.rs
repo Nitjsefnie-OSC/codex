@@ -1,6 +1,6 @@
 use super::*;
 use crate::session::tests::make_session_and_context_with_rx;
-use codex_protocol::protocol::MultiAgentVersion;
+use crate::session::tests::set_turn_reasoning_effort_for_test;
 
 async fn install_uncatalogued_model_only_role(turn: &mut TurnContext) -> String {
     let role_name = "uncatalogued-model-only-role".to_string();
@@ -149,7 +149,7 @@ async fn spawn_agent_role_overrides_invalid_configured_identity_defaults() {
 #[tokio::test]
 async fn spawn_agent_role_model_uses_selected_model_default_effort() {
     let (mut session, mut turn) = make_session_and_context().await;
-    turn.reasoning_effort = Some(ReasoningEffort::High);
+    set_turn_reasoning_effort_for_test(&mut turn, Some(ReasoningEffort::High));
     let role_name = "model-only-role".to_string();
     let role_path = turn
         .config
@@ -207,7 +207,7 @@ async fn spawn_agent_role_model_uses_selected_model_default_effort() {
 #[tokio::test]
 async fn spawn_agent_uncatalogued_role_model_preserves_parent_effort() {
     let (mut session, mut turn) = make_session_and_context().await;
-    turn.reasoning_effort = Some(ReasoningEffort::High);
+    set_turn_reasoning_effort_for_test(&mut turn, Some(ReasoningEffort::High));
     let role_name = install_uncatalogued_model_only_role(&mut turn).await;
     let manager = thread_manager();
     session.services.agent_control = manager.agent_control();
@@ -247,7 +247,7 @@ async fn spawn_agent_uncatalogued_role_model_preserves_parent_effort() {
 #[tokio::test]
 async fn multi_agent_v2_role_model_uses_selected_model_default_effort() {
     let (mut session, mut turn) = make_session_and_context().await;
-    turn.reasoning_effort = Some(ReasoningEffort::High);
+    set_turn_reasoning_effort_for_test(&mut turn, Some(ReasoningEffort::High));
     let role_name = "v2-model-only-role".to_string();
     let role_path = turn
         .config
@@ -318,7 +318,7 @@ async fn multi_agent_v2_role_model_uses_selected_model_default_effort() {
 #[tokio::test]
 async fn multi_agent_v2_uncatalogued_role_model_preserves_parent_effort() {
     let (mut session, mut turn) = make_session_and_context().await;
-    turn.reasoning_effort = Some(ReasoningEffort::High);
+    set_turn_reasoning_effort_for_test(&mut turn, Some(ReasoningEffort::High));
     let role_name = install_uncatalogued_model_only_role(&mut turn).await;
     let mut config = (*turn.config).clone();
     config
@@ -421,11 +421,7 @@ async fn spawn_v2_agent_with_role_identity_and_configured_defaults(
         .features
         .enable(Feature::MultiAgentV2)
         .expect("test config should allow feature update");
-    let turn = TurnContext {
-        config: Arc::new(config),
-        multi_agent_version: MultiAgentVersion::V2,
-        ..turn
-    };
+    set_turn_config(&mut turn, config);
     let mut args = json!({
         "message": "inspect this repo",
         "task_name": "explicit_identity",
@@ -644,10 +640,10 @@ async fn spawn_agent_full_history_inherits_parent_identity() {
     config.agent_default_subagent_reasoning_effort = Some(ReasoningEffort::Low);
     set_turn_config(&mut turn, config);
     let expected_identity = (
-        turn.model_info.slug.clone(),
-        turn.reasoning_effort
-            .clone()
-            .or_else(|| turn.model_info.default_reasoning_level.clone()),
+        turn.model_info().slug.clone(),
+        turn.reasoning_effort()
+            .cloned()
+            .or_else(|| turn.model_info().default_reasoning_level.clone()),
     );
     let manager = thread_manager();
     let root = manager
@@ -689,10 +685,10 @@ async fn spawn_agent_full_history_inherits_parent_role_metadata() {
     let role_name = install_role_with_model_override(&mut turn).await;
     turn.developer_instructions = Some("parent role instructions".to_string());
     let expected_identity = (
-        turn.model_info.slug.clone(),
-        turn.reasoning_effort
-            .clone()
-            .or_else(|| turn.model_info.default_reasoning_level.clone()),
+        turn.model_info().slug.clone(),
+        turn.reasoning_effort()
+            .cloned()
+            .or_else(|| turn.model_info().default_reasoning_level.clone()),
     );
     let manager = thread_manager();
     let root = manager
@@ -833,10 +829,10 @@ async fn multi_agent_v2_full_history_inherits_parent_role_metadata() {
     );
     set_turn_config(&mut turn, config.clone());
     let expected_parent_identity = (
-        turn.model_info.slug.clone(),
-        turn.reasoning_effort
-            .clone()
-            .or_else(|| turn.model_info.default_reasoning_level.clone()),
+        turn.model_info().slug.clone(),
+        turn.reasoning_effort()
+            .cloned()
+            .or_else(|| turn.model_info().default_reasoning_level.clone()),
     );
     let state_db = init_state_db(&config)
         .await
@@ -934,7 +930,7 @@ async fn multi_agent_v2_full_history_inherits_parent_role_metadata() {
     sender_config.model = Some("gpt-5.6-luna".to_string());
     sender_config.model_reasoning_effort = Some(ReasoningEffort::Minimal);
     agent_control
-        .ensure_v2_agent_loaded(sender_config, child_id)
+        .ensure_v2_agent_loaded(sender_config, child_id, /*parent*/ None)
         .await
         .expect("full-history child should reload");
     let reloaded_child = manager
@@ -1031,10 +1027,10 @@ async fn multi_agent_v2_full_history_inherits_parent_identity() {
     config.agent_default_subagent_reasoning_effort = Some(ReasoningEffort::Low);
     set_turn_config(&mut turn, config);
     let expected_identity = (
-        turn.model_info.slug.clone(),
-        turn.reasoning_effort
-            .clone()
-            .or_else(|| turn.model_info.default_reasoning_level.clone()),
+        turn.model_info().slug.clone(),
+        turn.reasoning_effort()
+            .cloned()
+            .or_else(|| turn.model_info().default_reasoning_level.clone()),
     );
     let manager = thread_manager();
     let root = manager

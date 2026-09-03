@@ -7,6 +7,7 @@ use crate::session::SessionIo;
 use crate::session::SessionSettingsUpdate;
 use crate::session::new_submission_id;
 use crate::session::session::Session;
+use crate::session::step_settings::StepSettingsUpdate;
 use crate::unified_exec::MonitorAcknowledgement;
 use crate::unified_exec::MonitorInfo;
 use crate::unified_exec::MonitorOutput;

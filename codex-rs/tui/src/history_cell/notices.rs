@@ -2,6 +2,9 @@
 
 use super::*;
 
+#[cfg_attr(not(test), allow(dead_code))]
+const RECAP_HEADING: &str = "Conversation recap";
+
 /// This fork's repository, not upstream's. A user following an "installation
 /// options" link to openai/codex installs a build without this one's
 /// capabilities.

@@ -364,6 +364,7 @@ impl ChatWidget {
         if self.suppressed_exec_calls.remove(&id) {
             return;
         }
+        let was_running = running.is_some();
         let (command, parsed, source) = match running {
             Some(rc) => (rc.command, rc.parsed_cmd, rc.source),
             None => (event_command, event_parsed, source),

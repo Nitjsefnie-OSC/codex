@@ -119,6 +119,7 @@ async fn tool_result_delivery_uses_its_dedicated_delegate_lane() {
         RequestId::new(/*value*/ 1),
         StartedCell::new(cell_id.clone(), response_rx),
         active_cell_permit,
+        Instant::now(),
     );
     let ordinary_permits = Arc::clone(&peer.delegate_permits)
         .acquire_many_owned(MAX_PENDING_DELEGATE_CALLS as u32)
@@ -257,6 +258,7 @@ async fn ordinary_delegate_backpressure_cannot_disconnect_before_delivery_receip
         RequestId::new(/*value*/ 1),
         StartedCell::new(cell_id.clone(), response_rx),
         active_cell_permit,
+        Instant::now(),
     );
 
     let mut ordinary = Vec::new();

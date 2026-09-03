@@ -85,6 +85,7 @@ impl PendingInput {
                 SubagentNotification::is_response_item(&item.item)
             }
             Self::Turn(TurnInput::UserInput { .. })
+            | Self::Turn(TurnInput::FunctionCallOutput(_))
             | Self::Turn(TurnInput::InterAgentCommunication(_))
             | Self::MonitorNotification(_) => false,
         }
@@ -98,6 +99,7 @@ impl PendingInput {
             Self::MonitorNotification(_) => false,
             Self::Turn(
                 TurnInput::UserInput { .. }
+                | TurnInput::FunctionCallOutput(_)
                 | TurnInput::ResponseItem(_)
                 | TurnInput::AgentCompletion(_),
             ) => true,
@@ -226,6 +228,7 @@ struct PendingMailboxCommunication {
 pub(crate) struct DrainedMailboxInputs {
     pub(crate) items: Vec<TurnInput>,
     pub(crate) provenance: PendingTurnProvenance,
+    pub(crate) start_options: TurnStartOptions,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -475,9 +478,9 @@ impl InputQueue {
             TurnInput::ResponseItem(item) if SubagentNotification::is_response_item(&item.item) => {
                 Some(InputQueueActivity::Mailbox)
             }
-            TurnInput::UserInput { .. } | TurnInput::InterAgentCommunication(_) => {
-                Some(InputQueueActivity::Steer)
-            }
+            TurnInput::UserInput { .. }
+            | TurnInput::FunctionCallOutput(_)
+            | TurnInput::InterAgentCommunication(_) => Some(InputQueueActivity::Steer),
             TurnInput::ResponseItem(_) => None,
         }
     }
@@ -533,11 +536,13 @@ impl InputQueue {
         &self,
         active_turn: &Mutex<Option<ActiveTurn>>,
         communication: InterAgentCommunication,
-        parent_turn_id: Option<String>,
-        root_turn_id: Option<String>,
+        start_options: TurnStartOptions,
     ) {
         let provenance = if communication.trigger_turn {
-            PendingTurnProvenance::from_trigger(parent_turn_id.as_deref(), root_turn_id.as_deref())
+            PendingTurnProvenance::from_trigger(
+                start_options.parent_turn_id.as_deref(),
+                start_options.root_turn_id.as_deref(),
+            )
         } else {
             PendingTurnProvenance::default()
         };
@@ -558,15 +563,18 @@ impl InputQueue {
                 else {
                     unreachable!("mailbox injection preserves the communication variant")
                 };
-                let parent_turn_id = match provenance.parent_turn {
+                let parent_turn_id = match &provenance.parent_turn {
                     PendingParentTurn::Unique(parent_turn_id) => Some(parent_turn_id),
                     PendingParentTurn::Empty | PendingParentTurn::Conflict => None,
                 };
-                let root_turn_id = match provenance.root_turn {
+                let root_turn_id = match &provenance.root_turn {
                     PendingParentTurn::Unique(root_turn_id) => Some(root_turn_id),
                     PendingParentTurn::Empty | PendingParentTurn::Conflict => None,
                 };
-                self.enqueue_mailbox_communication(communication, parent_turn_id, root_turn_id)
+                let mut start_options = start_options;
+                start_options.parent_turn_id = parent_turn_id.cloned();
+                start_options.root_turn_id = root_turn_id.cloned();
+                self.enqueue_mailbox_communication(communication, start_options)
                     .await;
             }
         }
@@ -608,15 +616,9 @@ impl InputQueue {
     }
 
     #[cfg(test)]
-    pub(crate) async fn drain_mailbox_input_items(
-        &self,
-    ) -> (Vec<TurnInput>, Option<String>, Option<String>) {
+    pub(crate) async fn drain_mailbox_input_items(&self) -> (Vec<TurnInput>, TurnStartOptions) {
         let drained = self.drain_mailbox_inputs().await;
-        (
-            drained.items,
-            drained.provenance.parent_turn.into_option(),
-            drained.provenance.root_turn.into_option(),
-        )
+        (drained.items, drained.start_options)
     }
 
     pub(crate) async fn drain_mailbox_inputs(&self) -> DrainedMailboxInputs {
@@ -632,15 +634,44 @@ impl InputQueue {
             .filter(|mail| mail.communication.trigger_turn)
         {
             provenance.merge_state(PendingTurnProvenance::from_trigger(
-                mail.parent_turn_id.as_deref(),
-                mail.root_turn_id.as_deref(),
+                mail.start_options.parent_turn_id.as_deref(),
+                mail.start_options.root_turn_id.as_deref(),
             ));
         }
+        // A later follow-up supersedes the earlier choice, including an omitted choice.
+        let mut start_options = pending_mails
+            .iter()
+            .rev()
+            .find(|mail| mail.communication.trigger_turn)
+            .map(|mail| mail.start_options.clone())
+            .unwrap_or_default();
+        start_options.parent_turn_id = pending_mails
+            .iter()
+            .filter(|mail| mail.communication.trigger_turn)
+            .map(|mail| mail.start_options.parent_turn_id.as_deref())
+            .reduce(|expected, candidate| expected.filter(|id| candidate == Some(*id)))
+            .and_then(|id| id.filter(|id| !id.trim().is_empty()).map(str::to_string));
+        start_options.root_turn_id = pending_mails
+            .iter()
+            .find(|mail| mail.communication.trigger_turn)
+            .and_then(|mail| {
+                mail.start_options
+                    .parent_turn_id
+                    .as_deref()
+                    .filter(|id| !id.trim().is_empty())
+                    .and(mail.start_options.root_turn_id.as_deref())
+                    .filter(|id| !id.trim().is_empty())
+            })
+            .map(str::to_string);
         let items = pending_mails
             .into_iter()
             .map(|mail| TurnInput::InterAgentCommunication(mail.communication))
             .collect();
-        DrainedMailboxInputs { items, provenance }
+        DrainedMailboxInputs {
+            items,
+            provenance,
+            start_options,
+        }
     }
 
     pub(crate) async fn ordered_background_inputs(
@@ -982,7 +1013,7 @@ impl InputQueue {
         match input {
             TurnInput::InterAgentCommunication(_) | TurnInput::AgentCompletion(_) => true,
             TurnInput::ResponseItem(item) => is_background_notification(&item.item),
-            TurnInput::UserInput { .. } => false,
+            TurnInput::UserInput { .. } | TurnInput::FunctionCallOutput(_) => false,
         }
     }
 
@@ -1614,8 +1645,10 @@ mod tests {
         input_queue
             .enqueue_mailbox_communication(
                 mail.clone(),
-                Some("parent-turn".to_string()),
-                /*root_turn_id*/ None,
+                TurnStartOptions {
+                    parent_turn_id: Some("parent-turn".to_string()),
+                    ..Default::default()
+                },
             )
             .await;
 

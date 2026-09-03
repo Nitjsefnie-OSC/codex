@@ -110,6 +110,9 @@ pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec {
     if !options.expose_agent_type {
         properties.remove("agent_type");
     }
+    if options.hide_agent_type_model_reasoning {
+        properties.remove("service_tier");
+    }
     if !options.expose_spawn_agent_model_overrides {
         properties.remove("model");
         properties.remove("reasoning_effort");
@@ -615,6 +618,12 @@ fn spawn_agent_common_properties_v1(agent_type_description: &str) -> BTreeMap<St
                 SPAWN_AGENT_REASONING_EFFORT_OVERRIDE_DESCRIPTION.to_string(),
             )),
         ),
+        (
+            "service_tier".to_string(),
+            JsonSchema::string(Some(
+                SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION.to_string(),
+            )),
+        ),
     ])
 }
 
@@ -652,6 +661,12 @@ fn spawn_agent_common_properties_v2(agent_type_description: &str) -> BTreeMap<St
                 SPAWN_AGENT_REASONING_EFFORT_OVERRIDE_DESCRIPTION.to_string(),
             )),
         ),
+        (
+            "service_tier".to_string(),
+            JsonSchema::string(Some(
+                SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION.to_string(),
+            )),
+        ),
     ])
 }
 
@@ -659,6 +674,7 @@ fn hide_spawn_agent_metadata_options(properties: &mut BTreeMap<String, JsonSchem
     properties.remove("agent_type");
     properties.remove("model");
     properties.remove("reasoning_effort");
+    properties.remove("service_tier");
 }
 
 fn spawn_agent_tool_description(

@@ -56,6 +56,7 @@ mod errors;
 mod head_tail_buffer;
 mod monitor_watcher;
 mod monitors;
+mod oneshot;
 mod process;
 mod process_manager;
 mod process_state;

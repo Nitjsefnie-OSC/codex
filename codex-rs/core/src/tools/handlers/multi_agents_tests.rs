@@ -449,15 +449,14 @@ async fn spawn_agent_service_tier_inheritance_uses_root_preference_and_child_mod
 
     {
         let (mut session, turn) = make_session_and_context().await;
-        let mut turn = turn
+        let turn = turn
             .with_model("gpt-5.4".to_string(), &session.services.models_manager)
             .await;
-        let mut config = (*turn.config).clone();
-        config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
-        turn.config = Arc::new(config);
+        let mut root_config = (*turn.config).clone();
+        root_config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
         let manager = thread_manager();
         let root = manager
-            .start_thread(StartThreadOptions::new((*turn.config).clone()))
+            .start_thread(StartThreadOptions::new(root_config))
             .await
             .expect("root thread should start");
         session.services.agent_control = root.thread.session.services.agent_control.clone();
@@ -673,15 +672,14 @@ async fn spawn_agent_full_history_fork_inherits_root_service_tier() {
     }
 
     let (mut session, turn) = make_session_and_context().await;
-    let mut turn = turn
+    let turn = turn
         .with_model("gpt-5.4".to_string(), &session.services.models_manager)
         .await;
-    let mut config = (*turn.config).clone();
-    config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
-    turn.config = Arc::new(config);
+    let mut root_config = (*turn.config).clone();
+    root_config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
     let manager = thread_manager();
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new(root_config))
         .await
         .expect("root thread should start");
     session.services.agent_control = root.thread.session.services.agent_control.clone();
@@ -726,16 +724,17 @@ async fn multi_agent_v2_full_history_fork_inherits_root_service_tier() {
     let mut turn = turn
         .with_model("gpt-5.4".to_string(), &session.services.models_manager)
         .await;
-    let mut config = (*turn.config).clone();
-    config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
-    config
+    let mut turn_config = (*turn.config).clone();
+    turn_config
         .features
         .enable(Feature::MultiAgentV2)
         .expect("test config should allow feature update");
-    set_turn_config(&mut turn, config);
+    set_turn_config(&mut turn, turn_config);
+    let mut root_config = (*turn.config).clone();
+    root_config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
     let manager = thread_manager();
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new(root_config))
         .await
         .expect("root thread should start");
     session.services.agent_control = root.thread.session.services.agent_control.clone();
@@ -1836,7 +1835,10 @@ fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn_body()
             *id == agent_id
                 && matches!(
                     op,
-                    Op::InterAgentCommunication { communication }
+                    Op::InterAgentCommunication {
+                        communication,
+                        start_options: _,
+                    }
                         if communication.author == AgentPath::root()
                             && communication.recipient == worker_path
                             && communication.encrypted_content.as_deref() == Some("continue")
@@ -2046,7 +2048,10 @@ async fn multi_agent_v2_interrupted_turn_does_not_notify_parent() {
             (id == root.thread_id)
                 .then_some(op)
                 .and_then(|op| match op {
-                    Op::InterAgentCommunication { communication }
+                    Op::InterAgentCommunication {
+                        communication,
+                        start_options: _,
+                    }
                     | Op::InterAgentCompletion { communication }
                         if communication.author.as_str() == "/root/worker"
                             && communication.recipient == AgentPath::root()

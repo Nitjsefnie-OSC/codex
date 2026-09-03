@@ -410,7 +410,10 @@ fn submit_nested_tool(
     tool_runtime: ToolCallRuntime,
     invocation: CodeModeNestedToolCall,
     cancellation_token: CancellationToken,
-) -> Result<NestedToolCallResult, FunctionCallError> {
+) -> Result<
+    impl std::future::Future<Output = Result<NestedToolCallResult, FunctionCallError>> + Send + 'static,
+    FunctionCallError,
+> {
     let CodeModeNestedToolCall {
         cell_id,
         runtime_tool_call_id,
@@ -447,54 +450,54 @@ fn submit_nested_tool(
             call_id: call.call_id.clone(),
             cell_id: cell_id.to_string(),
         });
-    let result = tool_runtime
-        .handle_tool_call_with_source(
-            call,
-            ToolCallSource::CodeMode {
-                cell_id: cell_id.to_string(),
-                runtime_tool_call_id,
-            },
-            cancellation_token,
-        )
-        .await;
-    let result = match result {
-        Ok(result) => result,
-        Err(error) => {
-            if acknowledges_yielded_exec {
-                exec.session
-                    .services
-                    .unified_exec_manager
-                    .discard_code_mode_initial_exec_outputs(&nested_call_id)
-                    .await;
+    let result = tool_runtime.handle_tool_call_with_source(
+        call,
+        ToolCallSource::CodeMode {
+            cell_id: cell_id.to_string(),
+            runtime_tool_call_id,
+        },
+        cancellation_token,
+    );
+    Ok(async move {
+        let result = match result.await {
+            Ok(result) => result,
+            Err(error) => {
+                if acknowledges_yielded_exec {
+                    exec.session
+                        .services
+                        .unified_exec_manager
+                        .discard_code_mode_initial_exec_outputs(&nested_call_id)
+                        .await;
+                }
+                return Err(error);
             }
-            return Err(error);
+        };
+        let result = result.code_mode_result();
+        let yielded_exec = if acknowledges_yielded_exec {
+            result
+                .get("session_id")
+                .and_then(JsonValue::as_i64)
+                .and_then(|session_id| i32::try_from(session_id).ok())
+                .map(|process_id| YieldedExecDelivery {
+                    session: Arc::clone(&exec.session),
+                    call_id: nested_call_id.clone(),
+                    process_id,
+                })
+        } else {
+            None
+        };
+        if acknowledges_yielded_exec && yielded_exec.is_none() {
+            exec.session
+                .services
+                .unified_exec_manager
+                .discard_code_mode_initial_exec_outputs(&nested_call_id)
+                .await;
         }
-    };
-    let result = result.code_mode_result();
-    let yielded_exec = if acknowledges_yielded_exec {
-        result
-            .get("session_id")
-            .and_then(JsonValue::as_i64)
-            .and_then(|session_id| i32::try_from(session_id).ok())
-            .map(|process_id| YieldedExecDelivery {
-                session: Arc::clone(&exec.session),
-                call_id: nested_call_id.clone(),
-                process_id,
-            })
-    } else {
-        None
-    };
-    if acknowledges_yielded_exec && yielded_exec.is_none() {
-        exec.session
-            .services
-            .unified_exec_manager
-            .discard_code_mode_initial_exec_outputs(&nested_call_id)
-            .await;
-    }
-    Ok(NestedToolCallResult {
-        value: result,
-        yielded_exec,
-        delivery_receipt: None,
+        Ok(NestedToolCallResult {
+            value: result,
+            yielded_exec,
+            delivery_receipt: None,
+        })
     })
 }
 

@@ -439,7 +439,7 @@ impl TurnContext {
     /// sends as `Max`; callers reporting request metadata must use this value
     /// rather than the unnormalized turn setting.
     pub(crate) fn request_reasoning_effort(&self) -> Option<ReasoningEffortConfig> {
-        crate::client::request_reasoning_effort(&self.model_info, self.reasoning_effort.clone())
+        crate::client::request_reasoning_effort(self.model_info(), self.reasoning_effort().cloned())
     }
 
     pub(crate) fn effective_reasoning_effort_for_tracing(&self) -> String {
@@ -890,17 +890,18 @@ impl Session {
         Ok(Some((turn_context, commit.snapshot)))
     }
 
+    /// Constructs a turn from the exact committed settings without starting a task.
     fn new_turn_from_configuration(
         &self,
         sub_id: String,
         session_configuration: SessionConfiguration,
-        final_output_json_schema: Option<Option<Value>>,
+        options: NewTurnContextOptions,
     ) -> BoxFuture<'_, Arc<TurnContext>> {
         Box::pin(async move {
             self.new_turn_context_from_configuration(
                 sub_id,
                 session_configuration,
-                final_output_json_schema,
+                options,
                 TurnMultiAgentRuntime::ResolveAndStore,
                 self.git_enrichment_policy,
             )

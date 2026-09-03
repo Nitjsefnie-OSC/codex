@@ -300,6 +300,7 @@ impl ExecCommandHandler {
                 )));
             }
         }
+        let process_id = manager.allocate_process_id().await;
         let resolved_command = get_command(
             &args,
             shell,
@@ -364,7 +365,7 @@ impl ExecCommandHandler {
             && !effective_additional_permissions.permissions_preapproved
             && prompt_is_rejected_by_policy(approval_policy, /*prompt_is_rule*/ false).is_some()
         {
-            let approval_policy = context.step_context.turn.approval_policy();
+            manager.release_process_id(process_id).await;
             return Err(FunctionCallError::RespondToModel(format!(
                 "approval policy is {approval_policy:?}; reject command — you cannot ask for escalated permissions if the approval policy is {approval_policy:?}"
             )));
@@ -389,7 +390,10 @@ impl ExecCommandHandler {
             |permissions| Ok(Some(permissions)),
         ) {
             Ok(normalized) => normalized,
-            Err(err) => return Err(FunctionCallError::RespondToModel(err)),
+            Err(err) => {
+                manager.release_process_id(process_id).await;
+                return Err(FunctionCallError::RespondToModel(err));
+            }
         };
 
         let intercepted_patch = intercept_apply_patch(
@@ -405,7 +409,13 @@ impl ExecCommandHandler {
             "exec_command",
         )
         .await;
+        // Keep the reservation when interception returns `Ok(None)`: the normal command below
+        // still needs this process ID.
+        if intercepted_patch.is_err() {
+            manager.release_process_id(process_id).await;
+        }
         if let Some(output) = intercepted_patch? {
+            manager.release_process_id(process_id).await;
             return Ok(boxed_tool_output(ExecCommandToolOutput {
                 event_call_id: String::new(),
                 chunk_id: String::new(),
@@ -421,33 +431,34 @@ impl ExecCommandHandler {
             }));
         }
 
-        let process_id = manager.allocate_process_id().await;
         emit_unified_exec_tty_metric(&turn.session_telemetry, tty);
-        let result = manager
-            .exec_command(
-                ExecCommandRequest {
-                    command,
-                    shell_type,
-                    hook_command: hook_command.clone(),
-                    process_id,
-                    yield_time_ms,
-                    max_output_tokens,
-                    cwd,
-                    sandbox_cwd: native_environment_cwd,
-                    turn_environment: turn_environment.clone(),
-                    shell_mode,
-                    network: context.step_context.turn.network.clone(),
-                    tty,
-                    sandbox_permissions: effective_additional_permissions.sandbox_permissions,
-                    additional_permissions: normalized_additional_permissions,
-                    additional_permissions_preapproved: effective_additional_permissions
-                        .permissions_preapproved,
-                    justification,
-                    prefix_rule,
-                },
-                &context,
-            )
-            .await;
+        let request = ExecCommandRequest {
+            command,
+            shell_type,
+            hook_command: hook_command.clone(),
+            process_id,
+            yield_time_ms,
+            max_output_tokens,
+            cwd,
+            sandbox_cwd: native_environment_cwd,
+            turn_environment: turn_environment.clone(),
+            shell_mode,
+            network: context.step_context.turn.network.clone(),
+            tty,
+            sandbox_permissions: effective_additional_permissions.sandbox_permissions,
+            additional_permissions: normalized_additional_permissions,
+            additional_permissions_preapproved: effective_additional_permissions
+                .permissions_preapproved,
+            justification,
+            prefix_rule,
+        };
+        let result = match completion_timeout {
+            Some(timeout) => {
+                UnifiedExecProcessManager::exec_command_to_completion(request, &context, timeout)
+                    .await
+            }
+            None => manager.exec_command(request, &context).await,
+        };
         settle_unified_exec_implicit_skill_activation(
             context.step_context.turn.as_ref(),
             implicit_skill_activation,
@@ -489,6 +500,35 @@ impl ExecCommandHandler {
             }
         }
     }
+}
+
+fn one_shot_exec_command_spec(spec: ToolSpec) -> ToolSpec {
+    let ToolSpec::Function(mut spec) = spec else {
+        unreachable!("exec_command has a function schema");
+    };
+    spec.description = spec.description.replacen(
+        "Runs a command in a PTY, returning output or a session ID for ongoing interaction.",
+        "Runs a command to completion and returns its output. The process is terminated on timeout or cancellation and cannot be resumed.",
+        1,
+    );
+    let properties = spec.parameters.properties.get_or_insert_default();
+    properties.remove("tty");
+    properties.remove("yield_time_ms");
+    properties.insert(
+        "timeout_ms".to_string(),
+        JsonSchema::number(Some(
+            "Maximum command runtime. Defaults to 10000 ms.".to_string(),
+        )),
+    );
+    if let Some(output_properties) = spec
+        .output_schema
+        .as_mut()
+        .and_then(|schema| schema.get_mut("properties"))
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        output_properties.remove("session_id");
+    }
+    ToolSpec::Function(spec)
 }
 
 fn settle_unified_exec_implicit_skill_activation(

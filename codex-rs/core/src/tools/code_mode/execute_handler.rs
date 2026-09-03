@@ -135,6 +135,9 @@ impl CodeModeExecuteHandler {
                 });
         }
         exec.session.services.elicitations.wait_until_clear().await;
+        if let Some(code_mode_host_duration) = response.code_mode_host_duration() {
+            telemetry.record_code_mode_host_duration(code_mode_host_duration);
+        }
         let wall_time = response
             .code_mode_host_duration()
             .unwrap_or_else(|| started_at.elapsed());

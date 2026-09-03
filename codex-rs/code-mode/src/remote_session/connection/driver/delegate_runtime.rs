@@ -354,7 +354,6 @@ impl ConnectionDriver {
                 }
             }
         };
-        let lane = message.transport_lane();
         let is_delivery_receipt = matches!(
             message,
             ClientToHost::DelegateResponse {
@@ -364,15 +363,10 @@ impl ConnectionDriver {
                 ..
             }
         );
-        self.queue_delegate_response(frame, lane, is_delivery_receipt)
+        self.queue_delegate_response(frame, is_delivery_receipt)
     }
 
-    fn queue_delegate_response(
-        &mut self,
-        frame: EncodedFrame,
-        lane: codex_code_mode_protocol::host::TransportLane,
-        is_delivery_receipt: bool,
-    ) -> bool {
+    fn queue_delegate_response(&mut self, frame: EncodedFrame, is_delivery_receipt: bool) -> bool {
         let permits = if is_delivery_receipt {
             &self.receipt_response_permits
         } else {
@@ -382,12 +376,7 @@ impl ConnectionDriver {
             self.fail("code-mode client has too many queued delegate responses".to_string());
             return false;
         };
-        let outgoing_tx = match lane {
-            codex_code_mode_protocol::host::TransportLane::Control => self.outgoing_tx.clone(),
-            codex_code_mode_protocol::host::TransportLane::Bulk => {
-                self.bulk_tx.as_ref().unwrap_or(&self.outgoing_tx).clone()
-            }
-        };
+        let outgoing_tx = self.outgoing_tx.clone();
         let event_tx = self.event_tx.clone();
         let cancellation = self.cancellation.clone();
         tokio::spawn(async move {

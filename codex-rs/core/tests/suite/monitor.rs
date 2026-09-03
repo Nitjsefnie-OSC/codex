@@ -228,6 +228,7 @@ async fn monitor_output_waits_behind_standalone_shell_and_wakes_once() -> Result
     test.codex
         .submit(Op::RunUserShellCommand {
             command: "touch .codex-monitor-shell-started; sleep 2".to_string(),
+            timeout_ms: None,
         })
         .await?;
     wait_for_event(&test.codex, |event| {

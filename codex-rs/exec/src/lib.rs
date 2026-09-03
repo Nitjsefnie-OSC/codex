@@ -1338,7 +1338,7 @@ fn thread_start_params_from_config(
         config: new_thread_config_overrides_from_config(config),
         ephemeral: Some(config.ephemeral),
         history_mode: (!config.ephemeral).then_some(ThreadHistoryMode::Paginated),
-        thread_source: Some(ThreadSource::User),
+        thread_source: Some(thread_source.clone()),
         base_instructions: config.base_instructions.clone(),
         developer_instructions: config.developer_instructions.clone(),
         ..ThreadStartParams::default()

@@ -160,7 +160,7 @@ impl Drop for InitialExecOutputPersistenceDecision {
     }
 }
 
-fn apply_unified_exec_env(mut env: HashMap<String, String>) -> HashMap<String, String> {
+pub(super) fn apply_unified_exec_env(mut env: HashMap<String, String>) -> HashMap<String, String> {
     for (key, value) in UNIFIED_EXEC_ENV {
         env.insert(key.to_string(), value.to_string());
     }
@@ -664,8 +664,10 @@ impl UnifiedExecProcessManager {
         request: ExecCommandRequest,
         context: &UnifiedExecContext,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
-        self.exec_command_inner(request, context, /*monitor*/ None)
-            .await
+        self.exec_command_inner(
+            request, context, /*completion*/ None, /*monitor*/ None,
+        )
+        .await
     }
 
     /// Start a monitored process.
@@ -682,14 +684,15 @@ impl UnifiedExecProcessManager {
         context: &UnifiedExecContext,
         attachment: MonitorAttachment,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
-        self.exec_command_inner(request, context, Some(attachment))
+        self.exec_command_inner(request, context, /*completion*/ None, Some(attachment))
             .await
     }
 
-    async fn exec_command_inner(
+    pub(super) async fn exec_command_inner(
         &self,
         request: ExecCommandRequest,
         context: &UnifiedExecContext,
+        mut completion: Option<&mut Completion<'_>>,
         monitor: Option<MonitorAttachment>,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
         let mut reservation_guard = UnboundProcessReservationGuard {
@@ -712,6 +715,9 @@ impl UnifiedExecProcessManager {
             permissions,
         } = attempt;
         let process = Arc::new(process);
+        if let Some(completion) = completion.as_ref() {
+            let _ = completion.process.set(Arc::clone(&process));
+        }
         let mut process_setup_guard = ProcessSetupGuard {
             process: Arc::clone(&process),
             process_store: Arc::clone(&self.process_store),
@@ -811,6 +817,8 @@ impl UnifiedExecProcessManager {
                     &request.command,
                     request.hook_command.clone(),
                     cwd.clone(),
+                    request.turn_environment.selection.environment_id.clone(),
+                    permissions,
                     source,
                     plugin_attribution.clone(),
                     start,
@@ -1417,6 +1425,8 @@ impl UnifiedExecProcessManager {
         command: &[String],
         hook_command: String,
         cwd: PathUri,
+        environment_id: String,
+        permissions: super::TerminalPermissions,
         source: ExecCommandSource,
         plugin_attribution: Option<PluginCommandAttribution>,
         started_at: Instant,

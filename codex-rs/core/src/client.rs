@@ -230,7 +230,7 @@ pub(crate) fn request_reasoning_effort(
 ) -> Option<ReasoningEffortConfig> {
     effort
         .or_else(|| model_info.default_reasoning_level.clone())
-        .map(reasoning_effort_for_request)
+        .map(|effort| reasoning_effort_for_request(model_info, effort))
 }
 
 fn session_telemetry_for_request(

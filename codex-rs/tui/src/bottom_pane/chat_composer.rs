@@ -482,6 +482,8 @@ pub(crate) struct ChatComposerConfig {
     pub(crate) shell_commands_enabled: bool,
     /// Whether pasting a file path can attach local images.
     pub(crate) image_paste_enabled: bool,
+    /// Strip leading and trailing whitespace from submissions.
+    pub(crate) trim_submission: bool,
     /// Whether composer prompt suggestions (the `Create a plan?` nudge) may render.
     pub(crate) prompt_suggestions_enabled: bool,
 }
@@ -493,6 +495,7 @@ impl Default for ChatComposerConfig {
             slash_commands_enabled: true,
             shell_commands_enabled: true,
             image_paste_enabled: true,
+            trim_submission: true,
             prompt_suggestions_enabled: true,
         }
     }
@@ -501,7 +504,7 @@ impl Default for ChatComposerConfig {
 impl ChatComposerConfig {
     /// A minimal preset for plain-text inputs embedded in other surfaces.
     ///
-    /// This disables popups, slash commands, image-path attachment behavior, and
+    /// This disables popups, slash and shell commands, image-path attachment behavior, and
     /// prompt suggestions so the composer behaves like a simple notes field.
     pub(crate) const fn plain_text() -> Self {
         Self {
@@ -509,6 +512,7 @@ impl ChatComposerConfig {
             slash_commands_enabled: false,
             shell_commands_enabled: false,
             image_paste_enabled: false,
+            trim_submission: true,
             prompt_suggestions_enabled: false,
         }
     }
@@ -599,6 +603,19 @@ pub(crate) struct ComposerDraftSnapshot {
 
 const FOOTER_SPACING_HEIGHT: u16 = 0;
 
+/// Builds the one-line nudge that replaces the ambient footer without adding layout height.
+fn plan_mode_nudge_line() -> Line<'static> {
+    Line::from(vec![
+        "Create a plan?".magenta(),
+        "  ".into(),
+        key_hint::shift(KeyCode::Tab).into(),
+        " use Plan mode".into(),
+        "   ".into(),
+        key_hint::plain(KeyCode::Esc).into(),
+        " dismiss".into(),
+    ])
+}
+
 impl ChatComposer {
     fn slash_input(&self) -> SlashInput<'_> {
         SlashInput::new(
@@ -670,6 +687,7 @@ impl ChatComposer {
                 use_shift_enter_hint,
                 mode: FooterMode::ComposerEmpty,
                 hint_override: None,
+                plan_mode_nudge_visible: false,
                 flash: None,
                 context_window_percent: None,
                 context_window_used_tokens: None,

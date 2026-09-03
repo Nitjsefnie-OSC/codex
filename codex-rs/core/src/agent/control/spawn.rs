@@ -2,6 +2,7 @@ use super::residency::is_v2_resident_session_source;
 use super::*;
 use crate::agent::role::AgentRoleOverrideMask;
 use crate::agent::role::apply_role_to_config_with_mask;
+use crate::codex_thread::CodexThread;
 use crate::config::PermissionProfileSnapshot;
 use crate::context::ContextualUserFragment;
 use crate::context::CurrentTimeReminder;
@@ -278,14 +279,34 @@ impl AgentControl {
         .await
     }
 
+    fn validate_loaded_v2_child(
+        &self,
+        thread: &CodexThread,
+        parent_thread_id: ThreadId,
+    ) -> CodexResult<()> {
+        if thread.is_running()
+            && thread.multi_agent_version() == Some(MultiAgentVersion::V2)
+            && thread.session_source.parent_thread_id() == Some(parent_thread_id)
+            && Arc::ptr_eq(&self.state, &thread.session.services.agent_control.state)
+        {
+            return Ok(());
+        }
+        Err(CodexErr::InvalidRequest(format!(
+            "multi-agent v2 child {} is not owned by its loaded parent",
+            thread.session.thread_id
+        )))
+    }
+
     pub(crate) fn ensure_v2_agent_loaded(
         &self,
         config: Config,
         thread_id: ThreadId,
+        parent: Option<Arc<CodexThread>>,
     ) -> BoxFuture<'_, CodexResult<()>> {
         Box::pin(self.ensure_v2_agent_loaded_with_admission(
             config,
             thread_id,
+            parent,
             V2ReloadAdmission::CapacityBounded,
         ))
     }
@@ -298,6 +319,7 @@ impl AgentControl {
         Box::pin(self.ensure_v2_agent_loaded_with_admission(
             config,
             thread_id,
+            /*parent*/ None,
             V2ReloadAdmission::CompletionDelivery,
         ))
     }
@@ -306,6 +328,7 @@ impl AgentControl {
         &self,
         mut config: Config,
         thread_id: ThreadId,
+        parent: Option<Arc<CodexThread>>,
         admission: V2ReloadAdmission,
     ) -> CodexResult<()> {
         let state = self.upgrade()?;
@@ -353,7 +376,6 @@ impl AgentControl {
         let stored_model = stored_thread.model.clone();
         let stored_reasoning_effort = stored_thread.reasoning_effort.clone();
         let stored_model_provider = stored_thread.model_provider.clone();
-        let stored_reasoning_effort = stored_thread.reasoning_effort.clone();
         let stored_source = stored_thread.source.clone();
         let stored_parent_thread_id = stored_thread.parent_thread_id;
         let history = load_agent_model_context(&state, thread_id, stored_thread.history_mode)
@@ -430,6 +452,111 @@ impl AgentControl {
                 })?;
             config.model_provider_id = stored_model_provider;
         }
+        let parent_thread_id = owner_thread_id
+            .or_else(|| initial_history.get_resumed_parent_thread_id())
+            .or(stored_parent_thread_id);
+        let (inherited_environments, inherited_exec_policy, client_mcp_extensions) = if let Some(
+            (parent, parent_environments),
+        ) =
+            parent.as_ref()
+        {
+            let parent_config = parent.session.get_config().await;
+            if !crate::exec_policy::child_uses_parent_exec_policy(&parent_config, &config) {
+                return Err(CodexErr::InvalidRequest(format!(
+                    "cannot resume multi-agent v2 child {thread_id}: parent execution policy has changed; retry through the parent"
+                )));
+            }
+            if let Some(selections) = environment_selections.as_mut() {
+                for selection in selections {
+                    let environment_id = &selection.environment_id;
+                    let invalid_environment = |reason: &str| {
+                        CodexErr::InvalidRequest(format!(
+                            "cannot resume multi-agent v2 child {thread_id}: cached environment {environment_id} {reason}"
+                        ))
+                    };
+                    let owner_environment = parent_environments
+                        .turn_environments()
+                        .find(|environment| {
+                            let parent_selection = &environment.selection;
+                            parent_selection.environment_id == selection.environment_id
+                                && parent_selection.cwd == selection.cwd
+                                && parent_selection.workspace_roots == selection.workspace_roots
+                        })
+                        .ok_or_else(|| {
+                            invalid_environment("no longer matches a ready parent environment")
+                        })?;
+                    let owner_config = owner_environment.config();
+                    let child_config = match &selection.config {
+                        EnvironmentConfigState::FromThread => {
+                            selection.config = EnvironmentConfigState::Ready(owner_config.clone());
+                            continue;
+                        }
+                        EnvironmentConfigState::Ready(config) => config,
+                        EnvironmentConfigState::Pending | EnvironmentConfigState::Failed(_) => {
+                            return Err(invalid_environment("configuration is not ready"));
+                        }
+                    };
+                    let mut bounded_config = child_config.clone();
+                    bounded_config.permission_profile = owner_config.permission_profile.clone();
+                    if bounded_config != *owner_config {
+                        return Err(invalid_environment(
+                            "configuration differs from the current parent",
+                        ));
+                    }
+                    if child_config.permission_profile == owner_config.permission_profile {
+                        continue;
+                    }
+                    if owner_environment.environment.is_remote() {
+                        return Err(invalid_environment(
+                            "permissions changed on a remote executor",
+                        ));
+                    }
+                    let cwd = selection.cwd.to_abs_path().map_err(|_| {
+                        invalid_environment("working directory is not a local absolute path")
+                    })?;
+                    let roots = owner_environment
+                        .workspace_roots()
+                        .iter()
+                        .map(PathUri::to_abs_path)
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|_| {
+                            invalid_environment("workspace roots are not local absolute paths")
+                        })?;
+                    let authority = owner_environment
+                        .permission_profile()
+                        .clone()
+                        .materialize_project_roots_with_workspace_roots(&roots);
+                    let requested = child_config
+                        .permission_profile
+                        .permission_profile()
+                        .clone()
+                        .materialize_project_roots_with_workspace_roots(&roots);
+                    let permissions =
+                        intersect_effective_permission_profiles(&authority, &requested, &cwd)
+                            .map_err(|err| {
+                                invalid_environment(&format!(
+                                    "permissions cannot be intersected safely: {err}"
+                                ))
+                            })?;
+                    bounded_config.permission_profile =
+                        PermissionProfileSnapshot::legacy(permissions);
+                    selection.config = EnvironmentConfigState::Ready(bounded_config);
+                }
+            }
+            (
+                Some(parent_environments.clone()),
+                Some(Arc::clone(&parent.session.services.exec_policy)),
+                Some(parent.client_mcp_extensions()),
+            )
+        } else {
+            (
+                self.inherited_environments_for_source(&state, Some(&session_source))
+                    .await,
+                self.inherited_exec_policy_for_source(&state, Some(&session_source), &config)
+                    .await,
+                None,
+            )
+        };
         let residency_slot = match admission {
             V2ReloadAdmission::CapacityBounded => Some(
                 self.reserve_v2_residency_slot(&state, &config, Some(thread_id))

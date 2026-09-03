@@ -17,6 +17,7 @@ use super::turn_context::NewTurnContextOptions;
 use super::turn_context::TurnContext;
 use crate::state::ActiveTurn;
 use crate::state::TurnState;
+use crate::tasks::MailboxParentProvenance;
 use crate::tasks::RegularTask;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::error::CodexErr;

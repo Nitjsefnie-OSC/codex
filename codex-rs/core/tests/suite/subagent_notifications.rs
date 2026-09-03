@@ -663,6 +663,7 @@ async fn spawned_agent_uses_multi_agent_reasoning_effort_for_requests(
     let server = start_mock_server().await;
     let (_test, _spawned_id, child_request_log) = setup_turn_one_with_custom_spawned_child(
         &server,
+        MultiAgentVersion::V1,
         json!({ "message": CHILD_PROMPT }),
         /*child_response_delay*/ None,
         /*wait_for_parent_notification*/ false,
@@ -2719,8 +2720,21 @@ async fn legacy_completion_wakes_idle_parent_without_wait_or_user_turn() -> Resu
     Ok(())
 }
 
-#[test_case(CompletionScenario::Completed ; "completed")]
-#[test_case(CompletionScenario::TerminalError ; "terminal_error")]
+#[test_case(
+    CompletionScenario::Completed,
+    ThreadHistoryMode::Paginated;
+    "completed_paginated"
+)]
+#[test_case(
+    CompletionScenario::Completed,
+    ThreadHistoryMode::Legacy;
+    "completed_legacy"
+)]
+#[test_case(
+    CompletionScenario::TerminalError,
+    ThreadHistoryMode::Paginated;
+    "terminal_error"
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn plaintext_multi_agent_v2_completion_sends_agent_message(
     scenario: CompletionScenario,

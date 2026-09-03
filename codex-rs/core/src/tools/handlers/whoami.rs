@@ -129,7 +129,10 @@ impl ToolExecutor<ToolInvocation> for WhoamiHandler {
         create_whoami_tool()
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move {
             if !matches!(invocation.payload, ToolPayload::Function { .. }) {
                 return Err(FunctionCallError::RespondToModel(
@@ -137,7 +140,7 @@ impl ToolExecutor<ToolInvocation> for WhoamiHandler {
                 ));
             }
 
-            let model_info = &invocation.turn.model_info;
+            let model_info = invocation.turn.model_info();
             let requested_model = model_info.slug.clone();
             let requested_display_name = model_info.display_name.clone();
             let requested_context_window = model_info.context_window;
@@ -261,9 +264,9 @@ mod tests {
     #[tokio::test]
     async fn handle_reports_request_metadata_as_unverified_without_server_model() {
         let (session, turn) = make_session_and_context().await;
-        let requested_model = turn.model_info.slug.clone();
-        let requested_display_name = turn.model_info.display_name.clone();
-        let requested_context_window = turn.model_info.context_window;
+        let requested_model = turn.model_info().slug.clone();
+        let requested_display_name = turn.model_info().display_name.clone();
+        let requested_context_window = turn.model_info().context_window;
         let requested_reasoning_effort = turn
             .request_reasoning_effort()
             .map(|effort| effort.as_str().to_string());
@@ -309,9 +312,9 @@ mod tests {
     #[tokio::test]
     async fn handle_prefers_latest_server_reported_model_for_legacy_slug() {
         let (session, turn) = make_session_and_context().await;
-        let requested_model = turn.model_info.slug.clone();
-        let requested_display_name = turn.model_info.display_name.clone();
-        let requested_context_window = turn.model_info.context_window;
+        let requested_model = turn.model_info().slug.clone();
+        let requested_display_name = turn.model_info().display_name.clone();
+        let requested_context_window = turn.model_info().context_window;
         let requested_reasoning_effort = turn
             .request_reasoning_effort()
             .map(|effort| effort.as_str().to_string());

@@ -1,6 +1,12 @@
 use super::*;
 use pretty_assertions::assert_eq;
 
+fn set_composer_text(chat: &mut ChatWidget, text: &str) {
+    chat.bottom_pane
+        .set_composer_text(text.to_string(), Vec::new(), Vec::new());
+    chat.refresh_plan_mode_nudge();
+}
+
 fn paste_hidden_plan_shell_payload(chat: &mut ChatWidget) -> String {
     let payload = format!("!echo {}", "x".repeat(1000));
     chat.bottom_pane
@@ -60,6 +66,16 @@ fn assert_literal_plan_prompt(chat: &ChatWidget, op: Result<Op, TryRecvError>, p
         other => panic!("expected literal plan prompt, got {other:?}"),
     }
     assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Plan);
+}
+
+#[test]
+fn plan_mode_nudge_matches_only_standalone_plain_text_keyword() {
+    assert!(contains_plan_keyword("plan"));
+    assert!(contains_plan_keyword("Make a Plan first."));
+    assert!(!contains_plan_keyword("plane"));
+    assert!(!contains_plan_keyword("planning"));
+    assert!(contains_plan_keyword("/plan"));
+    assert!(contains_plan_keyword("!plan"));
 }
 
 #[tokio::test]

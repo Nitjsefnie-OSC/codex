@@ -212,6 +212,7 @@ impl ChatWidget {
             #[cfg(test)]
             pet_image_support_override: None,
             thread_id: None,
+            dismissed_plan_mode_nudge_scopes: HashSet::new(),
             thread_name: None,
             thread_rename_block_message: None,
             active_side_conversation: false,
@@ -274,9 +275,11 @@ impl ChatWidget {
         if let Some(keymap) = runtime_keymap {
             widget.bottom_pane.set_keymap_bindings(&keymap);
         }
-        widget
-            .bottom_pane
-            .set_vim_enabled(widget.config.tui_vim_mode_default);
+        if widget.local_settings.tui.vim_mode_default {
+            widget.bottom_pane.enable_vim_in_insert_mode();
+        } else {
+            widget.bottom_pane.set_vim_enabled(/*enabled*/ false);
+        }
         widget.sync_prompt_suggestions_enabled();
         widget
             .bottom_pane

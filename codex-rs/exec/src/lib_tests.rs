@@ -689,7 +689,7 @@ async fn thread_start_params_preserve_resolved_role_instructions_and_effort() {
     config.developer_instructions = Some("ROLE-DEVELOPER-MARKER".to_string());
     config.model_reasoning_effort = Some(ReasoningEffort::Low);
 
-    let params = thread_start_params_from_config(&config);
+    let params = thread_start_params_from_config(&config, &ThreadSource::User);
 
     assert_eq!(
         params.base_instructions.as_deref(),

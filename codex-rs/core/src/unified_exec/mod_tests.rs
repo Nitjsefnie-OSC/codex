@@ -446,6 +446,7 @@ async fn write_stdin(
                 crate::session::step_context::StepContext::for_test(Arc::clone(turn)),
                 tokio_util::sync::CancellationToken::new(),
                 "write".to_string(),
+                InitialExecCommandOutputDestination::Untracked,
             ),
             WriteStdinRequest {
                 process_id,

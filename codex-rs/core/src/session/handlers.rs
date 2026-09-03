@@ -92,12 +92,7 @@ pub async fn inter_agent_communication(
         .lock_background_notification_delivery()
         .await;
     sess.input_queue
-        .enqueue_or_inject_mailbox_communication(
-            &sess.active_turn,
-            communication,
-            parent_turn_id.filter(|_| trigger_turn),
-            root_turn_id.filter(|_| trigger_turn),
-        )
+        .enqueue_or_inject_mailbox_communication(&sess.active_turn, communication, start_options)
         .await;
     drop(_delivery_guard);
     crate::agent_communication::emit_agent_communication_receive(&sub_id);
@@ -611,6 +606,7 @@ fn dispatch_submission(
                     sess.send_event_raw(Event {
                         id: sub.id.clone(),
                         msg: EventMsg::Error(ErrorEvent {
+                            misalignment: None,
                             message: err.to_string(),
                             codex_error_info: Some(CodexErrorInfo::Other),
                         }),
@@ -650,10 +646,16 @@ fn dispatch_submission(
             }
             Op::RecoverTurn {
                 thread_settings,
+                start_options,
                 reply,
             } => {
-                let result =
-                    turn_input::handle_recovery(&sess, thread_settings, sub.id.clone()).await;
+                let result = turn_input::handle_recovery(
+                    &sess,
+                    thread_settings,
+                    start_options,
+                    sub.id.clone(),
+                )
+                .await;
                 let _ = reply.send(result);
                 false
             }
@@ -673,15 +675,21 @@ fn dispatch_submission(
                 thread_settings::update(&sess, sub.id.clone(), thread_settings).await;
                 false
             }
-            Op::InterAgentCommunication { communication } => {
-                inter_agent_communication(
-                    &sess,
-                    sub.id.clone(),
-                    communication,
-                    sub.parent_turn_id,
-                    sub.root_turn_id,
-                )
-                .await;
+            Op::TurnSettings {
+                turn_id,
+                update,
+                reply,
+            } => {
+                let outcome = sess.apply_turn_settings(&turn_id, update).await;
+                let _ = reply.send(outcome);
+                false
+            }
+            Op::InterAgentCommunication {
+                communication,
+                start_options,
+            } => {
+                inter_agent_communication(&sess, sub.id.clone(), communication, start_options)
+                    .await;
                 false
             }
             Op::InterAgentCompletion { communication } => {
@@ -745,8 +753,11 @@ fn dispatch_submission(
                 set_thread_memory_mode(&sess, sub.id.clone(), mode).await;
                 false
             }
-            Op::RunUserShellCommand { command } => {
-                run_user_shell_command(&sess, sub.id.clone(), command).await;
+            Op::RunUserShellCommand {
+                command,
+                timeout_ms,
+            } => {
+                run_user_shell_command(&sess, sub.id.clone(), command, timeout_ms).await;
                 false
             }
             Op::ResolveElicitation {

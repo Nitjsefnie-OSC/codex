@@ -19,7 +19,7 @@ use super::ExecContext;
 use super::NestedToolCallResult;
 use super::PUBLIC_TOOL_NAME;
 use super::YieldedExecDelivery;
-use super::call_nested_tool;
+use super::submit_nested_tool;
 use crate::session::step_context::StepContext;
 use crate::tools::ExecutedToolCallRecorder;
 use crate::tools::context::SharedTurnDiffTracker;
@@ -28,8 +28,15 @@ use crate::tools::parallel::ToolCallRuntime;
 pub(super) struct CodeModeDispatchBroker {
     dispatch_tx: async_channel::Sender<DispatchMessage>,
     dispatch_rx: async_channel::Receiver<DispatchMessage>,
-    dispatch_gates: Arc<Mutex<HashMap<CellId, watch::Sender<bool>>>>,
+    dispatch_gates: Arc<Mutex<HashMap<CellId, CellDispatchGate>>>,
+    executed_tool_calls: Option<Arc<ExecutedToolCallRecorder>>,
     pending_tool_deliveries: Mutex<HashMap<(CellId, String), YieldedExecDelivery>>,
+}
+
+struct CellDispatchGate {
+    ready: watch::Sender<bool>,
+    // Keep the original exec item when later waits resume this cell.
+    originating_item_id: Option<ResponseItemId>,
 }
 
 impl CodeModeDispatchBroker {
@@ -39,6 +46,7 @@ impl CodeModeDispatchBroker {
             dispatch_tx,
             dispatch_rx,
             dispatch_gates: Arc::new(Mutex::new(HashMap::new())),
+            executed_tool_calls,
             pending_tool_deliveries: Mutex::new(HashMap::new()),
         }
     }
@@ -429,6 +437,7 @@ enum DispatchMessage {
         invocation: CodeModeNestedToolCall,
         cancellation_token: CancellationToken,
         response_tx: oneshot::Sender<Result<NestedToolCallResult, String>>,
+        span: tracing::Span,
     },
     Notify {
         call_id: String,
@@ -461,8 +470,9 @@ impl CoreTurnHost {
         &self,
         invocation: CodeModeNestedToolCall,
         cancellation_token: CancellationToken,
-    ) -> Result<NestedToolCallResult, String> {
-        call_nested_tool(
+    ) -> impl std::future::Future<Output = Result<NestedToolCallResult, String>> + Send + 'static
+    {
+        let invocation = submit_nested_tool(
             self.exec.clone(),
             self.tool_runtime.clone(),
             invocation,

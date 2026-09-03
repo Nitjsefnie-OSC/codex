@@ -28,6 +28,8 @@ impl From<&Config> for LocalSettings {
                 notification_settings: config.tui_notifications.clone(),
                 animations: config.animations,
                 show_tooltips: config.show_tooltips,
+                show_safety_buffering_ui: config.tui_show_safety_buffering_ui,
+                show_prompt_suggestions: config.tui_show_prompt_suggestions,
                 auto_recap: config.tui_auto_recap,
                 disable_paste_burst: Some(config.disable_paste_burst),
                 vim_mode_default: config.tui_vim_mode_default,

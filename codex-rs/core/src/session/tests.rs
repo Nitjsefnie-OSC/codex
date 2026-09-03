@@ -3,6 +3,7 @@ use super::step_settings::ResolvedStepSettings;
 use super::step_settings::StepSettings;
 use super::step_settings::StepSettingsUpdate;
 pub(crate) use super::step_settings::tests::update_selected_settings_for_test;
+use super::turn_context::NewTurnContextOptions;
 use super::turn_context::TurnEnvironment;
 use super::*;
 use crate::agents_md_manager::AgentsMdManager;
@@ -100,6 +101,7 @@ use codex_utils_path_uri::PathUri;
 use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use test_case::test_case;
 use tracing::Span;
 
 use crate::connectors::AppInfo;
@@ -247,6 +249,22 @@ pub(crate) fn update_turn_settings_for_test(
     let settings = Arc::new(settings);
     turn.initial_settings = Arc::clone(&settings);
     turn.current_settings.store(settings);
+}
+
+pub(crate) fn set_turn_reasoning_effort_for_test(
+    turn: &mut TurnContext,
+    reasoning_effort: Option<ReasoningEffortConfig>,
+) {
+    let fast_mode_enabled = turn.config.features.enabled(Feature::FastMode);
+    update_turn_settings_for_test(turn, |settings| {
+        let mut selected = settings.selected().clone();
+        selected.collaboration_mode.settings.reasoning_effort = reasoning_effort;
+        *settings = super::step_settings::ResolvedStepSettings::new(
+            Arc::new(selected),
+            Arc::clone(&settings.model_info),
+            fast_mode_enabled,
+        );
+    });
 }
 
 impl StepContext {
@@ -12019,9 +12037,14 @@ async fn aborting_sentinel_blocks_direct_task_start_until_cleanup_finishes() {
         .await
         .expect("abort hook should reach its delivery-lock-free wait");
 
-    let next_turn = sess
-        .new_default_turn_with_sub_id("next-turn-after-abort".to_string())
-        .await;
+    let (next_turn, _) = sess
+        .new_turn_with_sub_id(
+            "next-turn-after-abort".to_string(),
+            SessionSettingsUpdate::default(),
+            NewTurnContextOptions::default(),
+        )
+        .await
+        .expect("next turn should be constructed");
     let started = Arc::new(Notify::new());
     let run_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let start_task = tokio::spawn({
@@ -12430,7 +12453,10 @@ async fn thread_idle_lifecycle_waits_for_trigger_turn_mailbox_work() {
 async fn default_turn_construction_future_stays_small() {
     let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
     let future_size = {
-        let future = sess.new_default_turn_with_sub_id("future-size-regression".to_string());
+        let future = sess.new_turn_with_default_settings(
+            "future-size-regression".to_string(),
+            NewTurnContextOptions::default(),
+        );
         std::mem::size_of_val(&future)
     };
 
@@ -12445,6 +12471,7 @@ async fn sampling_loop_future_boundary_is_pointer_sized() {
     let (sess, turn_context) = make_session_and_context().await;
     let sess = Arc::new(sess);
     let turn_context = Arc::new(turn_context);
+    let mut mcp_startup_requirements = super::turn::McpStartupRequirements::default();
     let future = super::turn::run_turn_sampling_loop(
         Arc::clone(&sess),
         Arc::clone(&turn_context),
@@ -12454,6 +12481,7 @@ async fn sampling_loop_future_boundary_is_pointer_sized() {
         Arc::new(WorldState::default()),
         Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
         true,
+        &mut mcp_startup_requirements,
     );
     let future_size = std::mem::size_of_val(&future);
     assert!(
@@ -12620,11 +12648,7 @@ async fn active_completion_preserves_earlier_mailbox_order() {
     )
     .await;
     sess.input_queue
-        .enqueue_mailbox_communication(
-            progress.clone(),
-            /*parent_turn_id*/ None,
-            /*root_turn_id*/ None,
-        )
+        .enqueue_mailbox_communication(progress.clone(), Default::default())
         .await;
 
     sess.deliver_inter_agent_completion(completion.clone())
@@ -12668,8 +12692,7 @@ async fn active_mailbox_precedes_later_steer() {
             .enqueue_or_inject_mailbox_communication(
                 &sess.active_turn,
                 progress.clone(),
-                /*parent_turn_id*/ None,
-                /*root_turn_id*/ None,
+                Default::default(),
             )
             .await;
     }
@@ -12728,11 +12751,7 @@ async fn deferred_mailbox_precedes_later_injected_context() {
         .defer_mailbox_delivery_to_next_turn(&sess.active_turn, &tc.sub_id)
         .await;
     sess.input_queue
-        .enqueue_mailbox_communication(
-            progress.clone(),
-            /*parent_turn_id*/ None,
-            /*root_turn_id*/ None,
-        )
+        .enqueue_mailbox_communication(progress.clone(), Default::default())
         .await;
     let injected = user_message("context after progress");
 
@@ -12761,9 +12780,7 @@ async fn idle_mailbox_precedes_later_history_injection() {
         /*trigger_turn*/ false,
     );
     sess.input_queue
-        .enqueue_mailbox_communication(
-            progress, /*parent_turn_id*/ None, /*root_turn_id*/ None,
-        )
+        .enqueue_mailbox_communication(progress, Default::default())
         .await;
 
     sess.inject_no_new_turn(
@@ -12811,9 +12828,7 @@ async fn non_regular_task_persists_older_idle_mailbox_before_start() {
         /*trigger_turn*/ false,
     );
     sess.input_queue
-        .enqueue_mailbox_communication(
-            progress, /*parent_turn_id*/ None, /*root_turn_id*/ None,
-        )
+        .enqueue_mailbox_communication(progress, Default::default())
         .await;
 
     sess.spawn_task(
@@ -12853,8 +12868,10 @@ async fn non_regular_task_preserves_older_trigger_mail_wake() {
     sess.input_queue
         .enqueue_mailbox_communication(
             trigger,
-            Some("parent-turn".to_string()),
-            /*root_turn_id*/ None,
+            codex_protocol::turn_input::TurnStartOptions {
+                parent_turn_id: Some("parent-turn".to_string()),
+                ..Default::default()
+            },
         )
         .await;
 
@@ -12938,9 +12955,7 @@ async fn interrupted_finishing_turn_does_not_wake_for_queue_only_mail() {
         });
     }
     sess.input_queue
-        .enqueue_mailbox_communication(
-            progress, /*parent_turn_id*/ None, /*root_turn_id*/ None,
-        )
+        .enqueue_mailbox_communication(progress, Default::default())
         .await;
     terminal_persisted_tx.send_replace(true);
 
@@ -12969,9 +12984,7 @@ async fn replaced_finishing_turn_persists_older_mailbox_input() {
         });
     }
     sess.input_queue
-        .enqueue_mailbox_communication(
-            progress, /*parent_turn_id*/ None, /*root_turn_id*/ None,
-        )
+        .enqueue_mailbox_communication(progress, Default::default())
         .await;
     terminal_persisted_tx.send_replace(true);
 
@@ -13059,8 +13072,11 @@ async fn compact_task_queues_background_notifications_until_it_finishes() {
                 "triggered completion provenance".to_string(),
                 /*trigger_turn*/ true,
             ),
-            Some("parent-turn".to_string()),
-            Some("root-turn".to_string()),
+            codex_protocol::turn_input::TurnStartOptions {
+                parent_turn_id: Some("parent-turn".to_string()),
+                root_turn_id: Some("root-turn".to_string()),
+                ..Default::default()
+            },
         )
         .await;
 
@@ -13191,9 +13207,14 @@ async fn compact_task_queues_background_notifications_until_it_finishes() {
     // request. The provenance must survive the pending-input batch round trip
     // and the durable wake persistence boundary.
     let background_wake_receipt = sess.input_queue.snapshot_background_wake();
-    let successor_context = sess
-        .new_default_turn_with_sub_id("successor-turn".to_string())
-        .await;
+    let (successor_context, _) = sess
+        .new_turn_with_sub_id(
+            "successor-turn".to_string(),
+            SessionSettingsUpdate::default(),
+            NewTurnContextOptions::default(),
+        )
+        .await
+        .expect("successor turn should be constructed");
     successor_context
         .turn_metadata_state
         .set_attribute_background_parent_turn(true);
@@ -13354,9 +13375,7 @@ async fn aborted_active_turn_persists_ordered_mail_and_completion() {
     )
     .await;
     sess.input_queue
-        .enqueue_mailbox_communication(
-            progress, /*parent_turn_id*/ None, /*root_turn_id*/ None,
-        )
+        .enqueue_mailbox_communication(progress, Default::default())
         .await;
     sess.deliver_inter_agent_completion(completion).await;
 

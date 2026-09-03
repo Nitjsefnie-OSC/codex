@@ -3794,17 +3794,26 @@ impl Session {
             compaction_response_id: metadata.compaction_response_id,
             latest_token_usage_record: self.state.lock().await.latest_token_usage_record.clone(),
         };
+        // Wait for accepted updates to finish persisting, then keep later updates from
+        // overtaking the current settings snapshot while its checkpoint is written.
+        let _settings_guard = thread_settings::acquire_persistence_lock(self).await;
         // Resetting background notification budgets and installing replacement history form
         // one publication critical section. Holding the state guard while awaiting the reset
         // means cancellation leaves the old history in place; once the reset completes, the
-        // replacement and baseline update have no intervening await.
+        // replacement, retained context, and baseline update have no intervening await.
         let mut world_state_item = None;
         let mut state = self.state.lock().await;
         self.services
             .unified_exec_manager
             .begin_notification_window()
             .await;
-        state.replace_annotated_history(items, reference_context_item.clone());
+        state.replace_annotated_history(
+            items,
+            reference_context_item.clone(),
+            HistoryReplacement::Compaction,
+        );
+        compacted_item.guardian_history = state.history.guardian_history_checkpoint();
+        compacted_item.retained_context = Some(state.history.retained_context().clone());
         if let Some(world_state) = world_state_baseline {
             let snapshot = world_state.snapshot();
             world_state_item = Some(WorldStateItem::full(snapshot.clone().into_object()));

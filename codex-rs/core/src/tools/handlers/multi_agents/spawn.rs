@@ -119,10 +119,11 @@ async fn handle_spawn_agent(
     if should_validate_identity {
         validate_spawn_agent_model_reasoning_effort(&session, &config).await?;
     }
+    let root_service_tier = session.services.agent_control.root_service_tier();
     apply_spawn_agent_service_tier(
         &session,
         &mut config,
-        turn.config.service_tier.as_deref(),
+        root_service_tier.as_deref(),
         args.service_tier.as_deref(),
     )
     .await?;
@@ -267,6 +268,7 @@ struct SpawnAgentArgs {
     agent_type: Option<String>,
     model: Option<String>,
     reasoning_effort: Option<ReasoningEffort>,
+    service_tier: Option<String>,
     #[serde(default)]
     fork_context: bool,
 }

@@ -91,7 +91,8 @@ pub(super) async fn apply_update(
     submission_id: String,
     updates: SessionSettingsUpdate,
 ) -> ConstraintResult<()> {
-    session.update_settings(updates).await?;
+    let _settings_guard = acquire_persistence_lock(session).await;
+    let commit = session.update_settings(updates).await?;
     // A background wake may have been held back by Plan mode. The settings
     // submission is serialized ahead of the internal wake, so retry it after
     // any concurrent background notification delivery finishes.
@@ -100,7 +101,7 @@ pub(super) async fn apply_update(
         .lock_background_notification_delivery()
         .await;
     session.input_queue.notify_background_wake();
-    emit_applied(session, submission_id).await;
+    emit_applied(session, submission_id, commit.snapshot).await;
     Ok(())
 }
 

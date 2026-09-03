@@ -443,13 +443,16 @@ fn upstream_install_command(context: &InstallContext) -> &'static str {
     }
 }
 
-fn fetch_latest_version(context: &InstallContext) -> Result<String, String> {
+async fn fetch_latest_version(
+    client: &RouteAwareClientPool,
+    context: &InstallContext,
+) -> Result<String, String> {
     // The Homebrew cask tracks upstream. Consulting it for a build Homebrew
     // does not ship would report an upstream version as this build's available
     // update, so only the fork's own release channel is asked.
     match &context.method {
         InstallMethod::Brew if upstream_installers_ship_this_build() => {
-            fetch_homebrew_cask_version()
+            fetch_homebrew_cask_version(client).await
         }
         InstallMethod::Brew
         | InstallMethod::Npm
@@ -469,7 +472,7 @@ async fn fetch_latest_github_release_version(
         tag_name: String,
     }
 
-    let info = http_get_json::<ReleaseInfo>(github_latest_release_url())?;
+    let info = http_get_json::<ReleaseInfo>(client, github_latest_release_url()).await?;
     info.tag_name
         .strip_prefix(release_tag_prefix())
         .map(str::to_string)

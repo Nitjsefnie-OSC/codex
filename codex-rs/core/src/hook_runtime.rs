@@ -10,6 +10,7 @@ use codex_connectors::AppToolPolicyInput;
 use codex_core_plugins::executor_plugin_hook_sources;
 use codex_hooks::BackgroundState;
 use codex_hooks::BackgroundTerminalSnapshot;
+use codex_hooks::InterruptRequest;
 use codex_hooks::MonitorSnapshot;
 use codex_hooks::PermissionRequestDecision;
 use codex_hooks::PermissionRequestOutcome;
@@ -67,6 +68,7 @@ use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
 use crate::skills::skill_activation_snapshot;
+use crate::state::TurnState;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::sandboxing::PermissionRequestPayload;
 use crate::turn_metadata::McpTurnMetadataContext;
@@ -803,6 +805,28 @@ pub(crate) async fn record_pending_input(
             sess.record_annotated_conversation_items(turn_context, vec![item])
                 .await;
         }
+        TurnInput::FunctionCallOutput(item) => {
+            sess.record_conversation_items(turn_context, std::slice::from_ref(&item))
+                .await;
+            if let ResponseItem::FunctionCallOutput {
+                id: Some(id),
+                name: Some(name),
+                namespace,
+                output,
+                ..
+            } = item
+            {
+                let item = TurnItem::FunctionCallOutput(FunctionCallOutputItem {
+                    id: id.to_string(),
+                    name,
+                    namespace,
+                    output: output.body,
+                });
+                sess.emit_turn_item_started(turn_context, &item).await;
+                sess.emit_turn_item_completed(turn_context, item).await;
+            }
+            sess.ensure_rollout_materialized(persist_context).await;
+        }
         TurnInput::InterAgentCommunication(communication)
         | TurnInput::AgentCompletion(communication) => {
             sess.record_inter_agent_communication(turn_context, communication)
@@ -1112,6 +1136,10 @@ mod tests {
     use codex_hooks::SkillActivation;
     use codex_hooks::SkillActivationKind;
     use codex_hooks::SkillActivationScope;
+    use codex_otel::HOOK_RUN_DURATION_METRIC;
+    use codex_otel::HOOK_RUN_METRIC;
+    use codex_otel::MetricsClient;
+    use codex_otel::MetricsConfig;
     use codex_protocol::models::ContentItem;
     use codex_protocol::protocol::HookEventName;
     use codex_protocol::protocol::HookExecutionMode;

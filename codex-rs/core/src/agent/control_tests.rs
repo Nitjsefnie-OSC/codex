@@ -849,7 +849,7 @@ fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent_body(
 
         harness
             .control
-            .ensure_v2_agent_loaded(sender_config, spawned_agent.thread_id)
+            .ensure_v2_agent_loaded(sender_config, spawned_agent.thread_id, /*parent*/ None)
             .await
             .expect("known v2 agent should reload");
         let reloaded_child = harness
@@ -904,14 +904,16 @@ fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent_body(
                 spawned_agent.thread_id,
                 communication.clone(),
                 AgentCommunicationContext::new(AgentCommunicationKind::Message, ThreadId::new()),
-                /*parent_turn_id*/ None,
-                /*root_turn_id*/ None,
+                Default::default(),
             )
             .await
             .expect("send_inter_agent_communication should succeed after reload");
         let expected = (
             spawned_agent.thread_id,
-            Op::InterAgentCommunication { communication },
+            Op::InterAgentCommunication {
+                communication,
+                start_options: Default::default(),
+            },
         );
         let captured = harness
             .manager

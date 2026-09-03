@@ -16,6 +16,7 @@ use codex_protocol::protocol::SkillScope;
 use codex_skills::SkillMetadata;
 use codex_skills_extension::HostSkillsLoadInput;
 use codex_skills_extension::InjectedHostSkill;
+use codex_skills_extension::InjectedHostSkillPrompts;
 use codex_skills_extension::detect_implicit_skill_invocation;
 use codex_skills_extension::record_plugin_turn_usage;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -166,7 +167,7 @@ pub(crate) async fn emit_explicit_skill_invocations(
         .extension_data
         .get::<InjectedHostSkillPrompts>();
     for skill in injected_skills {
-        let skill_resource = skill.path_to_skills_md.to_string_lossy();
+        let skill_resource = skill.skill.path_to_skills_md.to_string_lossy();
         if injected_host_skill_prompts
             .as_ref()
             .is_some_and(|prompts| prompts.is_superseded_path(&skill_resource))

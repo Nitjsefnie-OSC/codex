@@ -19,6 +19,7 @@ use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::ResponseItemId;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
+use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::mcp::MCP_APP_UI_EXTENSION_ID;
@@ -765,6 +766,7 @@ async fn manager_with_blocking_thread_lifecycle(
         Arc::new(extensions.build()),
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
+        passthrough_image_store(),
         thread_store_from_config(&config, /*state_db*/ None),
         /*agent_graph_store*/ None,
         TEST_INSTALLATION_ID.to_string(),

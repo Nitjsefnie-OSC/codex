@@ -143,11 +143,20 @@ pub(crate) async fn run(engine: &ClaudeHooksEngine, request: StopRequest) -> Sto
         };
     }
 
+    // Memory workers terminate on managed rejection rather than continuing the turn,
+    // so their executor cleanup must also run when a managed hook blocks completion.
+    let (executor_cleanup, matched): (Vec<_>, Vec<_>) = matched.into_iter().partition(|handler| {
+        matches!(request.target, StopHookTarget::MemoryConsolidation)
+            && matches!(
+                handler.source_path,
+                HandlerSourcePath::ExecutorScoped { .. }
+            )
+    });
     let input_json = match build_input_json(&request) {
         Ok(input_json) => input_json,
         Err(error) => {
             let label = match request.target {
-                StopHookTarget::Stop => "stop hook input",
+                StopHookTarget::Stop | StopHookTarget::MemoryConsolidation => "stop hook input",
                 StopHookTarget::SubagentStop { .. } => "subagent stop hook input",
             };
             return serialization_failure_outcome(common::serialization_failure_hook_events(
@@ -201,20 +210,22 @@ pub(crate) async fn run(engine: &ClaudeHooksEngine, request: StopRequest) -> Sto
 /// contract is what a test should pin.
 fn build_input_json(request: &StopRequest) -> Result<String, serde_json::Error> {
     match &request.target {
-        StopHookTarget::Stop => serde_json::to_string(&StopCommandInput {
-            session_id: request.session_id.to_string(),
-            turn_id: request.turn_id.clone(),
-            transcript_path: NullableString::from_path(request.transcript_path.clone()),
-            cwd: request.cwd.display().to_string(),
-            hook_event_name: "Stop".to_string(),
-            model: request.model.clone(),
-            permission_mode: request.permission_mode.clone(),
-            stop_hook_active: request.stop_hook_active,
-            last_assistant_message: NullableString::from_string(
-                request.last_assistant_message.clone(),
-            ),
-            background: request.background.clone(),
-        }),
+        StopHookTarget::Stop | StopHookTarget::MemoryConsolidation => {
+            serde_json::to_string(&StopCommandInput {
+                session_id: request.session_id.to_string(),
+                turn_id: request.turn_id.clone(),
+                transcript_path: NullableString::from_path(request.transcript_path.clone()),
+                cwd: request.cwd.display().to_string(),
+                hook_event_name: "Stop".to_string(),
+                model: request.model.clone(),
+                permission_mode: request.permission_mode.clone(),
+                stop_hook_active: request.stop_hook_active,
+                last_assistant_message: NullableString::from_string(
+                    request.last_assistant_message.clone(),
+                ),
+                background: request.background.clone(),
+            })
+        }
         StopHookTarget::SubagentStop {
             agent_id,
             agent_type,

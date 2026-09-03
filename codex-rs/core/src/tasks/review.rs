@@ -67,7 +67,8 @@ impl SessionTask for ReviewTask {
         for item in input {
             match item {
                 TurnInput::UserInput { mut content, .. } => user_input.append(&mut content),
-                TurnInput::ResponseItem(_)
+                TurnInput::FunctionCallOutput(_)
+                | TurnInput::ResponseItem(_)
                 | TurnInput::InterAgentCommunication(_)
                 | TurnInput::AgentCompletion(_) => {}
             }

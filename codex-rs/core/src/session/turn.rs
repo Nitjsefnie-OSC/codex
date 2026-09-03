@@ -108,6 +108,7 @@ use codex_protocol::protocol::PlanDeltaEvent;
 use codex_protocol::protocol::ReasoningContentDeltaEvent;
 use codex_protocol::protocol::ReasoningRawContentDeltaEvent;
 use codex_protocol::protocol::SafetyBufferingEvent;
+use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SkillScope;
 use codex_protocol::protocol::TurnDiffEvent;
 use codex_protocol::protocol::WarningEvent;
@@ -129,6 +130,7 @@ use codex_utils_stream_parser::AssistantTextStreamParser;
 use codex_utils_stream_parser::ProposedPlanSegment;
 use codex_utils_stream_parser::extract_proposed_plan_text;
 use codex_utils_stream_parser::strip_citations;
+use futures::future::BoxFuture;
 use futures::prelude::*;
 use futures::stream::FuturesOrdered;
 use tokio_util::sync::CancellationToken;
@@ -143,6 +145,13 @@ use tracing::trace_span;
 use tracing::warn;
 
 const POST_SAMPLING_TOKEN_ESTIMATE_TARGET: &str = "codex_core::post_sampling_token_estimate";
+
+/// Explicit MCP startup requirements retained across restarts within one user turn.
+#[derive(Default)]
+pub(crate) struct McpStartupRequirements {
+    required_servers: Vec<String>,
+    required_plugins: HashSet<String>,
+}
 
 struct TurnSetup {
     client_session: ModelClientSession,
@@ -166,17 +175,19 @@ struct TurnSetup {
 /// - If the model sends only an assistant message, we record it in the
 ///   conversation history and consider the turn complete.
 ///
-pub(crate) fn run_turn(
+pub(crate) fn run_turn<'a>(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     input: Vec<TurnInput>,
+    mcp_startup_requirements: &'a mut McpStartupRequirements,
     prewarmed_client_session: Option<ModelClientSession>,
     cancellation_token: CancellationToken,
-) -> BoxFuture<'static, CodexResult<Option<String>>> {
+) -> BoxFuture<'a, CodexResult<Option<String>>> {
     Box::pin(run_turn_inner(
         sess,
         turn_context,
         input,
+        mcp_startup_requirements,
         prewarmed_client_session,
         cancellation_token,
     ))
@@ -203,6 +214,7 @@ async fn run_turn_inner(
         &sess,
         &turn_context,
         input,
+        mcp_startup_requirements,
         prewarmed_client_session,
         &cancellation_token,
     )
@@ -219,6 +231,7 @@ async fn run_turn_inner(
         world_state,
         turn_diff_tracker,
         can_drain_pending_input,
+        mcp_startup_requirements,
     )
     .await
 }
@@ -226,7 +239,7 @@ async fn run_turn_inner(
 // Keep the request loop behind a heap boundary. The setup path must not retain
 // the loop's monitor-delivery and tool-sampling state while it is being polled,
 // and the loop's concrete future includes several large asynchronous branches.
-pub(crate) fn run_turn_sampling_loop(
+pub(crate) fn run_turn_sampling_loop<'a>(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     cancellation_token: CancellationToken,
@@ -235,7 +248,8 @@ pub(crate) fn run_turn_sampling_loop(
     world_state: Arc<WorldState>,
     turn_diff_tracker: SharedTurnDiffTracker,
     can_drain_pending_input: bool,
-) -> BoxFuture<'static, CodexResult<Option<String>>> {
+    mcp_startup_requirements: &'a mut McpStartupRequirements,
+) -> BoxFuture<'a, CodexResult<Option<String>>> {
     Box::pin(run_turn_sampling_loop_inner(
         sess,
         turn_context,
@@ -245,6 +259,7 @@ pub(crate) fn run_turn_sampling_loop(
         world_state,
         turn_diff_tracker,
         can_drain_pending_input,
+        mcp_startup_requirements,
     ))
 }
 
@@ -257,6 +272,7 @@ async fn run_turn_sampling_loop_inner(
     mut world_state: Arc<WorldState>,
     turn_diff_tracker: SharedTurnDiffTracker,
     mut can_drain_pending_input: bool,
+    mcp_startup_requirements: &mut McpStartupRequirements,
 ) -> CodexResult<Option<String>> {
     let mut last_agent_message: Option<String> = None;
     let mut stop_hook_active = false;
@@ -330,14 +346,25 @@ async fn run_turn_sampling_loop_inner(
         } else {
             next_step_context = None;
             let pending_user_input = turn_user_input(&pending_input);
-            let (required_servers, _) =
+            if !crate::guardian::is_basic_session_source(&turn_context.session_source) {
+                mcp_startup_requirements.required_plugins.extend(
+                    crate::plugins::collect_explicit_plugin_ids(&pending_user_input),
+                );
+            }
+            let (pending_required_servers, _) =
                 required_mcp_servers_for_input(&sess, turn_context.as_ref(), &pending_user_input)
                     .or_cancel(&cancellation_token)
                     .await?;
+            mcp_startup_requirements
+                .required_servers
+                .extend(pending_required_servers);
+            mcp_startup_requirements.required_servers.sort_unstable();
+            mcp_startup_requirements.required_servers.dedup();
             sess.capture_step_context_with_required_mcp_servers(
                 Arc::clone(&turn_context),
                 &cancellation_token,
-                &required_servers,
+                &mcp_startup_requirements.required_servers,
+                &mcp_startup_requirements.required_plugins,
             )
             .await?
         };
@@ -629,6 +656,7 @@ async fn prepare_turn_setup(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     input: Vec<TurnInput>,
+    mcp_startup_requirements: &mut McpStartupRequirements,
     prewarmed_client_session: Option<ModelClientSession>,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<Option<TurnSetup>> {
@@ -655,7 +683,12 @@ async fn prepare_turn_setup(
         return Ok(None);
     }
     let user_input = turn_user_input(&input);
-    let (required_servers, mentioned_plugins) =
+    if !crate::guardian::is_basic_session_source(&turn_context.session_source) {
+        mcp_startup_requirements
+            .required_plugins
+            .extend(crate::plugins::collect_explicit_plugin_ids(&user_input));
+    }
+    let (input_required_servers, mentioned_plugins) =
         match required_mcp_servers_for_input(sess, turn_context.as_ref(), &user_input)
             .or_cancel(cancellation_token)
             .await
@@ -667,13 +700,19 @@ async fn prepare_turn_setup(
                 return Err(err.into());
             }
         };
+    mcp_startup_requirements
+        .required_servers
+        .extend(input_required_servers);
+    mcp_startup_requirements.required_servers.sort_unstable();
+    mcp_startup_requirements.required_servers.dedup();
 
     // run_turn owns the step used to seed context and make the first sampling request.
     let first_step_context = match sess
         .capture_step_context_with_required_mcp_servers(
             Arc::clone(turn_context),
             cancellation_token,
-            &required_servers,
+            &mcp_startup_requirements.required_servers,
+            &mcp_startup_requirements.required_plugins,
         )
         .await
     {
@@ -730,11 +769,20 @@ async fn prepare_turn_setup(
         return Ok(None);
     }
 
+    // Only speculate after hooks accept the turn, using its finalized tools and permissions.
+    {
+        let mut state = sess.state.lock().await;
+        if state.shell_snapshot_prewarm.is_none() {
+            state.shell_snapshot_prewarm =
+                sess.prewarm_shell_snapshots(first_step_context.as_ref());
+        }
+    }
+
     sess.merge_connector_selection(explicitly_enabled_connectors.clone())
         .await;
     sess.set_previous_turn_settings(Some(PreviousTurnSettings {
-        model: turn_context.model_info.slug.clone(),
-        comp_hash: turn_context.model_info.comp_hash.clone(),
+        model: turn_context.model_info().slug.clone(),
+        comp_hash: turn_context.model_info().comp_hash.clone(),
         realtime_active: Some(turn_context.realtime_active),
     }))
     .await;
@@ -817,6 +865,7 @@ fn turn_user_input(input: &[TurnInput]) -> Vec<UserInput> {
         .filter_map(|item| match item {
             TurnInput::UserInput { content, .. } => Some(content.as_slice()),
             TurnInput::ResponseItem(_)
+            | TurnInput::FunctionCallOutput(_)
             | TurnInput::InterAgentCommunication(_)
             | TurnInput::AgentCompletion(_) => None,
         })
@@ -1001,7 +1050,8 @@ async fn build_skills_and_plugins(
         &mentioned_skills,
         &injected_host_skills,
         tracking.clone(),
-    );
+    )
+    .await;
 
     for injected_skill in &injected_host_skills {
         let skill = &injected_skill.skill;
@@ -1171,6 +1221,7 @@ async fn track_turn_resolved_config_analytics(
                 .filter_map(|item| match item {
                     TurnInput::UserInput { content, .. } => Some(content.as_slice()),
                     TurnInput::ResponseItem(_)
+                    | TurnInput::FunctionCallOutput(_)
                     | TurnInput::InterAgentCommunication(_)
                     | TurnInput::AgentCompletion(_) => None,
                 })
@@ -1321,7 +1372,7 @@ fn maybe_run_previous_model_inline_compact_after_settings<'a>(
     Box::pin(async move {
         let should_compact_for_comp_hash_change = comp_hash_changed(
             previous_turn_settings.comp_hash.as_deref(),
-            turn_context.model_info.comp_hash.as_deref(),
+            turn_context.model_info().comp_hash.as_deref(),
         );
         let previous_model = previous_turn_settings.model;
         let previous_model_turn_context = Arc::new(
@@ -1365,7 +1416,7 @@ fn maybe_run_previous_model_inline_compact_after_settings<'a>(
             match turn_context.config.model_auto_compact_token_limit_scope {
                 AutoCompactTokenLimitScope::Total => {
                     let new_auto_compact_limit = turn_context
-                        .model_info
+                        .model_info()
                         .auto_compact_token_limit()
                         .unwrap_or(i64::MAX);
                     active_context_tokens > new_auto_compact_limit
@@ -1376,7 +1427,7 @@ fn maybe_run_previous_model_inline_compact_after_settings<'a>(
                 }
             };
         let should_run = previous_model_limit_reached
-            && previous_model_turn_context.model_info.slug != turn_context.model_info.slug
+            && previous_model_turn_context.model_info().slug != turn_context.model_info().slug
             && old_context_window > new_context_window;
         if should_run {
             let step_context = sess
@@ -2541,8 +2592,7 @@ async fn try_run_sampling_request_inner<'a>(
         .instrument(trace_span!("stream_request"))
         .or_cancel(&cancellation_token);
     let mut stream = stream_future.await??;
-    let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
-        FuturesOrdered::new();
+    let mut in_flight: FuturesOrdered<InFlightFuture<'static>> = FuturesOrdered::new();
     let mut needs_follow_up = false;
     let mut last_agent_message: Option<String> = None;
     let mut active_item: Option<TurnItem> = None;

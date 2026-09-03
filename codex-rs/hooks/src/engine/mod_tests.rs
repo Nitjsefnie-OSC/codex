@@ -46,6 +46,7 @@ use super::ConfiguredHandlerKind;
 use super::HandlerSourcePath;
 use super::HookListEntryHandler;
 use crate::BackgroundState;
+use crate::events::interrupt::InterruptRequest;
 use crate::events::pre_tool_use::PreToolUseRequest;
 use crate::events::stop::StopHookTarget;
 use crate::events::stop::StopRequest;

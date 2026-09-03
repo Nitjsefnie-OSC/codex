@@ -17,7 +17,6 @@ use codex_code_mode_protocol::host::HostToClient;
 use codex_code_mode_protocol::host::MAX_PENDING_DELEGATE_CALLS;
 use codex_code_mode_protocol::host::RequestId;
 use codex_code_mode_protocol::host::SessionId;
-use codex_code_mode_protocol::host::TransportLane;
 use codex_code_mode_protocol::host::WireResult;
 use codex_code_mode_protocol::host::WireRuntimeResponse;
 use tokio::sync::Mutex;
@@ -32,7 +31,6 @@ const CELL_MESSAGE_CAPACITY: usize = MAX_PENDING_DELEGATE_CALLS + 1;
 
 pub(super) struct HostPeer {
     outgoing_tx: mpsc::Sender<EncodedFrame>,
-    bulk_tx: Option<mpsc::Sender<EncodedFrame>>,
     pending: Mutex<HashMap<DelegateRequestId, PendingDelegate>>,
     delegate_permits: Arc<Semaphore>,
     receipt_permits: Arc<Semaphore>,
@@ -73,7 +71,6 @@ impl HostPeer {
     pub(super) fn new(outgoing_tx: mpsc::Sender<EncodedFrame>) -> Self {
         Self {
             outgoing_tx,
-            bulk_tx: None,
             pending: Mutex::new(HashMap::new()),
             delegate_permits: Arc::new(Semaphore::new(MAX_PENDING_DELEGATE_CALLS)),
             receipt_permits: Arc::new(Semaphore::new(1)),
@@ -83,11 +80,6 @@ impl HostPeer {
             disconnected: CancellationToken::new(),
             failure: StdMutex::new(None),
         }
-    }
-
-    pub(super) fn with_bulk_sender(mut self, bulk_tx: mpsc::Sender<EncodedFrame>) -> Self {
-        self.bulk_tx = Some(bulk_tx);
-        self
     }
 
     pub(super) async fn respond(
@@ -495,10 +487,6 @@ impl HostPeer {
     ) -> Result<(), PeerSendError> {
         let frame = EncodedFrame::encode(&message)
             .map_err(|err| PeerSendError::Payload(err.to_string()))?;
-        let sender = match message.transport_lane() {
-            TransportLane::Control => &self.outgoing_tx,
-            TransportLane::Bulk => self.bulk_tx.as_ref().unwrap_or(&self.outgoing_tx),
-        };
         tokio::select! {
             biased;
             _ = cancellation.cancelled() => Err(PeerSendError::Unavailable(
@@ -507,7 +495,7 @@ impl HostPeer {
             _ = self.disconnected.cancelled() => Err(PeerSendError::Unavailable(
                 "code-mode client connection closed".to_string(),
             )),
-            result = sender.send(frame) => result.map_err(|_| {
+            result = self.outgoing_tx.send(frame) => result.map_err(|_| {
                 self.disconnect();
                 PeerSendError::Unavailable("code-mode client connection closed".to_string())
             }),

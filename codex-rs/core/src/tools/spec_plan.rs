@@ -1376,7 +1376,7 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
                 context.default_agent_type_description,
                 crate::agent::role::spawn_tool_spec::ModelOverrideExposure::Exposed,
             );
-            let exposure = if search_tool_enabled(turn_context) {
+            let exposure = if search_tool_enabled(turn_context, turn_context.model_info()) {
                 ToolExposure::Deferred
             } else {
                 ToolExposure::Direct

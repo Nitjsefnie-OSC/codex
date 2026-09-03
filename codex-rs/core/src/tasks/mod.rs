@@ -28,6 +28,7 @@ use tracing::warn;
 use crate::codex_thread::BackgroundTerminalInfo;
 use crate::config::Config;
 use crate::context::ContextualUserFragment;
+use crate::hook_runtime::run_turn_interrupt_hooks;
 use crate::session::PendingInputBatch;
 use crate::session::PendingTurnProvenance;
 use crate::session::TurnInput;
@@ -77,6 +78,11 @@ pub(crate) use user_shell::execute_user_shell_command;
 pub(crate) const GRACEFULL_INTERRUPTION_TIMEOUT_MS: u64 = 100;
 const TASK_COMPACT_METRIC: &str = "codex.task.compact";
 static ACTIVE_TURNS: Gauge = Gauge::new("core.turns.active");
+
+pub(crate) enum MailboxParentProvenance {
+    Ignore,
+    Attribute,
+}
 
 pub(crate) type SessionTaskResult = CodexResult<Option<String>>;
 
@@ -297,7 +303,8 @@ impl Session {
         let _turn_start_guard = self.input_queue.lock_turn_start().await;
         self.abort_all_tasks(TurnAbortReason::Replaced).await;
         self.clear_connector_selection().await;
-        self.start_task(turn_context, input, task).await;
+        self.start_task(turn_context, input, task, MailboxParentProvenance::Ignore)
+            .await;
     }
 
     pub(crate) fn start_task<T: SessionTask>(
@@ -616,12 +623,19 @@ impl Session {
         {
             return;
         }
-        if self.active_turn.lock().await.is_some() {
-            return;
-        }
+        let turn_state = {
+            let mut active_turn = self.active_turn.lock().await;
+            if active_turn.is_some() {
+                return;
+            }
+            let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
+            Arc::clone(&active_turn.turn_state)
+        };
 
-        let (input, mut start_options) =
-            self.input_queue.get_pending_input(&self.active_turn).await;
+        let mailbox = self.input_queue.drain_mailbox_inputs().await;
+        let input = mailbox.items;
+        let provenance = mailbox.provenance;
+        let mut start_options = mailbox.start_options;
         if !input.iter().any(
             |item| matches!(item, TurnInput::InterAgentCommunication(mail) if mail.trigger_turn),
         ) {
@@ -661,9 +675,10 @@ impl Session {
         }
         self.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
             .await;
-        if self.active_turn.lock().await.is_some() {
-            return;
-        }
+        // Task completion must still save this mail if pre-turn compaction fails.
+        self.input_queue
+            .extend_pending_input_batch_for_turn_state(turn_state.as_ref(), input, provenance)
+            .await;
         self.start_task(
             turn_context,
             Vec::new(),
@@ -1164,10 +1179,13 @@ impl Session {
             && (has_user_input || background_successor_allowed)
         {
             let next_turn_context = self
-                .new_default_turn_with_sub_id(uuid::Uuid::new_v4().to_string())
+                .new_turn_with_default_settings(
+                    uuid::Uuid::new_v4().to_string(),
+                    Default::default(),
+                )
                 .await;
             if !has_user_input
-                && next_turn_context.mode == codex_protocol::config_types::ModeKind::Plan
+                && next_turn_context.mode() == codex_protocol::config_types::ModeKind::Plan
             {
                 let (pending_input, pending_parent_turn) = self
                     .input_queue
