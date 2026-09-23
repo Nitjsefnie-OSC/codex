@@ -219,6 +219,7 @@ impl ChatWidget {
             #[cfg(test)]
             pet_image_support_override: None,
             thread_id: None,
+            dismissed_plan_mode_nudge_scopes: HashSet::new(),
             thread_name: None,
             thread_rename_block_message: None,
             active_side_conversation: false,
@@ -289,6 +290,7 @@ impl ChatWidget {
         } else {
             widget.bottom_pane.set_vim_enabled(/*enabled*/ false);
         }
+        widget.sync_prompt_suggestions_enabled();
         widget
             .bottom_pane
             .set_status_line_enabled(!widget.configured_status_line_items().is_empty());

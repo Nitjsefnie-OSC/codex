@@ -45,6 +45,9 @@ impl CodeModeSessionDelegate for RemoteDelegate {
                 DelegateResponse::NotificationDelivered => {
                     Err("code-mode client returned an invalid tool result".to_string())
                 }
+                DelegateResponse::ToolResultDeliveryRecorded => {
+                    Err("code-mode client returned an invalid tool result".to_string())
+                }
             }
         })
     }
@@ -73,6 +76,34 @@ impl CodeModeSessionDelegate for RemoteDelegate {
                 DelegateResponse::NotificationDelivered => Ok(()),
                 DelegateResponse::ToolResult { .. } => {
                     Err("code-mode client returned an invalid notification result".to_string())
+                }
+                DelegateResponse::ToolResultDeliveryRecorded => {
+                    Err("code-mode client returned an invalid notification result".to_string())
+                }
+            }
+        })
+    }
+
+    fn tool_result_delivered<'a>(
+        &'a self,
+        cell_id: CellId,
+        runtime_tool_call_id: String,
+        delivered: bool,
+    ) -> NotificationFuture<'a> {
+        Box::pin(async move {
+            match self
+                .peer
+                .call_tool_result_delivered(
+                    self.session_id.clone(),
+                    cell_id,
+                    runtime_tool_call_id,
+                    delivered,
+                )
+                .await?
+            {
+                DelegateResponse::ToolResultDeliveryRecorded => Ok(()),
+                DelegateResponse::ToolResult { .. } | DelegateResponse::NotificationDelivered => {
+                    Err("code-mode client returned an invalid delivery receipt result".to_string())
                 }
             }
         })

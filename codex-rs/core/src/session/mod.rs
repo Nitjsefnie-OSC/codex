@@ -270,7 +270,10 @@ pub(crate) use self::environment::ThreadEnvironmentDefaults;
 #[cfg(test)]
 use self::handlers::submission_dispatch_span;
 use self::handlers::submission_loop;
+pub(crate) use self::input_queue::InputQueue;
 pub(crate) use self::input_queue::InputQueueActivity;
+pub(crate) use self::input_queue::PendingInputBatch;
+pub(crate) use self::input_queue::PendingTurnProvenance;
 pub(crate) use self::input_queue::TurnInput;
 pub(crate) use self::input_queue::TurnInputQueue;
 use self::review::spawn_review_thread;
@@ -3660,14 +3663,38 @@ impl Session {
                     metadata: image,
                 });
         }
+        let function_call_outputs = response_items
+            .iter()
+            .filter_map(|item| match item {
+                ResponseItem::FunctionCallOutput {
+                    call_id, output, ..
+                } => {
+                    let call_id = call_id.as_ref()?;
+                    output
+                        .text_content()
+                        .map(|output| (call_id.clone(), output.to_string()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         let rollout_items: Vec<RolloutItem> =
             items.into_iter().map(RolloutItem::ResponseItem).collect();
-        if self.persist_rollout_items(&rollout_items).await
-            && let Some(revision) = mcp_revision
-        {
-            self.services
-                .executed_tool_calls
-                .mark_mcp_attribution_persisted(revision);
+        if function_call_outputs.is_empty() {
+            if self.persist_rollout_items(&rollout_items).await
+                && let Some(revision) = mcp_revision
+            {
+                self.services
+                    .executed_tool_calls
+                    .mark_mcp_attribution_persisted(revision);
+            }
+        } else {
+            let decision = self
+                .services
+                .unified_exec_manager
+                .prepare_initial_exec_command_output_persistence(&function_call_outputs)
+                .await;
+            self.persist_rollout_items_with_exec_decision(rollout_items, decision)
+                .await;
         }
         if turn_context.config.memories.disable_on_external_context
             && let Some(item) = response_items
@@ -3943,6 +3970,9 @@ impl Session {
             token_budget,
             session_telemetry,
             turn: turn_context,
+            response_identity: Arc::new(
+                crate::session::step_context::ResponseIdentityState::default(),
+            ),
             environments,
             selected_capability_roots,
             executor_capability_discovery,
@@ -4093,6 +4123,11 @@ impl Session {
         let mut world_state_item = None;
         let compacted_item = {
             let mut state = self.state.lock().await;
+            // Fork: reset monitor notification budgets for the new history window.
+            self.services
+                .unified_exec_manager
+                .begin_notification_window()
+                .await;
             state.replace_annotated_history(
                 items,
                 reference_context_item.clone(),
@@ -4128,7 +4163,6 @@ impl Session {
                 }),
             }
         };
-
         let mut rollout_items = vec![RolloutItem::Compacted(compacted_item)];
         // Persist the baseline after the replacement history that established it.
         if let Some(world_state_item) = world_state_item {
@@ -4154,6 +4188,26 @@ impl Session {
         }
     }
 
+    async fn persist_rollout_items_with_exec_decision(
+        &self,
+        rollout_items: Vec<RolloutItem>,
+        decision: crate::unified_exec::InitialExecOutputPersistenceDecision,
+    ) {
+        let Some(live_thread) = self.live_thread().cloned() else {
+            decision.commit();
+            return;
+        };
+        let persistence = tokio::spawn(async move {
+            live_thread
+                .append_items_with_post_commit(&rollout_items, || decision.commit())
+                .await
+        });
+        match persistence.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => error!("failed to record rollout items: {error:#}"),
+            Err(error) => error!("rollout persistence task failed: {error}"),
+        }
+    }
     pub fn enabled(&self, feature: Feature) -> bool {
         self.features.enabled(feature)
     }

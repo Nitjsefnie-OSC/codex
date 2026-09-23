@@ -2,7 +2,8 @@ use super::residency::is_v2_resident_session_source;
 use super::spawn_guard::PendingSpawn;
 use super::*;
 use crate::agent::child_config::build_agent_resume_config;
-use crate::agent::role::apply_role_to_config;
+use crate::agent::role::AgentRoleOverrideMask;
+use crate::agent::role::apply_role_to_config_with_mask;
 use crate::agent::types::AgentMetadata;
 use crate::agent::types::LiveAgent;
 use crate::agent::types::SpawnAgentForkMode;
@@ -307,11 +308,61 @@ impl LocalAgentControl {
         )))
     }
 
+    pub(crate) async fn spawn_agent_with_communication(
+        &self,
+        config: Config,
+        communication: InterAgentCommunication,
+        context: AgentCommunicationContext,
+        session_source: Option<SessionSource>,
+        options: SpawnAgentOptions,
+    ) -> CodexResult<(LiveAgent, ThreadConfigSnapshot)> {
+        self.spawn_agent_internal(
+            config,
+            SpawnInitialInput::InterAgentCommunication(communication, context),
+            session_source,
+            options,
+        )
+        .await
+    }
+
     /// A provided parent enables owner-validated reloads; `None` preserves sender-driven reloads.
     pub(crate) async fn ensure_v2_agent_loaded(
         &self,
+        config: Config,
+        thread_id: ThreadId,
+        parent: Option<Arc<CodexThread>>,
+    ) -> CodexResult<()> {
+        self.ensure_v2_agent_loaded_with_admission(
+            config,
+            thread_id,
+            V2ReloadAdmission::CapacityBounded,
+            parent,
+        )
+        .await
+    }
+
+    #[expect(
+        dead_code,
+        reason = "completion-path reload without residency reservation is retained for the fork's idle-wake contract"
+    )]
+    pub(crate) fn ensure_v2_agent_loaded_for_completion(
+        &self,
+        config: Config,
+        thread_id: ThreadId,
+    ) -> BoxFuture<'_, CodexResult<()>> {
+        Box::pin(self.ensure_v2_agent_loaded_with_admission(
+            config,
+            thread_id,
+            V2ReloadAdmission::CompletionDelivery,
+            /*parent*/ None,
+        ))
+    }
+
+    async fn ensure_v2_agent_loaded_with_admission(
+        &self,
         mut config: Config,
         thread_id: ThreadId,
+        admission: V2ReloadAdmission,
         parent: Option<Arc<CodexThread>>,
     ) -> CodexResult<()> {
         let state = self.runtime.upgrade()?;
@@ -356,8 +407,8 @@ impl LocalAgentControl {
             })
             .await?;
         let stored_model = stored_thread.model.clone();
-        let stored_model_provider = stored_thread.model_provider.clone();
         let stored_reasoning_effort = stored_thread.reasoning_effort.clone();
+        let stored_model_provider = stored_thread.model_provider.clone();
         let stored_source = stored_thread.source.clone();
         let stored_parent_thread_id = stored_thread.parent_thread_id;
         let history = load_agent_model_context(&state, thread_id, stored_thread.history_mode)
@@ -406,7 +457,7 @@ impl LocalAgentControl {
         } else {
             None
         };
-        config.model_reasoning_effort = stored_reasoning_effort;
+        config.model_reasoning_effort = stored_reasoning_effort.clone();
         if let Some(role_name) = session_source.get_agent_role() {
             let runtime_approval_policy = config.permissions.approval_policy.value();
             let runtime_approvals_reviewer = config.approvals_reviewer;
@@ -424,9 +475,16 @@ impl LocalAgentControl {
                 ),
             };
 
-            apply_role_to_config(&mut config, Some(&role_name))
-                .await
-                .map_err(CodexErr::InvalidRequest)?;
+            let mut stored_identity_mask = AgentRoleOverrideMask::default();
+            stored_identity_mask.preserve_model();
+            stored_identity_mask.preserve_reasoning_effort();
+            apply_role_to_config_with_mask(
+                &mut config,
+                Some(role_name.as_str()),
+                stored_identity_mask,
+            )
+            .await
+            .map_err(CodexErr::InvalidRequest)?;
             config
                 .permissions
                 .approval_policy
@@ -447,6 +505,7 @@ impl LocalAgentControl {
         if let Some(model) = stored_model {
             config.model = Some(model);
         }
+        config.model_reasoning_effort = stored_reasoning_effort;
         if config.model_provider_id != stored_model_provider {
             config.model_provider = config
                 .model_providers
@@ -496,8 +555,7 @@ impl LocalAgentControl {
                     let owner_config = owner_environment.config();
                     let child_config = match &selection.config {
                         EnvironmentConfigState::FromThread => {
-                            // Pin current owner authority instead of re-inferring child settings.
-                            selection.config = EnvironmentConfigState::Ready(owner_config.clone());
+                            // Pin current owner authority instead of re-inferring child settings.                            selection.config = EnvironmentConfigState::Ready(owner_config.clone());
                             continue;
                         }
                         EnvironmentConfigState::Ready(config) => config,
@@ -581,11 +639,15 @@ impl LocalAgentControl {
                     ..Default::default()
                 })
         };
-        // Reserving a slot can evict an idle nested parent. Capture its instructions
-        // alongside its authority so the child does not depend on a later live lookup.
-        let residency_slot = self
-            .reserve_v2_residency_slot(&state, &config, Some(thread_id))
-            .await?;
+        // The fork's completion-delivery admission must not reserve a residency
+        // slot: it runs on a child's completion path and must not evict anyone.
+        let residency_slot = match admission {
+            V2ReloadAdmission::CapacityBounded => Some(
+                self.reserve_v2_residency_slot(&state, &config, Some(thread_id))
+                    .await?,
+            ),
+            V2ReloadAdmission::CompletionDelivery => None,
+        };
 
         match state
             .resume_thread_with_history_with_source(ResumeThreadWithHistoryOptions {
@@ -607,7 +669,12 @@ impl LocalAgentControl {
                     self.validate_loaded_v2_child(&reloaded_thread.thread, parent_thread_id)?;
                 }
                 self.runtime.registry.clear_evicted_environments(thread_id);
-                residency_slot.commit(reloaded_thread.thread_id);
+                if let Some(residency_slot) = residency_slot {
+                    residency_slot.commit(reloaded_thread.thread_id);
+                } else {
+                    self.touch_loaded_v2_residency(&state, reloaded_thread.thread_id)
+                        .await;
+                }
                 state.notify_thread_created(reloaded_thread.thread_id);
                 Ok(())
             }

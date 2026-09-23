@@ -67,6 +67,12 @@ async fn handle_spawn_agent(
         .as_deref()
         .map(str::trim)
         .filter(|role| !role.is_empty());
+    let inherited_role_name = turn.session_source.get_agent_role();
+    let child_role_name = if args.fork_context {
+        inherited_role_name.as_deref()
+    } else {
+        role_name
+    };
     let input_items = parse_collab_input(args.message, args.items)?;
     let prompt = render_input_preview(&input_items);
     let session_source = turn.session_source.clone();
@@ -77,6 +83,64 @@ async fn handle_spawn_agent(
             "Agent depth limit reached. Solve the task yourself.".to_string(),
         ));
     }
+    let mut config =
+        build_agent_spawn_config(&session.get_base_instructions().await, turn.as_ref())?;
+    if let Some(service_tier) = args.service_tier.as_ref() {
+        config.service_tier = Some(service_tier.clone());
+    }
+    let (identity_selection, applied_role) = if args.fork_context {
+        reject_full_fork_identity_overrides(
+            role_name,
+            args.model.as_deref(),
+            args.reasoning_effort.as_ref(),
+        )?;
+        (SpawnAgentIdentitySelection::default(), Default::default())
+    } else {
+        let identity_selection = prepare_spawn_agent_identity_selection(
+            turn.as_ref(),
+            &mut config,
+            args.model.as_deref(),
+            args.reasoning_effort.clone(),
+        );
+        let applied_role = apply_spawn_agent_role(
+            &mut config,
+            role_name,
+            identity_selection.role_override_mask(),
+        )
+        .await?;
+        (identity_selection, applied_role)
+    };
+    let should_validate_identity = identity_selection.selects_identity()
+        || applied_role.model
+        || applied_role.reasoning_effort;
+    apply_explicit_spawn_agent_identity_selection(
+        &session,
+        turn.as_ref(),
+        &mut config,
+        identity_selection,
+        applied_role,
+    )
+    .await?;
+    if should_validate_identity {
+        validate_spawn_agent_model_reasoning_effort(&session, &config).await?;
+    }
+    let root_service_tier = session.services.agent_control.root_service_tier();
+    apply_spawn_agent_service_tier(
+        &session,
+        &mut config,
+        root_service_tier.as_deref(),
+        args.service_tier.as_deref(),
+    )
+    .await?;
+    apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
+
+    let spawn_source = thread_spawn_source(
+        session.thread_id,
+        &turn.session_source,
+        child_depth,
+        child_role_name,
+        /*task_name*/ None,
+    )?;
     session
         .emit_turn_item_started(
             turn,
@@ -209,6 +273,7 @@ struct SpawnAgentArgs {
     agent_type: Option<String>,
     model: Option<String>,
     reasoning_effort: Option<ReasoningEffort>,
+    service_tier: Option<String>,
     #[serde(default)]
     fork_context: bool,
 }

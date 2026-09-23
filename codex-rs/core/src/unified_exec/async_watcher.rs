@@ -7,11 +7,14 @@ use tokio::time::Duration;
 use tokio::time::Instant;
 use tokio::time::Sleep;
 
+use super::InitialExecCommandState;
 use super::SharedPluginMetricsSidecar;
 use super::UnifiedExecContext;
 use super::process::OutputHandles;
 use super::process::UnifiedExecProcess;
 use super::take_plugin_metrics_sidecar;
+use crate::context::ExecCommandCompletion;
+use crate::context::ExecCommandCompletionNotification;
 use crate::exec::MAX_EXEC_OUTPUT_DELTAS_PER_CALL;
 use crate::plugins::metrics::finish_and_track_measurements;
 use crate::session::session::Session;
@@ -32,6 +35,23 @@ use codex_protocol::protocol::ExecOutputStream;
 use codex_utils_path_uri::PathUri;
 
 pub(crate) const TRAILING_OUTPUT_GRACE: Duration = Duration::from_millis(100);
+
+pub(crate) struct YieldedExecCompletionContext {
+    initial_exec_command_state: Arc<InitialExecCommandState>,
+    command: String,
+}
+
+impl YieldedExecCompletionContext {
+    pub(crate) fn new(
+        initial_exec_command_state: Arc<InitialExecCommandState>,
+        command: String,
+    ) -> Self {
+        Self {
+            initial_exec_command_state,
+            command,
+        }
+    }
+}
 
 /// Upper bound for a single ExecCommandOutputDelta chunk emitted by unified exec.
 ///
@@ -168,13 +188,15 @@ pub(crate) fn spawn_exit_watcher(
     context: &UnifiedExecContext,
     command: Vec<String>,
     cwd: PathUri,
+    source: ExecCommandSource,
     process_id: i32,
     plugin_attribution: Option<PluginCommandAttribution>,
     transcript: Arc<Mutex<HeadTailBuffer>>,
     started_at: Instant,
     network_denial_monitor: Option<tokio::task::JoinHandle<()>>,
     plugin_metrics_sidecar: Option<SharedPluginMetricsSidecar>,
-) {
+    completion_notification: Option<YieldedExecCompletionContext>,
+) -> tokio::task::JoinHandle<()> {
     let session_ref = Arc::clone(&context.session);
     let turn_ref = Arc::clone(&context.step_context.turn);
     let model_info = Arc::clone(&context.step_context.settings.model_info);
@@ -199,24 +221,26 @@ pub(crate) fn spawn_exit_watcher(
         let plugin_metrics_sidecar = plugin_metrics_sidecar
             .as_ref()
             .and_then(take_plugin_metrics_sidecar);
-        if let Some(message) = process.failure_message() {
+        let completion = if let Some(message) = process.failure_message() {
             drop(plugin_metrics_sidecar);
             emit_failed_exec_end_for_unified_exec(
                 process.sandbox_type(),
-                session_ref,
-                turn_ref,
+                Arc::clone(&session_ref),
+                Arc::clone(&turn_ref),
                 model_info,
                 call_id,
                 command,
                 cwd,
+                source,
                 Some(process_id.to_string()),
                 plugin_attribution,
                 transcript,
                 String::new(),
-                message,
+                message.clone(),
                 duration,
             )
             .await;
+            ExecCommandCompletion::Failed { message }
         } else {
             let exit_code = process.exit_code().unwrap_or(-1);
             let timed_out = process.timed_out();
@@ -231,12 +255,13 @@ pub(crate) fn spawn_exit_watcher(
             .await;
             emit_exec_end_for_unified_exec(
                 process.sandbox_type(),
-                session_ref,
-                turn_ref,
+                Arc::clone(&session_ref),
+                Arc::clone(&turn_ref),
                 model_info,
                 call_id,
                 command,
                 cwd,
+                source,
                 Some(process_id.to_string()),
                 plugin_attribution,
                 transcript,
@@ -246,8 +271,28 @@ pub(crate) fn spawn_exit_watcher(
                 timed_out,
             )
             .await;
+            ExecCommandCompletion::Exited { exit_code }
+        };
+
+        if let Some(completion_notification) = completion_notification
+            && let Some(output_may_be_available) = completion_notification
+                .initial_exec_command_state
+                .claim_terminal_notification()
+                .await
+        {
+            session_ref
+                .deliver_exec_command_completion_notification(
+                    ExecCommandCompletionNotification {
+                        session_id: process_id,
+                        command: completion_notification.command,
+                        completion,
+                        output_may_be_available,
+                    },
+                    turn_ref.as_ref(),
+                )
+                .await;
         }
-    });
+    })
 }
 
 impl<const MAX_BYTES: usize> Buffer<MAX_BYTES> {
@@ -351,6 +396,7 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
     call_id: String,
     command: Vec<String>,
     cwd: PathUri,
+    source: ExecCommandSource,
     process_id: Option<String>,
     plugin_attribution: Option<PluginCommandAttribution>,
     transcript: Arc<Mutex<HeadTailBuffer>>,
@@ -403,6 +449,7 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
     call_id: String,
     command: Vec<String>,
     cwd: PathUri,
+    source: ExecCommandSource,
     process_id: Option<String>,
     plugin_attribution: Option<PluginCommandAttribution>,
     transcript: Arc<Mutex<HeadTailBuffer>>,

@@ -1,14 +1,29 @@
+use crate::agent::child_config::MAX_SPAWN_AGENT_MODEL_OVERRIDES;
+use crate::agent::child_config::model_supports_multi_agent_backend;
+use crate::agent::model_reasoning::validate_model_reasoning_effort;
+use crate::agent::role::AgentRoleOverrideMask;
+use crate::agent::role::AppliedAgentRoleOverrides;
+use crate::agent::role::apply_role_to_config_with_mask;
+use crate::config::Config;
 use crate::config::DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS;
 use crate::config::HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS;
 use crate::function_tool::FunctionCallError;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
+use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
+use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ResponseInputItem;
+use codex_protocol::openai_models::ModelPreset;
+use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::openai_models::ReasoningEffortPreset;
+use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::user_input::UserInput;
@@ -154,4 +169,315 @@ pub(crate) fn parse_collab_input(
             Ok(items)
         }
     }
+}
+
+/// Builds the base config snapshot for a newly spawned sub-agent.
+///
+/// The returned config starts from the parent's effective config and then refreshes the
+/// runtime-owned fields carried by the turn, including model selection, reasoning settings,
+/// approval policy, sandbox, and cwd. Role-specific overrides are layered
+/// after this step; skipping this helper and cloning stale config state directly can send the child
+/// agent out with the wrong provider or runtime policy.
+pub(crate) fn build_agent_spawn_config(
+    base_instructions: &BaseInstructions,
+    turn: &TurnContext,
+) -> Result<Config, FunctionCallError> {
+    let mut config = build_agent_shared_config(turn)?;
+    config.base_instructions = Some(base_instructions.text.clone());
+    config.base_instructions_provenance = base_instructions.provenance.clone();
+    Ok(config)
+}
+
+pub(crate) fn build_agent_resume_config(turn: &TurnContext) -> Result<Config, FunctionCallError> {
+    let mut config = build_agent_shared_config(turn)?;
+    // For resume, keep base instructions sourced from rollout/session metadata.
+    config.base_instructions = None;
+    config.base_instructions_provenance = None;
+    Ok(config)
+}
+
+fn build_agent_shared_config(turn: &TurnContext) -> Result<Config, FunctionCallError> {
+    let base_config = turn.config.clone();
+    let mut config = (*base_config).clone();
+    config.model = Some(turn.model_info().slug.clone());
+    config.model_provider = turn.provider.info().clone();
+    config.model_reasoning_effort = turn
+        .reasoning_effort()
+        .or(turn.model_info().default_reasoning_level.as_ref())
+        .cloned();
+    config.model_reasoning_summary = Some(turn.reasoning_summary());
+    config.developer_instructions = turn.developer_instructions.clone();
+    if turn.multi_agent_version == MultiAgentVersion::V2
+        && let Some(developer_instructions) = turn
+            .config
+            .multi_agent_v2
+            .subagent_developer_instructions
+            .clone()
+    {
+        config.developer_instructions = Some(developer_instructions);
+    }
+    apply_spawn_agent_runtime_overrides(&mut config, turn)?;
+
+    Ok(config)
+}
+
+pub(crate) fn reject_full_fork_identity_overrides(
+    agent_type: Option<&str>,
+    model: Option<&str>,
+    reasoning_effort: Option<&ReasoningEffort>,
+) -> Result<(), FunctionCallError> {
+    let field = if agent_type.is_some() {
+        "agent_type"
+    } else if model.is_some() {
+        "model"
+    } else if reasoning_effort.is_some() {
+        "reasoning_effort"
+    } else {
+        return Ok(());
+    };
+    Err(FunctionCallError::RespondToModel(format!(
+        "Full-history forked agents inherit the parent role, model, and reasoning effort; omit {field}, or spawn without a full-history fork."
+    )))
+}
+
+/// Copies runtime-only turn state onto a child config before it is handed to `AgentControl`.
+///
+/// These values are chosen by the live turn rather than persisted config, so leaving them stale can
+/// make a child agent disagree with its parent about approval policy, cwd, or sandboxing.
+pub(crate) fn apply_spawn_agent_runtime_overrides(
+    config: &mut Config,
+    turn: &TurnContext,
+) -> Result<(), FunctionCallError> {
+    config
+        .permissions
+        .approval_policy
+        .set(turn.approval_policy())
+        .map_err(|err| {
+            FunctionCallError::RespondToModel(format!("approval_policy is invalid: {err}"))
+        })?;
+    config.approvals_reviewer = turn.config.approvals_reviewer;
+    #[allow(deprecated)]
+    let turn_cwd = turn.cwd.clone();
+    config.cwd = turn_cwd;
+    config
+        .permissions
+        .set_permission_profile_from_session_snapshot(
+            turn.config
+                .permissions
+                .permission_profile_state()
+                .snapshot(),
+        )
+        .map_err(|err| {
+            FunctionCallError::RespondToModel(format!("permission_profile is invalid: {err}"))
+        })?;
+    Ok(())
+}
+
+#[derive(Default)]
+pub(crate) struct SpawnAgentIdentitySelection {
+    explicit_model: Option<String>,
+    explicit_reasoning_effort: Option<ReasoningEffort>,
+    configured_model: Option<String>,
+    configured_reasoning_effort: Option<ReasoningEffort>,
+}
+
+impl SpawnAgentIdentitySelection {
+    pub(crate) fn selects_identity(&self) -> bool {
+        self.explicit_model.is_some()
+            || self.explicit_reasoning_effort.is_some()
+            || self.configured_model.is_some()
+            || self.configured_reasoning_effort.is_some()
+    }
+
+    pub(crate) fn role_override_mask(&self) -> AgentRoleOverrideMask {
+        let mut override_mask = AgentRoleOverrideMask::default();
+        if self.explicit_model.is_some() {
+            override_mask.preserve_model();
+        }
+        if self.explicit_reasoning_effort.is_some() {
+            override_mask.preserve_reasoning_effort();
+        }
+        override_mask
+    }
+}
+
+pub(crate) fn prepare_spawn_agent_identity_selection(
+    turn: &TurnContext,
+    config: &mut Config,
+    requested_model: Option<&str>,
+    requested_reasoning_effort: Option<ReasoningEffort>,
+) -> SpawnAgentIdentitySelection {
+    let configured_model = turn.config.agent_default_subagent_model.clone();
+    let configured_reasoning_effort = turn.config.agent_default_subagent_reasoning_effort.clone();
+    if let Some(model) = configured_model.as_ref() {
+        config.model = Some(model.clone());
+    }
+    if let Some(reasoning_effort) = configured_reasoning_effort.as_ref() {
+        config.model_reasoning_effort = Some(reasoning_effort.clone());
+    }
+    SpawnAgentIdentitySelection {
+        explicit_model: requested_model.map(str::to_string),
+        explicit_reasoning_effort: requested_reasoning_effort,
+        configured_model,
+        configured_reasoning_effort,
+    }
+}
+
+pub(crate) async fn apply_explicit_spawn_agent_identity_selection(
+    session: &Session,
+    turn: &TurnContext,
+    config: &mut Config,
+    selection: SpawnAgentIdentitySelection,
+    applied_role: AppliedAgentRoleOverrides,
+) -> Result<(), FunctionCallError> {
+    if let Some(model) = selection.explicit_model.as_ref() {
+        config.model = Some(model.clone());
+    }
+    if let Some(reasoning_effort) = selection.explicit_reasoning_effort.as_ref() {
+        config.model_reasoning_effort = Some(reasoning_effort.clone());
+    }
+
+    let strict_model_selection = selection.explicit_model.is_some()
+        || (!applied_role.model && selection.configured_model.is_some());
+    let selected_model_name = if strict_model_selection {
+        let requested_model = config.model.as_deref().ok_or_else(|| {
+            FunctionCallError::RespondToModel(
+                "spawn_agent could not resolve the requested child model".to_string(),
+            )
+        })?;
+        let available_models = session
+            .services
+            .models_manager
+            .list_models(RefreshStrategy::Offline, config.http_client_factory())
+            .await;
+        let selected_model_name = find_spawn_agent_model_name(
+            &available_models,
+            requested_model,
+            turn.multi_agent_version,
+        )?;
+        config.model = Some(selected_model_name.clone());
+        Some(selected_model_name)
+    } else if applied_role.model {
+        config.model.clone()
+    } else {
+        None
+    };
+
+    let effort_selected_by_higher_precedence_source = selection.explicit_reasoning_effort.is_some()
+        || applied_role.reasoning_effort
+        || selection.configured_reasoning_effort.is_some();
+    if let Some(selected_model_name) = selected_model_name
+        && !effort_selected_by_higher_precedence_source
+    {
+        let selected_model_info = session
+            .services
+            .models_manager
+            .get_model_info(&selected_model_name, &config.to_models_manager_config())
+            .await;
+        if let Some(default_reasoning_level) = selected_model_info.default_reasoning_level {
+            config.model_reasoning_effort = Some(default_reasoning_level);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn apply_spawn_agent_service_tier(
+    session: &Session,
+    config: &mut Config,
+    parent_service_tier: Option<&str>,
+    requested_service_tier: Option<&str>,
+) -> Result<(), FunctionCallError> {
+    let candidate_service_tiers = [
+        config.service_tier.clone(),
+        requested_service_tier.map(str::to_string),
+        parent_service_tier.map(str::to_string),
+    ];
+    if candidate_service_tiers.iter().all(Option::is_none) {
+        config.service_tier = None;
+        return Ok(());
+    }
+
+    let model = config.model.clone().ok_or_else(|| {
+        FunctionCallError::RespondToModel(
+            "spawn_agent could not resolve the child model for service tier validation".to_string(),
+        )
+    })?;
+    let model_info = session
+        .services
+        .models_manager
+        .get_model_info(model.as_str(), &config.to_models_manager_config())
+        .await;
+
+    if let Some(requested_service_tier) = requested_service_tier
+        && !model_info.supports_service_tier(requested_service_tier)
+    {
+        let supported_service_tiers = if model_info.service_tiers.is_empty() {
+            "none".to_string()
+        } else {
+            model_info
+                .service_tiers
+                .iter()
+                .map(|tier| tier.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        return Err(FunctionCallError::RespondToModel(format!(
+            "Service tier `{requested_service_tier}` is not supported for model `{model}`. Supported service tiers: {supported_service_tiers}"
+        )));
+    }
+
+    config.service_tier =
+        candidate_service_tiers
+            .into_iter()
+            .flatten()
+            .find(|candidate_service_tier| {
+                model_info.supports_service_tier(candidate_service_tier.as_str())
+            });
+    Ok(())
+}
+
+pub(crate) async fn apply_spawn_agent_role(
+    config: &mut Config,
+    role_name: Option<&str>,
+    override_mask: AgentRoleOverrideMask,
+) -> Result<AppliedAgentRoleOverrides, FunctionCallError> {
+    apply_role_to_config_with_mask(config, role_name, override_mask)
+        .await
+        .map_err(FunctionCallError::RespondToModel)
+}
+
+pub(crate) async fn validate_spawn_agent_model_reasoning_effort(
+    session: &Session,
+    config: &Config,
+) -> Result<(), FunctionCallError> {
+    validate_model_reasoning_effort(config, &session.services.models_manager)
+        .await
+        .map_err(FunctionCallError::RespondToModel)
+}
+
+fn find_spawn_agent_model_name(
+    available_models: &[ModelPreset],
+    requested_model: &str,
+    multi_agent_version: MultiAgentVersion,
+) -> Result<String, FunctionCallError> {
+    available_models
+        .iter()
+        .find(|model| {
+            model.model == requested_model
+                && model_supports_multi_agent_backend(model, multi_agent_version)
+        })
+        .map(|model| model.model.clone())
+        .ok_or_else(|| {
+            let available = available_models
+                .iter()
+                .filter(|model| model.show_in_picker)
+                .filter(|model| model_supports_multi_agent_backend(model, multi_agent_version))
+                .take(MAX_SPAWN_AGENT_MODEL_OVERRIDES)
+                .map(|model| model.model.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            FunctionCallError::RespondToModel(format!(
+                "Unknown model `{requested_model}` for spawn_agent. Available models: {available}"
+            ))
+        })
 }

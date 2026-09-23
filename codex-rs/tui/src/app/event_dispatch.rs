@@ -2726,6 +2726,10 @@ impl App {
             AppEvent::OpenAgentPicker => {
                 self.open_agent_picker(app_server).await;
             }
+            AppEvent::OpenProcessList => {
+                self.refresh_process_list_agent_liveness(app_server).await;
+                self.add_process_list_output();
+            }
             AppEvent::AgentPickerThreadsLoaded {
                 primary_thread_id,
                 request_id,

@@ -11,7 +11,6 @@ use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::config::Config;
 use crate::config::RolloutBudgetConfig;
-use crate::context::SubagentNotification;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::session::emit_subagent_session_started;
 use crate::session_prefix::format_inter_agent_completion_message;
@@ -51,6 +50,8 @@ use codex_protocol::user_input::UserInput;
 use codex_thread_store::LoadThreadHistoryParams;
 use codex_thread_store::ReadThreadParams;
 use futures::StreamExt;
+use futures::future::BoxFuture;
+use serde::Serialize;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Weak;
@@ -84,6 +85,17 @@ mod watch;
 /// Per-session controller handle for a local agent tree.
 /// Handles retain a session identity and share their tree's `LocalAgentRuntime`.
 /// Local startup preserves that state when creating or resuming children.
+#[derive(Clone, Copy)]
+enum V2ReloadAdmission {
+    CapacityBounded,
+    CompletionDelivery,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct ListedAgent {
+    pub(crate) agent_name: String,
+    pub(crate) agent_status: AgentStatus,
+}
 #[derive(Clone)]
 pub(crate) struct LocalAgentControl {
     /// session_id is equal to the root thread's ID.
@@ -102,6 +114,17 @@ impl Default for LocalAgentControl {
 }
 
 impl LocalAgentControl {
+    pub(crate) async fn has_live_descendants(&self, parent_thread_id: ThreadId) -> bool {
+        let Ok(state) = self.runtime.upgrade() else {
+            return true;
+        };
+        state
+            .list_live_thread_spawn_edges()
+            .await
+            .into_iter()
+            .any(|(parent, _)| parent == parent_thread_id)
+    }
+
     /// Construct a new `LocalAgentControl` that can spawn/message agents via the given manager state.
     pub(crate) fn new(
         manager: Weak<ThreadManagerState>,
@@ -178,6 +201,7 @@ impl LocalAgentControl {
         .await
     }
 
+    /// Emits SubAgentActivity lifecycle items to the initiating thread.
     pub(crate) async fn emit_sub_agent_activity(
         &self,
         thread_id: ThreadId,
@@ -479,20 +503,31 @@ impl LocalAgentControl {
                 else {
                     return;
                 };
+                let child_agent_path = crate::session_prefix::completion_agent_identity(
+                    &child_agent_path,
+                    child_thread_id,
+                );
+                let parent_agent_path = crate::session_prefix::completion_agent_identity(
+                    &parent_agent_path,
+                    parent_thread_id,
+                );
+                let completion_turn_id = child_thread_id.to_string();
                 let Some(message) = format_inter_agent_completion_message(
-                    parent_agent_path.clone(),
-                    child_agent_path.clone(),
+                    &parent_agent_path,
+                    &child_agent_path,
                     &status,
+                    Some(&completion_turn_id),
                 ) else {
                     return;
                 };
-                let communication = InterAgentCommunication::new(
-                    child_agent_path,
-                    parent_agent_path,
+                let mut communication = InterAgentCommunication::new(
+                    child_agent_path.model_path,
+                    parent_agent_path.model_path,
                     Vec::new(),
                     message,
                     /*trigger_turn*/ false,
                 );
+                communication.set_turn_id_if_missing(&completion_turn_id);
                 let context =
                     AgentCommunicationContext::new(AgentCommunicationKind::Result, child_thread_id);
                 let _ = control
@@ -500,19 +535,24 @@ impl LocalAgentControl {
                         parent_thread_id,
                         communication,
                         context,
-                        TurnStartOptions::default(),
+                        codex_protocol::turn_input::TurnStartOptions::default(),
                     )
                     .await;
                 return;
             }
-            let Ok(parent_thread) = state.get_thread(parent_thread_id).await else {
-                return;
-            };
-            parent_thread
-                .inject_fragment_without_turn(SubagentNotification::new(
-                    child_reference.as_str(),
-                    status,
-                ))
+            let _ = state
+                .send_op(
+                    parent_thread_id,
+                    Op::SubagentCompletion {
+                        agent_reference: crate::session_prefix::bounded_completion_agent_reference(
+                            &child_reference,
+                        ),
+                        status: crate::session_prefix::bounded_completion_status(&status),
+                        turn_id: child_thread_id.to_string(),
+                    },
+                    /*parent_turn_id*/ None,
+                    /*root_turn_id*/ None,
+                )
                 .await;
         });
     }

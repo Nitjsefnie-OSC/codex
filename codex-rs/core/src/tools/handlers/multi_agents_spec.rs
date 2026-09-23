@@ -14,10 +14,12 @@ use std::collections::BTreeMap;
 pub const MULTI_AGENT_V1_NAMESPACE: &str = "multi_agent_v1";
 const MULTI_AGENT_V1_NAMESPACE_DESCRIPTION: &str = "Tools for spawning and managing sub-agents.";
 
-const SPAWN_AGENT_INHERITED_MODEL_GUIDANCE: &str = "Spawned agents inherit your current model by default. Omit `model` to use that preferred default; set `model` only when an explicit override is needed.";
+const SPAWN_AGENT_INHERITED_MODEL_GUIDANCE: &str = "Non-full-history spawned agents resolve the model from an explicit override, selected role default, configured sub-agent default, then the parent model; reasoning effort resolves from an explicit override, selected role default, configured sub-agent default, selected model default, then parent effort. Full-history forks inherit the parent role, model, and reasoning effort and reject `agent_type`, `model`, and `reasoning_effort` overrides.";
 const SPAWN_AGENT_TYPE_OVERRIDE_DESCRIPTION_V1: &str = "Agent type override for the new agent. Omit to inherit the parent agent type with a full-history fork; otherwise, `default` is used.";
-const SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION: &str =
-    "Model override for the new agent. Omit unless an explicit override is needed.";
+const SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION: &str = "Model override for the new agent. Omit to use the selected role, configured sub-agent default, or parent model.";
+const SPAWN_AGENT_REASONING_EFFORT_OVERRIDE_DESCRIPTION: &str = "Reasoning effort override for the new agent. Omit to use the selected role, configured sub-agent default, selected model default, or parent effort.";
+const SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION: &str =
+    "Service tier override for the new agent. Omit unless explicitly requested.";
 const MAX_REASONING_EFFORT_CHARS_IN_SPAWN_AGENT_DESCRIPTION: usize = 64;
 
 #[derive(Debug, Clone)]
@@ -111,6 +113,9 @@ pub fn create_spawn_agent_tool_v2(
     if !options.expose_agent_type {
         properties.remove("agent_type");
     }
+    if options.hide_agent_type_model_reasoning {
+        properties.remove("service_tier");
+    }
     if !options.expose_spawn_agent_model_overrides {
         properties.remove("model");
         properties.remove("reasoning_effort");
@@ -118,7 +123,7 @@ pub fn create_spawn_agent_tool_v2(
     properties.insert(
         "task_name".to_string(),
         JsonSchema::string(Some(
-            "Task name for the new agent. Use lowercase letters, digits, and underscores."
+            "Task name for the new agent. Use lowercase letters, digits, and underscores; the resulting canonical agent path must not exceed 256 bytes."
                 .to_string(),
         )),
     );
@@ -620,8 +625,13 @@ fn spawn_agent_common_properties_v1(agent_type_description: &str) -> BTreeMap<St
         (
             "reasoning_effort".to_string(),
             JsonSchema::string(Some(
-                "Reasoning effort override for the new agent. Omit to inherit the parent effort."
-                    .to_string(),
+                SPAWN_AGENT_REASONING_EFFORT_OVERRIDE_DESCRIPTION.to_string(),
+            )),
+        ),
+        (
+            "service_tier".to_string(),
+            JsonSchema::string(Some(
+                SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION.to_string(),
             )),
         ),
     ])
@@ -639,7 +649,7 @@ fn spawn_agent_common_properties_v2(agent_type_description: &str) -> BTreeMap<St
         (
             "agent_type".to_string(),
             JsonSchema::string(Some(format!(
-                "Agent type override for the new agent. Omit unless explicitly asked. The selected role applies regardless of how much parent history is inherited.\n{agent_type_description}"
+                "Agent type override for the new agent. Applies to non-full-history forks; full-history forks inherit the parent role and reject identity overrides. Omit unless explicitly asked.\n{agent_type_description}"
             ))),
         ),
         (
@@ -658,8 +668,13 @@ fn spawn_agent_common_properties_v2(agent_type_description: &str) -> BTreeMap<St
         (
             "reasoning_effort".to_string(),
             JsonSchema::string(Some(
-                "Reasoning effort override for the new agent. Omit to inherit the parent effort."
-                    .to_string(),
+                SPAWN_AGENT_REASONING_EFFORT_OVERRIDE_DESCRIPTION.to_string(),
+            )),
+        ),
+        (
+            "service_tier".to_string(),
+            JsonSchema::string(Some(
+                SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION.to_string(),
             )),
         ),
     ])
@@ -669,6 +684,7 @@ fn hide_spawn_agent_metadata_options(properties: &mut BTreeMap<String, JsonSchem
     properties.remove("agent_type");
     properties.remove("model");
     properties.remove("reasoning_effort");
+    properties.remove("service_tier");
 }
 
 fn spawn_agent_tool_description(
@@ -701,7 +717,7 @@ fn spawn_agent_tool_description(
     format!(
         r#"
         {tool_description}
-This spawn_agent tool provides you access to sub-agents that inherit your current model by default. Do not set the `model` field unless the user explicitly asks for a different model. You should follow the rules and guidelines below to use this tool.
+This spawn_agent tool resolves non-full-history child identity fields independently: explicit spawn overrides, selected role fields, configured sub-agent defaults, then the parent/default value; for reasoning effort, the selected model's default is applied before the parent effort. Full-history forks inherit the parent role, model, and reasoning effort. Do not set the `model` field unless the user explicitly asks for a different model or there is a clear task-specific reason. You should follow the rules and guidelines below to use this tool.
 
 Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.
 Requests for depth, thoroughness, research, investigation, or detailed codebase analysis do not count as permission to spawn.

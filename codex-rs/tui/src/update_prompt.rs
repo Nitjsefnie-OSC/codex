@@ -39,7 +39,13 @@ use ratatui::widgets::Wrap;
 #[cfg(not(debug_assertions))]
 use tokio_stream::StreamExt;
 
-const RELEASE_NOTES_URL: &str = "https://github.com/openai/codex/releases/latest";
+/// Release notes for the channel this build upgrades from — the fork's, not
+/// upstream's.
+fn release_notes_url() -> &'static str {
+    &codex_fork_manifest::manifest()
+        .release_channel
+        .releases_page_url
+}
 
 #[cfg(not(debug_assertions))]
 pub(crate) enum UpdatePromptOutcome {
@@ -227,7 +233,7 @@ impl WidgetRef for &UpdatePromptScreen {
             /*flex*/ 1,
             Paragraph::new(Line::from(vec![
                 "Release notes: ".dim(),
-                RELEASE_NOTES_URL.dim().underlined(),
+                release_notes_url().dim().underlined(),
             ]))
             .wrap(Wrap { trim: false })
             .inset(Insets::vh(/*v*/ 0, /*h*/ 2)),
@@ -266,7 +272,7 @@ impl WidgetRef for &UpdatePromptScreen {
         };
         render_menu_surface(panel, buf);
         column.render(panel, buf);
-        crate::terminal_hyperlinks::mark_underlined_hyperlink(buf, area, RELEASE_NOTES_URL);
+        crate::terminal_hyperlinks::mark_underlined_hyperlink(buf, area, release_notes_url());
     }
 }
 

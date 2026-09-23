@@ -602,8 +602,15 @@ impl TurnContext {
         self.initial_settings.effective_reasoning_effort()
     }
 
-    /// Legacy: returns the frozen initial-turn reasoning-effort label for tracing.
-    /// Step-scoped consumers should use their captured `StepContext::settings`.
+    /// Returns the effective reasoning effort encoded in the Responses request.
+    ///
+    /// `Ultra` is an internal configuration spelling that the request builder
+    /// sends as `Max`; callers reporting request metadata must use this value
+    /// rather than the unnormalized turn setting.
+    pub(crate) fn request_reasoning_effort(&self) -> Option<ReasoningEffortConfig> {
+        crate::client::request_reasoning_effort(self.model_info(), self.reasoning_effort().cloned())
+    }
+
     pub(crate) fn effective_reasoning_effort_for_tracing(&self) -> String {
         self.effective_reasoning_effort()
             .map(|effort| effort.to_string())

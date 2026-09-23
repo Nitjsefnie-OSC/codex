@@ -1,9 +1,7 @@
 use super::*;
 use crate::agent::api::AgentInput;
 use crate::agent::api::SpawnRequest;
-use crate::agent::child_config::SpawnConfigOptions;
 use crate::agent::child_config::SpawnConfigVersion;
-use crate::agent::child_config::prepare_agent_spawn_config;
 use crate::agent::next_thread_spawn_depth;
 use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::types::MessageDeliveryMode;
@@ -127,29 +125,85 @@ async fn handle_spawn_agent(
         .as_deref()
         .map(str::trim)
         .filter(|role| !role.is_empty());
+    let inherited_role_name = turn.session_source.get_agent_role();
 
     let session_source = turn.session_source.clone();
     let child_depth = next_thread_spawn_depth(&session_source);
-    let prepared = prepare_agent_spawn_config(
-        &session,
-        step_context.as_ref(),
-        SpawnConfigOptions {
-            version: SpawnConfigVersion::V2,
-            full_history_fork: matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory)),
-            role_name,
-            model: args.model.as_deref(),
-            reasoning_effort: args.reasoning_effort.clone(),
-        },
-    )
-    .await
-    .map_err(FunctionCallError::RespondToModel)?;
-    let config = prepared.config;
+    let mut config =
+        build_agent_spawn_config(&session.get_base_instructions().await, turn.as_ref())?;
+    if let Some(service_tier) = args.service_tier.as_ref() {
+        config.service_tier = Some(service_tier.clone());
+    }
     let is_full_history_fork = matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory));
+    let child_role_name = if is_full_history_fork {
+        inherited_role_name.as_deref()
+    } else {
+        role_name
+    };
+    let (identity_selection, applied_role) = if is_full_history_fork {
+        reject_full_fork_identity_overrides(
+            role_name,
+            args.model.as_deref(),
+            args.reasoning_effort.as_ref(),
+        )?;
+        (SpawnAgentIdentitySelection::default(), Default::default())
+    } else {
+        let identity_selection = prepare_spawn_agent_identity_selection(
+            turn.as_ref(),
+            &mut config,
+            args.model.as_deref(),
+            args.reasoning_effort.clone(),
+        );
+        let applied_role = apply_spawn_agent_role(
+            &mut config,
+            role_name,
+            identity_selection.role_override_mask(),
+        )
+        .await?;
+        (identity_selection, applied_role)
+    };
+    let should_validate_identity = identity_selection.selects_identity()
+        || applied_role.model
+        || applied_role.reasoning_effort;
+    apply_explicit_spawn_agent_identity_selection(
+        &session,
+        turn.as_ref(),
+        &mut config,
+        identity_selection,
+        applied_role,
+    )
+    .await?;
+    if should_validate_identity {
+        validate_spawn_agent_model_reasoning_effort(&session, &config).await?;
+    }
+    let root_service_tier = session.services.agent_control.root_service_tier();
+    apply_spawn_agent_service_tier(
+        &session,
+        &mut config,
+        root_service_tier.as_deref(),
+        args.service_tier.as_deref(),
+    )
+    .await?;
+    apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
+
+    // Remember an applied configured default so cold reload reapplies its restrictions.
+    let persisted_role_name = if is_full_history_fork {
+        inherited_role_name.as_deref()
+    } else {
+        role_name.or_else(|| {
+            (!is_full_history_fork
+                && config
+                    .agent_roles
+                    .get(DEFAULT_ROLE_NAME)
+                    .is_some_and(|role| role.config_file.is_some()))
+            .then_some(DEFAULT_ROLE_NAME)
+        })
+    };
     let spawn_source = thread_spawn_source(
         session.thread_id,
         &turn.session_source,
         child_depth,
-        prepared.role_name.as_deref(),
+        persisted_role_name.as_deref(),
         Some(args.task_name.clone()),
     )?;
     let new_agent_path = spawn_source.get_agent_path().ok_or_else(|| {
@@ -223,7 +277,7 @@ async fn handle_spawn_agent(
         },
     )
     .await;
-    let role_tag = role_name.unwrap_or(DEFAULT_ROLE_NAME);
+    let role_tag = child_role_name.unwrap_or(DEFAULT_ROLE_NAME);
     turn.session_telemetry.counter(
         "codex.multi_agent.spawn",
         /*inc*/ 1,
@@ -257,6 +311,7 @@ struct SpawnAgentArgs {
     agent_type: Option<String>,
     model: Option<String>,
     reasoning_effort: Option<ReasoningEffort>,
+    service_tier: Option<String>,
     fork_turns: Option<String>,
     fork_context: Option<bool>,
 }

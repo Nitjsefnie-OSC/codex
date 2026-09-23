@@ -162,6 +162,8 @@ pub(crate) struct TurnMetadataState {
     parent_turn_id: OnceLock<String>,
     initiating_agent_path: OnceLock<AgentPath>,
     root_turn_id: OnceLock<String>,
+    root_turn_ambiguous: AtomicBool,
+    attribute_background_parent_turn: AtomicBool,
     subagent_header: Option<String>,
     subagent_kind: Option<String>,
     thread_source: Option<ThreadSource>,
@@ -249,6 +251,8 @@ impl TurnMetadataState {
             parent_turn_id: OnceLock::new(),
             initiating_agent_path: OnceLock::new(),
             root_turn_id: OnceLock::new(),
+            root_turn_ambiguous: AtomicBool::new(false),
+            attribute_background_parent_turn: AtomicBool::new(false),
             subagent_header: subagent_header_value(session_source),
             subagent_kind: subagent_metadata_kind(session_source),
             thread_source,
@@ -357,7 +361,24 @@ impl TurnMetadataState {
     }
 
     pub(crate) fn root_turn_id(&self) -> Option<String> {
-        self.root_turn_id.get().cloned()
+        self.root_turn_id
+            .get()
+            .filter(|_| !self.root_turn_ambiguous.load(Ordering::Relaxed))
+            .cloned()
+    }
+
+    pub(crate) fn mark_root_turn_ambiguous(&self) {
+        self.root_turn_ambiguous.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_attribute_background_parent_turn(&self, attribute: bool) {
+        self.attribute_background_parent_turn
+            .store(attribute, Ordering::Release);
+    }
+
+    pub(crate) fn attribute_background_parent_turn(&self) -> bool {
+        self.attribute_background_parent_turn
+            .load(Ordering::Acquire)
     }
 
     pub(crate) fn set_responsesapi_client_metadata(

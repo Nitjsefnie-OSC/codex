@@ -117,9 +117,14 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
         properties
             .get("reasoning_effort")
             .and_then(|schema| schema.description.as_deref()),
-        Some("Reasoning effort override for the new agent. Omit to inherit the parent effort.")
+        Some(SPAWN_AGENT_REASONING_EFFORT_OVERRIDE_DESCRIPTION)
     );
-    assert!(!properties.contains_key("service_tier"));
+    assert_eq!(
+        properties
+            .get("service_tier")
+            .and_then(|schema| schema.description.as_deref()),
+        Some(SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION)
+    );
     assert_eq!(
         parameters.required.as_ref(),
         Some(&vec!["task_name".to_string(), "message".to_string()])
@@ -221,7 +226,12 @@ fn spawn_agent_tool_v1_keeps_legacy_fork_context_field() {
             .and_then(|schema| schema.description.as_deref()),
         Some(SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION)
     );
-    assert!(!properties.contains_key("service_tier"));
+    assert_eq!(
+        properties
+            .get("service_tier")
+            .and_then(|schema| schema.description.as_deref()),
+        Some(SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION)
+    );
 }
 
 #[test]
