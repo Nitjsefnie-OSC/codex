@@ -1,9 +1,6 @@
 use super::*;
 use crate::agent::api::AgentInput;
 use crate::agent::api::SpawnRequest;
-use crate::agent::child_config::SpawnConfigOptions;
-use crate::agent::child_config::SpawnConfigVersion;
-use crate::agent::child_config::prepare_agent_spawn_config;
 use crate::agent::control::render_input_preview;
 use crate::agent::exceeds_thread_spawn_depth_limit;
 use crate::agent::next_thread_spawn_depth;
@@ -158,20 +155,6 @@ async fn handle_spawn_agent(
             }),
         )
         .await;
-    let prepared = prepare_agent_spawn_config(
-        &session,
-        step_context.as_ref(),
-        SpawnConfigOptions {
-            version: SpawnConfigVersion::V1,
-            full_history_fork: args.fork_context,
-            role_name,
-            model: args.model.as_deref(),
-            reasoning_effort: args.reasoning_effort.clone(),
-        },
-    )
-    .await
-    .map_err(FunctionCallError::RespondToModel)?;
-    let config = prepared.config;
     let result = session
         .services
         .agent_control
@@ -179,13 +162,7 @@ async fn handle_spawn_agent(
             caller: session.thread_id,
             config,
             input: AgentInput::UserInput(input_items),
-            source: thread_spawn_source(
-                session.thread_id,
-                &turn.session_source,
-                child_depth,
-                prepared.role_name.as_deref(),
-                /*task_name*/ None,
-            )?,
+            source: spawn_source,
             options: SpawnAgentOptions {
                 fork_parent_spawn_call_id: args.fork_context.then(|| call_id.clone()),
                 fork_mode: args.fork_context.then_some(SpawnAgentForkMode::FullHistory),

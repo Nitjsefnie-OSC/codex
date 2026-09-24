@@ -1,7 +1,6 @@
 use super::*;
 use crate::agent::api::AgentInput;
 use crate::agent::api::SpawnRequest;
-use crate::agent::child_config::SpawnConfigVersion;
 use crate::agent::next_thread_spawn_depth;
 use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::types::MessageDeliveryMode;
