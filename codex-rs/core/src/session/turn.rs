@@ -1904,16 +1904,20 @@ async fn run_sampling_request_inner<'a>(
             step_context.as_ref(),
             base_instructions.clone(),
         );
-        let responses_metadata = sess
+        let mut request_metadata = sess
             .responses_metadata(step_context.as_ref(), CodexResponsesRequestKind::Turn)
             .await;
+        // The caller applied the background-wake receipt's parent-turn attribution.
+        request_metadata
+            .parent_turn_id
+            .clone_from(&responses_metadata.parent_turn_id);
         if crate::guardian::is_basic_session_source(&turn_context.session_source) {
             crate::guardian::check_guardian_prompt_budget(
                 &sess,
                 &prompt,
                 &turn_context.config,
                 &step_context.settings.model_info,
-                &responses_metadata,
+                &request_metadata,
             )?;
         }
         let err = match try_run_sampling_request(
@@ -1922,7 +1926,7 @@ async fn run_sampling_request_inner<'a>(
             Arc::clone(&step_context),
             Arc::clone(&turn_store),
             client_session,
-            &responses_metadata,
+            &request_metadata,
             Arc::clone(&turn_diff_tracker),
             &prompt,
             cancellation_token.child_token(),
