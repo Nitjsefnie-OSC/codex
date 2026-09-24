@@ -484,7 +484,6 @@ impl Session {
         let task_for_run = Arc::clone(&task);
         let task_input = input;
         let task_cancellation_token = cancellation_token.child_token();
-        let token_usage_for_lifecycle = token_usage_at_turn_start.clone();
         // Task-owned turn spans keep a core-owned span open for the
         // full task lifecycle after the submission dispatch span ends.
         let reasoning_effort = turn_context.effective_reasoning_effort_for_tracing();
@@ -511,13 +510,6 @@ impl Session {
                 if startup_rx.await.is_err() {
                     return;
                 }
-                session
-                    .emit_turn_start_lifecycle(
-                        ctx.as_ref(),
-                        Some(&token_usage_for_lifecycle),
-                        codex_extension_api::TurnStartPhase::BeforeTaskRegistration,
-                    )
-                    .await;
                 let ctx_for_finish = Arc::clone(&ctx);
                 let task_result = task_for_run
                     .run(
