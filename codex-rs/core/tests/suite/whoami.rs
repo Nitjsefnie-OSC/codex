@@ -24,7 +24,7 @@ use pretty_assertions::assert_eq;
 use serde_json::Value;
 
 const REQUESTED_MODEL: &str = "gpt-5.4";
-const SERVER_MODEL: &str = "gpt-5.2";
+const SERVER_MODEL: &str = "gpt-5.5";
 
 fn user_turn(test: &TestCodex) -> TurnInputRequest {
     let (sandbox_policy, permission_profile) =
@@ -127,7 +127,7 @@ async fn whoami_reports_server_routed_model_and_request_provenance() -> Result<(
         "model_catalog_configuration"
     );
     assert_ne!(output["slug"], output["requested_model"]);
-    assert_eq!(output["display_name"], "GPT-5.2");
+    assert_eq!(output["display_name"], "GPT-5.5");
     assert_ne!(output["display_name"], output["requested_display_name"]);
     assert!(
         request_effort.is_string(),
