@@ -853,6 +853,127 @@ async fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent() {
 async fn ensure_v2_child_loaded_preserves_evicted_parent_authority() {
     check_v2_agent_reload(V2ReloadRoute::NestedParent).await;
 }
+
+#[tokio::test]
+async fn ensure_v2_agent_loaded_preserves_child_reasoning_effort() {
+    check_v2_agent_reload_identity(Some(ReasoningEffort::High)).await;
+}
+
+#[tokio::test]
+async fn ensure_v2_agent_loaded_preserves_absent_reasoning_effort() {
+    check_v2_agent_reload_identity(/*child_reasoning_effort*/ None).await;
+}
+
+/// A sender-driven reload keeps the worker's stored model and reasoning effort, even an absent
+/// one, over both the sender's and the role's identity, while reapplying the role's other
+/// settings.
+async fn check_v2_agent_reload_identity(child_reasoning_effort: Option<ReasoningEffort>) {
+    let (home, mut config) = test_config().await;
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    let _ = config.features.enable(Feature::Sqlite);
+    config.model = Some("gpt-5.6-sol".to_string());
+    let role_path = home.path().join("reload-role.toml");
+    tokio::fs::write(
+        &role_path,
+        "developer_instructions = \"Reload role instructions\"\nmodel = \"gpt-5.6-terra\"\nmodel_reasoning_effort = \"xhigh\"\n",
+    )
+    .await
+    .expect("reload role config should be written");
+    config.agent_roles.insert(
+        "reload-role".to_string(),
+        AgentRoleConfig {
+            description: Some("Reload role".to_string()),
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    );
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (parent_thread_id, parent_thread) = harness.start_paginated_thread().await;
+    let source = thread_spawn_source(
+        parent_thread_id,
+        &parent_thread.session_source,
+        next_thread_spawn_depth(&parent_thread.session_source),
+        Some("reload-role"),
+        Some("worker".to_string()),
+    )
+    .expect("child source");
+    let mut child_config = harness.config.clone();
+    child_config.model = Some("gpt-5.6-luna".to_string());
+    child_config.model_reasoning_effort = child_reasoning_effort.clone();
+    let spawned_agent = harness
+        .control
+        .spawn_agent_with_metadata(
+            child_config,
+            text_input("hello child"),
+            source,
+            SpawnAgentOptions {
+                parent_thread_id: Some(parent_thread_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("spawn_agent should succeed");
+    let child_thread = harness
+        .manager
+        .get_thread(spawned_agent.thread_id)
+        .await
+        .expect("child thread should exist");
+    child_thread
+        .inject_response_items(vec![assistant_message(
+            "child persisted",
+            Some(MessagePhase::FinalAnswer),
+        )])
+        .await
+        .expect("child rollout should persist with v2 metadata");
+    child_thread
+        .shutdown_and_wait()
+        .await
+        .expect("child thread should shut down");
+    let stored_child = child_thread
+        .read_thread(
+            /*include_archived*/ true, /*include_history*/ false,
+        )
+        .await
+        .expect("child metadata should be readable");
+    assert_eq!(stored_child.reasoning_effort, child_reasoning_effort);
+    assert_eq!(stored_child.agent_role.as_deref(), Some("reload-role"));
+    assert!(
+        harness
+            .manager
+            .remove_thread(&spawned_agent.thread_id)
+            .await
+            .is_some()
+    );
+
+    let mut sender_config = harness.config.clone();
+    sender_config.model_reasoning_effort = Some(ReasoningEffort::Minimal);
+    harness
+        .control
+        .ensure_v2_agent_loaded(sender_config, spawned_agent.thread_id, /*parent*/ None)
+        .await
+        .expect("known v2 agent should reload");
+    let reloaded_child = harness
+        .manager
+        .get_thread(spawned_agent.thread_id)
+        .await
+        .expect("reloaded child thread should exist");
+    let reloaded_snapshot = reloaded_child.config_snapshot().await;
+    assert_eq!(
+        (reloaded_snapshot.model, reloaded_snapshot.reasoning_effort),
+        ("gpt-5.6-luna".to_string(), child_reasoning_effort),
+        "residency reload must preserve the worker identity instead of the sender's or the role's",
+    );
+    assert_eq!(
+        reloaded_child
+            .session
+            .new_default_turn()
+            .await
+            .developer_instructions
+            .as_deref(),
+        Some("Reload role instructions"),
+        "residency reload must reapply non-identity role settings",
+    );
+}
 #[derive(Clone, Copy)]
 enum V2ReloadRoute {
     Sender,
