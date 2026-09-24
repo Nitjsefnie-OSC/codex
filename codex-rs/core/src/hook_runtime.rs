@@ -1452,7 +1452,7 @@ mod tests {
         assert!(matches!(
             super::run_pre_tool_use_hooks(
                 &session_a,
-                &turn_a,
+                &crate::session::step_context::StepContext::for_test(Arc::clone(&turn_a)),
                 "pre-a".to_string(),
                 &HookToolName::bash(),
                 &serde_json::json!({"command": "echo alpha"}),
@@ -1463,7 +1463,7 @@ mod tests {
         assert!(matches!(
             super::run_pre_tool_use_hooks(
                 &session_b,
-                &turn_b,
+                &crate::session::step_context::StepContext::for_test(Arc::clone(&turn_b)),
                 "pre-b".to_string(),
                 &HookToolName::bash(),
                 &serde_json::json!({"command": "echo beta"}),
@@ -1491,7 +1491,7 @@ mod tests {
         record_skill_activation(&turn_a, activation_a_later);
         super::run_pre_tool_use_hooks(
             &session_a,
-            &turn_a,
+            &crate::session::step_context::StepContext::for_test(Arc::clone(&turn_a)),
             "pre-a-later".to_string(),
             &HookToolName::bash(),
             &serde_json::json!({"command": "echo later"}),
@@ -1527,7 +1527,7 @@ mod tests {
 
         super::run_post_tool_use_hooks(
             &session_a,
-            &turn_a,
+            &crate::session::step_context::StepContext::for_test(Arc::clone(&turn_a)),
             "post-a".to_string(),
             "Bash".to_string(),
             Vec::new(),
@@ -1537,7 +1537,7 @@ mod tests {
         .await;
         super::run_post_tool_use_hooks(
             &session_b,
-            &turn_b,
+            &crate::session::step_context::StepContext::for_test(Arc::clone(&turn_b)),
             "post-b".to_string(),
             "Bash".to_string(),
             Vec::new(),

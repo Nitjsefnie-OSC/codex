@@ -17,6 +17,8 @@ use crate::session::tests::make_session_and_context;
 use crate::session::tests::update_selected_settings_for_test;
 use crate::session::tests::update_turn_settings_for_test;
 use crate::session::turn_context::TurnContext;
+use crate::session_prefix::bounded_completion_turn_id;
+use crate::session_prefix::completion_agent_identity;
 use crate::session_prefix::format_inter_agent_completion_message;
 use crate::thread_manager::thread_store_from_config;
 use crate::tools::context::ToolOutput;
@@ -1955,16 +1957,23 @@ async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn()
         )
         .await;
 
+    // Match the completion path: identities and a bounded turn id per turn.
+    let root_identity = completion_agent_identity(&AgentPath::root(), root.thread_id);
+    let worker_identity = completion_agent_identity(&worker_path, agent_id);
+    let first_turn_id = bounded_completion_turn_id(&first_turn.sub_id);
+    let second_turn_id = bounded_completion_turn_id(&second_turn.sub_id);
     let first_notification = format_inter_agent_completion_message(
-        AgentPath::root(),
-        worker_path.clone(),
+        &root_identity,
+        &worker_identity,
         &AgentStatus::Completed(Some("first done".to_string())),
+        Some(&first_turn_id),
     )
     .expect("completed status should render");
     let second_notification = format_inter_agent_completion_message(
-        AgentPath::root(),
-        worker_path.clone(),
+        &root_identity,
+        &worker_identity,
         &AgentStatus::Completed(Some("second done".to_string())),
+        Some(&second_turn_id),
     )
     .expect("completed status should render");
 

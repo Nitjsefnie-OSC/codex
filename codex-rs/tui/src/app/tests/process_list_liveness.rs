@@ -10,6 +10,7 @@
 
 use super::*;
 use codex_app_server_protocol::SubAgentActivityKind;
+use codex_model_provider_info::ModelProviderInfo;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call_with_namespace;
@@ -315,8 +316,8 @@ enabled = true
                 text_elements: Vec::new(),
             }],
             app.config.cwd.to_path_buf(),
-            AskForApproval::Never,
-            ApprovalsReviewer::User,
+            Some(AskForApproval::Never),
+            Some(codex_app_server_protocol::ApprovalsReviewer::User),
             TurnPermissionsOverride::Preserve,
             &workspace_roots,
             MODEL.to_string(),
@@ -481,8 +482,8 @@ enabled = true
                 text_elements: Vec::new(),
             }],
             app.config.cwd.to_path_buf(),
-            AskForApproval::Never,
-            ApprovalsReviewer::User,
+            Some(AskForApproval::Never),
+            Some(codex_app_server_protocol::ApprovalsReviewer::User),
             TurnPermissionsOverride::Preserve,
             &workspace_roots,
             MODEL.to_string(),

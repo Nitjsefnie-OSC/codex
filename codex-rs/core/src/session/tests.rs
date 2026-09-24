@@ -118,7 +118,6 @@ use test_case::test_case;
 use tracing::Span;
 
 use crate::connectors::AppInfo;
-use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
 use crate::rollout::recorder::RolloutRecorder;
 use crate::session::Submission;
@@ -11475,6 +11474,7 @@ impl SessionTask for BlockingStartTask {
                     text_elements: Vec::new(),
                 }],
                 client_id: None,
+                acceptance_order: None,
             }],
             "the pending start input must be preserved exactly",
         );
@@ -12240,6 +12240,7 @@ async fn aborting_sentinel_blocks_direct_task_start_until_cleanup_finishes() {
                         text_elements: Vec::new(),
                     }],
                     client_id: None,
+                    acceptance_order: None,
                 }],
                 BlockingStartTask { started, run_count },
                 MailboxParentProvenance::Ignore,
@@ -13013,6 +13014,7 @@ async fn active_mailbox_precedes_later_steer() {
                     text_elements: Vec::new(),
                 }],
                 client_id: None,
+                acceptance_order: None,
             },
         ]
     );
@@ -13130,6 +13132,7 @@ async fn non_regular_task_persists_older_idle_mailbox_before_start() {
                 text_elements: Vec::new(),
             }],
             client_id: None,
+            acceptance_order: None,
         }],
         NeverEndingTask {
             kind: TaskKind::Review,
