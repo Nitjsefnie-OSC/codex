@@ -757,10 +757,28 @@ impl Session {
         drop(delivery_guard);
 
         let (task, turn_state, abort_complete) = detached;
-        let turn_context = self
-            .handle_task_abort(task, reason.clone(), &turn_state)
-            .await;
+        let turn_context = self.cancel_task_for_abort(task, reason.clone()).await;
+        self.complete_task_abort(
+            Arc::clone(&turn_context),
+            turn_state,
+            abort_complete,
+            reason,
+        )
+        .await;
+        Some(turn_context)
+    }
 
+    /// Persists an aborted task's cleanup input, then emits its terminal event.
+    ///
+    /// Background input that arrived while the task was being cancelled belongs before
+    /// `TurnAborted`, so clients re-reading history at the terminal event see it.
+    async fn complete_task_abort(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        turn_state: Arc<Mutex<TurnState>>,
+        abort_complete: Arc<Notify>,
+        reason: TurnAbortReason,
+    ) {
         let delivery_guard = self
             .input_queue
             .lock_background_notification_delivery()
@@ -780,7 +798,8 @@ impl Session {
         if let Err(err) = self.flush_rollout().await {
             warn!("failed to flush abort cleanup before terminal event: {err}");
         }
-        self.emit_aborted_turn(&turn_context, reason.clone()).await;
+        self.emit_aborted_turn(&turn_context, reason.clone(), turn_state.as_ref())
+            .await;
 
         let active_turn = {
             let mut active = self.active_turn.lock().await;
@@ -805,7 +824,6 @@ impl Session {
             persisted.publish(&self.input_queue);
         }
         abort_complete.notify_waiters();
-        Some(turn_context)
     }
 
     pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {
@@ -908,29 +926,25 @@ impl Session {
         turn_id: &str,
         reason: TurnAbortReason,
     ) -> bool {
-        let active_turn = {
-            let mut active = self.active_turn.lock().await;
-            if active
-                .as_ref()
-                .and_then(|active_turn| active_turn.task.as_ref())
-                .is_some_and(|task| task.turn_context.sub_id == turn_id)
-            {
-                if matches!(
-                    reason,
-                    TurnAbortReason::Interrupted | TurnAbortReason::BudgetLimited
-                ) {
-                    self.mark_interrupted();
-                }
-                active.take()
-            } else {
-                None
-            }
-        };
-        let Some(active_turn) = active_turn else {
+        let Some(turn_context) = self
+            .abort_active_task_in_transaction(reason.clone(), Some(turn_id))
+            .await
+        else {
             return false;
         };
 
-        self.finish_turn_abort(active_turn, reason).await;
+        self.services
+            .unified_exec_manager
+            .discard_unrecorded_initial_exec_command_outputs()
+            .await;
+        self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
+            .await;
+
+        if reason == TurnAbortReason::Interrupted {
+            self.maybe_start_turn_for_pending_work().await;
+            self.input_queue.notify_background_wake();
+        }
+
         true
     }
 
@@ -939,12 +953,20 @@ impl Session {
         mut active_turn: ActiveTurn,
         reason: TurnAbortReason,
     ) {
-        let task = active_turn.task.take();
-        let turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
-        if let Some(task) = task {
-            self.handle_task_abort(task, reason.clone(), &active_turn.turn_state)
+        let turn_context = match active_turn.task.take() {
+            Some(task) => {
+                let turn_context = self.cancel_task_for_abort(task, reason.clone()).await;
+                self.complete_task_abort(
+                    Arc::clone(&turn_context),
+                    Arc::clone(&active_turn.turn_state),
+                    Arc::clone(&active_turn.abort_complete),
+                    reason.clone(),
+                )
                 .await;
-        }
+                Some(turn_context)
+            }
+            None => None,
+        };
         if let Some(turn_context) = turn_context.as_deref() {
             self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
                 .await;
@@ -1398,6 +1420,7 @@ impl Session {
         self: &Arc<Self>,
         turn_context: &Arc<TurnContext>,
         reason: TurnAbortReason,
+        turn_state: &Mutex<TurnState>,
     ) {
         if reason == TurnAbortReason::Interrupted
             && let Some(marker) = interrupted_turn_history_marker(
@@ -1418,6 +1441,10 @@ impl Session {
             if let Err(err) = self.flush_rollout().await {
                 warn!("failed to flush interrupted-turn marker before emitting TurnAborted: {err}");
             }
+        }
+
+        if reason == TurnAbortReason::Interrupted {
+            run_turn_interrupt_hooks(self, turn_context, turn_state).await;
         }
 
         let started_at = turn_context.turn_timing_state.started_at_unix_secs().await;
@@ -1446,11 +1473,11 @@ impl Session {
         }
     }
 
-    async fn handle_task_abort(
+    /// Cancels an aborted task and runs its abort hook; the caller emits the terminal event.
+    async fn cancel_task_for_abort(
         self: &Arc<Self>,
         task: RunningTask,
         reason: TurnAbortReason,
-        turn_state: &Mutex<TurnState>,
     ) -> Arc<TurnContext> {
         let sub_id = task.turn_context.sub_id.clone();
         let turn_context = Arc::clone(&task.turn_context);
@@ -1492,61 +1519,6 @@ impl Session {
         session_task
             .abort(Arc::clone(self), Arc::clone(&task.turn_context))
             .await;
-
-        if reason == TurnAbortReason::Interrupted
-            && let Some(marker) = interrupted_turn_history_marker(
-                InterruptedTurnHistoryMarker::from_config_and_version(
-                    task.turn_context.config.as_ref(),
-                    task.turn_context.multi_agent_version,
-                ),
-            )
-        {
-            self.record_conversation_items(
-                task.turn_context.as_ref(),
-                task.turn_context.model_info(),
-                std::slice::from_ref(&marker),
-            )
-            .await;
-            // Ensure the marker is durably visible before emitting TurnAborted: some clients
-            // synchronously re-read the rollout on receipt of the abort event.
-            if let Err(err) = self.flush_rollout().await {
-                warn!("failed to flush interrupted-turn marker before emitting TurnAborted: {err}");
-            }
-        }
-
-        if reason == TurnAbortReason::Interrupted {
-            run_turn_interrupt_hooks(self, &task.turn_context, turn_state).await;
-        }
-
-        let started_at = task
-            .turn_context
-            .turn_timing_state
-            .started_at_unix_secs()
-            .await;
-        let (completed_at, duration_ms, profile) = task
-            .turn_context
-            .turn_timing_state
-            .complete_profile_and_duration_ms()
-            .await;
-        self.services
-            .analytics_events_client
-            .track_turn_profile(TurnProfileFact {
-                turn_id: task.turn_context.sub_id.clone(),
-                profile,
-            });
-        let event = EventMsg::TurnAborted(TurnAbortedEvent {
-            turn_id: Some(task.turn_context.sub_id.clone()),
-            reason,
-            started_at,
-            completed_at,
-            duration_ms,
-        });
-        self.send_event(task.turn_context.as_ref(), event).await;
-        // Regular items were flushed before this terminal event was appended; buffering
-        // thread writers may not flush it without another explicit barrier.
-        if let Err(err) = self.flush_rollout().await {
-            warn!("failed to flush rollout after emitting terminal turn event: {err}");
-        }
         turn_context
     }
 }
