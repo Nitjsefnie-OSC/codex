@@ -270,7 +270,7 @@ impl HistoryCell for ExecCell {
     }
 
     fn display_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
-        if self.calls.len() > 1 && (!self.is_exploring_cell() || !self.is_active()) {
+        if self.group.calls.len() > 1 && (!self.is_exploring_cell() || !self.is_active()) {
             self.compact_group_display_lines(width)
         } else if self.is_exploring_cell() {
             self.exploring_display_lines(width)
@@ -301,8 +301,9 @@ impl HistoryCell for ExecCell {
 }
 
 impl ExecCell {
-    fn compact_group_display_lines(&self, width: u16) -> Vec<Line<'static>> {
+    fn compact_group_display_lines(&self, width: u16) -> Vec<HyperlinkLine> {
         let completed_commands = self
+            .group
             .calls
             .iter()
             .take_while(|call| {
@@ -325,16 +326,16 @@ impl ExecCell {
             } else {
                 "commands"
             };
-            lines.push(Line::from(vec![
+            lines.push(HyperlinkLine::from(Line::from(vec![
                 "•".green().bold(),
                 " ".into(),
                 format!("Ran {completed_commands} {noun}").bold(),
                 " · ".dim(),
                 TRANSCRIPT_HINT.dim(),
-            ]));
+            ])));
         }
-        for call in &self.calls[completed_commands..] {
-            lines.extend(self.command_call_display_lines(width, call));
+        for call in &self.group.calls[completed_commands..] {
+            lines.extend(self.command_call_display_lines(width, call).lines);
         }
         lines
     }
@@ -496,7 +497,7 @@ impl ExecCell {
         self.command_call_display_lines(width, call)
     }
 
-    fn command_call_display_lines(&self, width: u16, call: &ExecCall) -> Vec<Line<'static>> {
+    fn command_call_display_lines(&self, width: u16, call: &ExecCall) -> CommandDisplay {
         let layout = EXEC_DISPLAY_LAYOUT;
         let success = call
             .duration

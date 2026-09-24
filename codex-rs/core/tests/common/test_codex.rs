@@ -1174,7 +1174,8 @@ impl TestCodex {
         let turn_environment_selections = environments.map(|environments| {
             TurnEnvironmentSelections::new(self.config.cwd.clone(), environments)
         });
-        self.codex
+        let submission = self
+            .codex
             .start_or_steer_turn(
                 TurnInputRequest::user_input(vec![UserInput::Text {
                     text: prompt.into(),
@@ -1198,6 +1199,12 @@ impl TestCodex {
                 }),
             )
             .await?;
+        if std::env::var_os("DEBUG_TEST_EVENTS").is_some() {
+            eprintln!("[test-events] submission: {submission:?}");
+        }
+        if let codex_core::TurnInputSubmission::NotSubmitted { reason } = &submission {
+            anyhow::bail!("turn input was not submitted: {reason:?}");
+        }
 
         let turn_id = wait_for_event_match(&self.codex, |event| match event {
             EventMsg::TurnStarted(event) => Some(event.turn_id.clone()),
