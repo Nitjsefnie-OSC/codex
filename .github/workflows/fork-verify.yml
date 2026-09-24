@@ -54,6 +54,10 @@ jobs:
 
       - name: Yielded exec completion wake regression
         working-directory: codex-rs
+        env:
+          # A timeout in these waits names the last event seen, not only "Elapsed".
+          DEBUG_TEST_EVENTS: "1"
+          RUST_BACKTRACE: "1"
         run: |
           # Swatinem/rust-cache can restore v8's Cargo fingerprint after its
           # externally supplied static archive was evicted. Rebuild only that
@@ -301,7 +305,8 @@ jobs:
           cargo check --workspace \
             --exclude codex-v8-poc \
             --exclude codex-code-mode-runtime \
-            --exclude codex-code-mode-host
+            --exclude codex-code-mode-host \
+            --exclude codex-voice-host
           df -h /
 
       - name: ps fleet presentation regression
@@ -594,6 +599,12 @@ jobs:
           name: config-schema
           path: codex-rs/core/config.schema.json
           if-no-files-found: error
+
+      # write_schema_fixtures.py shells out to `uv`; upstream's CI installs it
+      # with this same pinned action.
+      - name: Install uv
+        if: always()
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
 
       - name: app-server schema freshness
         if: always()
