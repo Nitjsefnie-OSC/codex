@@ -51,7 +51,6 @@ use codex_thread_store::LoadThreadHistoryParams;
 use codex_thread_store::ReadThreadParams;
 use futures::StreamExt;
 use futures::future::BoxFuture;
-use serde::Serialize;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Weak;

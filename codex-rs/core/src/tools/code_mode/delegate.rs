@@ -192,7 +192,6 @@ impl CodeModeDispatchBroker {
                         mut dispatch_trace,
                         cancellation_token,
                         response_tx,
-                        ..
                     } => {
                         let cell_id = invocation.cell_id.clone();
                         if !wait_until_cell_ready_for_dispatch(
@@ -393,7 +392,6 @@ impl CodeModeSessionDelegate for CodeModeCellDelegate {
                     invocation,
                     step_context: Arc::downgrade(&self.step_context),
                     dispatch_trace,
-                    span: tracing::Span::current(),
                     cancellation_token: cancellation_token.clone(),
                     response_tx,
                 })
@@ -519,7 +517,6 @@ enum DispatchMessage {
         dispatch_trace: Box<NestedToolDispatchTrace>,
         cancellation_token: CancellationToken,
         response_tx: oneshot::Sender<Result<NestedToolCallResult, String>>,
-        span: tracing::Span,
     },
     Notify {
         call_id: String,

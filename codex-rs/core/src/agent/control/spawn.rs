@@ -308,23 +308,6 @@ impl LocalAgentControl {
         )))
     }
 
-    pub(crate) async fn spawn_agent_with_communication(
-        &self,
-        config: Config,
-        communication: InterAgentCommunication,
-        context: AgentCommunicationContext,
-        session_source: Option<SessionSource>,
-        options: SpawnAgentOptions,
-    ) -> CodexResult<(LiveAgent, ThreadConfigSnapshot)> {
-        self.spawn_agent_internal(
-            config,
-            SpawnInitialInput::InterAgentCommunication(communication, context),
-            session_source,
-            options,
-        )
-        .await
-    }
-
     /// A provided parent enables owner-validated reloads; `None` preserves sender-driven reloads.
     pub(crate) async fn ensure_v2_agent_loaded(
         &self,
