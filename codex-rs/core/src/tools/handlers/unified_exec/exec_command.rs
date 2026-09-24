@@ -303,7 +303,6 @@ impl ExecCommandHandler {
                 )));
             }
         }
-        let process_id = manager.allocate_process_id().await;
         let resolved_command = get_command(
             &args,
             shell,
@@ -403,13 +402,7 @@ impl ExecCommandHandler {
             "exec_command",
         )
         .await;
-        // Keep the reservation when interception returns `Ok(None)`: the normal command below
-        // still needs this process ID.
-        if intercepted_patch.is_err() {
-            manager.release_process_id(process_id).await;
-        }
         if let Some(output) = intercepted_patch? {
-            manager.release_process_id(process_id).await;
             return Ok(boxed_tool_output(ExecCommandToolOutput {
                 event_call_id: String::new(),
                 chunk_id: String::new(),
