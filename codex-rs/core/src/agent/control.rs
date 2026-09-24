@@ -91,11 +91,6 @@ enum V2ReloadAdmission {
     CompletionDelivery,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-pub(crate) struct ListedAgent {
-    pub(crate) agent_name: String,
-    pub(crate) agent_status: AgentStatus,
-}
 #[derive(Clone)]
 pub(crate) struct LocalAgentControl {
     /// session_id is equal to the root thread's ID.

@@ -188,13 +188,6 @@ pub(crate) fn build_agent_spawn_config(
     Ok(config)
 }
 
-pub(crate) fn build_agent_resume_config(turn: &TurnContext) -> Result<Config, FunctionCallError> {
-    let mut config = build_agent_shared_config(turn)?;
-    // For resume, keep base instructions sourced from rollout/session metadata.
-    config.base_instructions = None;
-    config.base_instructions_provenance = None;
-    Ok(config)
-}
 
 fn build_agent_shared_config(turn: &TurnContext) -> Result<Config, FunctionCallError> {
     let base_config = turn.config.clone();
