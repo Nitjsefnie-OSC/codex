@@ -4,7 +4,6 @@
 //! Delivery remains best effort, with tracing recorded only after the parent accepts it.
 
 use super::LocalAgentControl;
-use crate::TurnStartOptions;
 use crate::agent::api::AgentTurnOutcome;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
@@ -44,6 +43,20 @@ impl LocalAgentControl {
         else {
             return;
         };
+        // The completion must reach an evicted parent: reload it on the completion
+        // path, which never reserves (or evicts for) a residency slot.
+        if let Ok(state) = self.runtime.upgrade()
+            && let Ok(child) = state.get_thread(outcome.thread_id).await
+        {
+            let config = (*child.config().await).clone();
+            if let Err(err) = self
+                .ensure_v2_agent_loaded_for_completion(config, parent_thread_id)
+                .await
+            {
+                debug!("failed to load parent thread {parent_thread_id} for completion: {err}");
+                return;
+            }
+        }
 
         if matches!(status, AgentStatus::Completed(_))
             && let Some(parent_turn_id) = outcome.parent_turn_id
@@ -102,22 +115,19 @@ impl LocalAgentControl {
         // `communication` owns the message. Keep a second copy only when the
         // recorder will actually need it after parent delivery succeeds.
         let trace_message = trace.is_enabled().then(|| message.clone());
-        let communication = InterAgentCommunication::new(
+        let mut communication = InterAgentCommunication::new(
             child_identity.model_path,
             parent_identity.model_path,
             Vec::new(),
             message,
             /*trigger_turn*/ false,
         );
+        communication.set_turn_id_if_missing(&completion_turn_id);
         let context =
             AgentCommunicationContext::new(AgentCommunicationKind::Result, outcome.thread_id);
+        // The parent's completion op records the result durably and wakes an idle parent.
         if let Err(err) = self
-            .send_inter_agent_communication(
-                parent_thread_id,
-                communication,
-                context,
-                TurnStartOptions::default(),
-            )
+            .deliver_inter_agent_completion(parent_thread_id, communication, context)
             .await
         {
             debug!("failed to notify parent thread {parent_thread_id}: {err}");

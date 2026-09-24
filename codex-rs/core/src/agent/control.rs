@@ -196,6 +196,43 @@ impl LocalAgentControl {
         .await
     }
 
+    /// Delivers a terminal child result through the parent's durable background path.
+    pub(crate) async fn deliver_inter_agent_completion(
+        &self,
+        agent_id: ThreadId,
+        communication: InterAgentCommunication,
+        context: AgentCommunicationContext,
+    ) -> CodexResult<String> {
+        let state = self.runtime.upgrade()?;
+        let communication_for_log =
+            crate::agent_communication::logging_enabled().then(|| communication.clone());
+        let result = self
+            .handle_thread_request_result(
+                agent_id,
+                &state,
+                state
+                    .send_op(
+                        agent_id,
+                        Op::InterAgentCompletion { communication },
+                        /*parent_turn_id*/ None,
+                        /*root_turn_id*/ None,
+                    )
+                    .await,
+            )
+            .await;
+        if let (Some(communication), Ok(communication_id)) =
+            (communication_for_log, result.as_ref())
+        {
+            crate::agent_communication::emit_agent_communication_send(
+                communication_id,
+                &context,
+                &communication,
+                agent_id,
+            );
+        }
+        result
+    }
+
     /// Emits SubAgentActivity lifecycle items to the initiating thread.
     pub(crate) async fn emit_sub_agent_activity(
         &self,

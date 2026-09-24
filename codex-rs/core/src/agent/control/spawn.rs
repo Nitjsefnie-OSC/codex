@@ -341,10 +341,6 @@ impl LocalAgentControl {
         .await
     }
 
-    #[expect(
-        dead_code,
-        reason = "completion-path reload without residency reservation is retained for the fork's idle-wake contract"
-    )]
     pub(crate) fn ensure_v2_agent_loaded_for_completion(
         &self,
         config: Config,
