@@ -62,7 +62,7 @@ async fn spawn_v1_agent_with_role_identity_and_configured_defaults(
     set_turn_config(&mut turn, config);
     let role_name = install_role_with_model_override(&mut turn).await;
     let manager = thread_manager();
-    session.services.agent_control = manager.agent_control();
+    set_agent_control(&mut session, manager.agent_control());
     let mut args = json!({
         "message": "inspect this repo",
         "agent_type": role_name,
@@ -173,7 +173,7 @@ async fn spawn_agent_role_model_uses_selected_model_default_effort() {
     );
     set_turn_config(&mut turn, config);
     let manager = thread_manager();
-    session.services.agent_control = manager.agent_control();
+    set_agent_control(&mut session, manager.agent_control());
 
     let output = SpawnAgentHandler::default()
         .handle(invocation(
@@ -210,7 +210,7 @@ async fn spawn_agent_uncatalogued_role_model_preserves_parent_effort() {
     set_turn_reasoning_effort_for_test(&mut turn, Some(ReasoningEffort::High));
     let role_name = install_uncatalogued_model_only_role(&mut turn).await;
     let manager = thread_manager();
-    session.services.agent_control = manager.agent_control();
+    set_agent_control(&mut session, manager.agent_control());
 
     let output = SpawnAgentHandler::default()
         .handle(invocation(
@@ -279,7 +279,7 @@ async fn multi_agent_v2_role_model_uses_selected_model_default_effort() {
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
-    session.services.agent_control = manager.agent_control();
+    set_agent_control(&mut session, manager.agent_control());
     session.thread_id = root.thread_id;
 
     SpawnAgentHandlerV2::default()
@@ -331,7 +331,7 @@ async fn multi_agent_v2_uncatalogued_role_model_preserves_parent_effort() {
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
-    session.services.agent_control = manager.agent_control();
+    set_agent_control(&mut session, manager.agent_control());
     session.thread_id = root.thread_id;
 
     SpawnAgentHandlerV2::default()
@@ -414,7 +414,7 @@ async fn spawn_v2_agent_with_role_identity_and_configured_defaults(
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
-    session.services.agent_control = manager.agent_control();
+    set_agent_control(&mut session, manager.agent_control());
     session.thread_id = root.thread_id;
     let mut config = (*turn.config).clone();
     config
@@ -650,7 +650,7 @@ async fn spawn_agent_full_history_inherits_parent_identity() {
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
-    session.services.agent_control = manager.agent_control();
+    set_agent_control(&mut session, manager.agent_control());
     session.thread_id = root.thread_id;
     let output = SpawnAgentHandler::default()
         .handle(invocation(
@@ -695,7 +695,7 @@ async fn spawn_agent_full_history_inherits_parent_role_metadata() {
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
-    session.services.agent_control = manager.agent_control();
+    set_agent_control(&mut session, manager.agent_control());
     session.thread_id = root.thread_id;
     turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
         parent_thread_id: root.thread_id,
@@ -761,7 +761,7 @@ async fn spawn_agent_fresh_does_not_inherit_parent_role_metadata() {
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
-    session.services.agent_control = manager.agent_control();
+    set_agent_control(&mut session, manager.agent_control());
     session.thread_id = root.thread_id;
     turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
         parent_thread_id: root.thread_id,
@@ -976,7 +976,7 @@ async fn multi_agent_v2_fresh_does_not_inherit_parent_role_metadata() {
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
-    session.services.agent_control = manager.agent_control();
+    set_agent_control(&mut session, manager.agent_control());
     session.thread_id = root.thread_id;
     turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
         parent_thread_id: root.thread_id,
@@ -1037,7 +1037,7 @@ async fn multi_agent_v2_full_history_inherits_parent_identity() {
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
-    session.services.agent_control = manager.agent_control();
+    set_agent_control(&mut session, manager.agent_control());
     session.thread_id = root.thread_id;
     let output = SpawnAgentHandlerV2::default()
         .handle(invocation(
