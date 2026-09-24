@@ -786,7 +786,9 @@ async fn draining_process_store_coordinates_with_terminal_notification_claim() {
         (
             vec![1],
             vec![2, 3],
-            vec![2, 3, 4],
+            // Deterministic process ids (always on under test) stay reserved after removal
+            // so allocation never reuses them; production releases the drained id.
+            vec![1, 2, 3, 4],
             false,
             Some(false),
             true,
