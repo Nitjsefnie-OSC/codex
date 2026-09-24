@@ -1114,22 +1114,26 @@ impl Session {
     }
 
     /// Builds a context from the caller's chosen settings and environments without starting work.
-    async fn new_turn_from_configuration(
+    // Boxed: turn construction runs inside small-stack worker futures, and its
+    // state must live on the heap (default_turn_construction_future_stays_small).
+    fn new_turn_from_configuration(
         &self,
         sub_id: String,
         session_configuration: SessionConfiguration,
         turn_environments: TurnEnvironmentSnapshot,
         options: NewTurnContextOptions,
-    ) -> Arc<TurnContext> {
-        self.new_turn_context_from_configuration(
-            sub_id,
-            session_configuration,
-            turn_environments,
-            options,
-            TurnContextBuildMode::Full,
-            self.git_enrichment_policy,
-        )
-        .await
+    ) -> BoxFuture<'_, Arc<TurnContext>> {
+        Box::pin(async move {
+            self.new_turn_context_from_configuration(
+                sub_id,
+                session_configuration,
+                turn_environments,
+                options,
+                TurnContextBuildMode::Full,
+                self.git_enrichment_policy,
+            )
+            .await
+        })
     }
 
     async fn new_startup_prewarm_turn_from_configuration(
@@ -1367,9 +1371,8 @@ impl Session {
         options: NewTurnContextOptions,
     ) -> Arc<TurnContext> {
         let session_configuration = self.default_turn_configuration().await;
-        let turn_environments = self
-            .activate_turn_environments(&session_configuration)
-            .await;
+        let turn_environments =
+            Box::pin(self.activate_turn_environments(&session_configuration)).await;
         self.new_turn_from_configuration(sub_id, session_configuration, turn_environments, options)
             .await
     }
