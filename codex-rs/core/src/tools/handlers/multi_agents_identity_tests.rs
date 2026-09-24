@@ -60,7 +60,7 @@ async fn spawn_v1_agent_with_role_identity_and_configured_defaults(
     config.agent_default_subagent_model = configured_model.map(str::to_string);
     config.agent_default_subagent_reasoning_effort = configured_reasoning_effort;
     set_turn_config(&mut turn, config);
-    let role_name = install_role_with_model_override(&mut turn).await;
+    let role_name = install_role_with_model_and_effort_override(&mut turn, "low").await;
     let manager = thread_manager();
     set_agent_control(&mut session, manager.agent_control());
     let mut args = json!({
@@ -408,7 +408,7 @@ async fn spawn_v2_agent_with_role_identity_and_configured_defaults(
     configured.agent_default_subagent_model = configured_model.map(str::to_string);
     configured.agent_default_subagent_reasoning_effort = configured_reasoning_effort;
     set_turn_config(&mut turn, configured);
-    let role_name = install_role_with_model_override(&mut turn).await;
+    let role_name = install_role_with_model_and_effort_override(&mut turn, "low").await;
     let manager = thread_manager();
     let root = manager
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
@@ -682,7 +682,7 @@ async fn spawn_agent_full_history_inherits_parent_identity() {
 #[tokio::test]
 async fn spawn_agent_full_history_inherits_parent_role_metadata() {
     let (mut session, mut turn) = make_session_and_context().await;
-    let role_name = install_role_with_model_override(&mut turn).await;
+    let role_name = install_role_with_model_and_effort_override(&mut turn, "low").await;
     turn.developer_instructions = Some("parent role instructions".to_string());
     let expected_identity = (
         turn.model_info().slug.clone(),
@@ -755,7 +755,7 @@ async fn spawn_agent_full_history_inherits_parent_role_metadata() {
 #[tokio::test]
 async fn spawn_agent_fresh_does_not_inherit_parent_role_metadata() {
     let (mut session, mut turn) = make_session_and_context().await;
-    let role_name = install_role_with_model_override(&mut turn).await;
+    let role_name = install_role_with_model_and_effort_override(&mut turn, "low").await;
     let manager = thread_manager();
     let root = manager
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
@@ -964,7 +964,7 @@ async fn multi_agent_v2_full_history_inherits_parent_role_metadata() {
 #[tokio::test]
 async fn multi_agent_v2_fresh_does_not_inherit_parent_role_metadata() {
     let (mut session, mut turn) = make_session_and_context().await;
-    let role_name = install_role_with_model_override(&mut turn).await;
+    let role_name = install_role_with_model_and_effort_override(&mut turn, "low").await;
     let mut config = (*turn.config).clone();
     config
         .features

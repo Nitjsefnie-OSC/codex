@@ -153,6 +153,14 @@ fn thread_manager() -> ThreadManager {
 }
 
 async fn install_role_with_model_override(turn: &mut TurnContext) -> String {
+    install_role_with_model_and_effort_override(turn, "minimal").await
+}
+
+/// Installs the model-override role with the given `model_reasoning_effort`.
+async fn install_role_with_model_and_effort_override(
+    turn: &mut TurnContext,
+    reasoning_effort: &str,
+) -> String {
     let role_name = "fork-context-role".to_string();
     tokio::fs::create_dir_all(&turn.config.codex_home)
         .await
@@ -164,10 +172,12 @@ async fn install_role_with_model_override(turn: &mut TurnContext) -> String {
         .join("fork-context-role.toml");
     tokio::fs::write(
         &role_config_path,
-        r#"model = "gpt-5-role-override"
+        format!(
+            r#"model = "gpt-5-role-override"
 model_provider = "ollama"
-model_reasoning_effort = "minimal"
-"#,
+model_reasoning_effort = "{reasoning_effort}"
+"#
+        ),
     )
     .await
     .expect("role config should be written");

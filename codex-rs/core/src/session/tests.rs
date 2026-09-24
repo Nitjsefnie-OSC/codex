@@ -13018,7 +13018,7 @@ async fn active_mailbox_precedes_later_steer() {
                     text_elements: Vec::new(),
                 }],
                 client_id: None,
-                acceptance_order: None,
+                acceptance_order: Some(0),
             },
         ]
     );

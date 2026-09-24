@@ -328,7 +328,9 @@ async fn spawn_agent_tool_description_mentions_overridable_role_defaults() -> Re
         role_block(&agent_type_description, "custom").expect("custom role description");
     pretty_assertions::assert_eq!(
         custom_role_description,
-        "custom: {\nCustom role\n- This role's model defaults to `gpt-5.4` and its reasoning effort defaults to `high`. Explicit `model` and `reasoning_effort` spawn arguments override these defaults.\n}"
+        format!(
+            "custom: {{\nCustom role\n- This role's model defaults to `{ROLE_MODEL}` and its reasoning effort defaults to `high`. Explicit `model` and `reasoning_effort` spawn arguments override these defaults.\n}}"
+        )
     );
     assert!(
         tool_parameter_description(spawn_agent, "model")
