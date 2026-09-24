@@ -1,6 +1,8 @@
 use super::*;
 use crate::agent::api::AgentInput;
 use crate::agent::api::SpawnRequest;
+use crate::agent::child_config::apply_spawn_agent_runtime_overrides;
+use crate::agent::child_config::build_agent_spawn_config;
 use crate::agent::control::render_input_preview;
 use crate::agent::exceeds_thread_spawn_depth_limit;
 use crate::agent::next_thread_spawn_depth;
@@ -80,8 +82,11 @@ async fn handle_spawn_agent(
             "Agent depth limit reached. Solve the task yourself.".to_string(),
         ));
     }
-    let mut config =
-        build_agent_spawn_config(&session.get_base_instructions().await, turn.as_ref())?;
+    let mut config = build_agent_spawn_config(
+        &session.get_base_instructions().await,
+        step_context.as_ref(),
+    )
+    .map_err(FunctionCallError::RespondToModel)?;
     if let Some(service_tier) = args.service_tier.as_ref() {
         config.service_tier = Some(service_tier.clone());
     }
@@ -129,7 +134,8 @@ async fn handle_spawn_agent(
         args.service_tier.as_deref(),
     )
     .await?;
-    apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
+    apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())
+        .map_err(FunctionCallError::RespondToModel)?;
 
     let spawn_source = thread_spawn_source(
         session.thread_id,

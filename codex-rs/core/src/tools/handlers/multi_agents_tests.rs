@@ -1,7 +1,6 @@
 use super::*;
 use crate::StartThreadOptions;
 use crate::ThreadManager;
-use crate::agent::child_config::apply_spawn_agent_service_tier;
 use crate::agent::child_config::build_agent_resume_config;
 use crate::agent::child_config::build_agent_spawn_config;
 use crate::config::AgentRoleConfig;
@@ -464,9 +463,22 @@ async fn spawn_agent_service_tier_uses_root_preference_when_root_model_cannot_su
     assert_eq!(root.thread.config_snapshot().await.service_tier, None);
 
     config.model = Some("gpt-5.5".to_string());
-    apply_spawn_agent_service_tier(root.thread.session.as_ref(), &mut config)
-        .await
-        .expect("root preference should be resolved against the child model");
+    // Only the root preference is a candidate; the child config carries no tier of its own.
+    config.service_tier = None;
+    let root_service_tier = root
+        .thread
+        .session
+        .services
+        .agent_control
+        .root_service_tier();
+    apply_spawn_agent_service_tier(
+        root.thread.session.as_ref(),
+        &mut config,
+        root_service_tier.as_deref(),
+        /*requested_service_tier*/ None,
+    )
+    .await
+    .expect("root preference should be resolved against the child model");
 
     assert_eq!(
         config.service_tier,

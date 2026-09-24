@@ -18,11 +18,9 @@ use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
-use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ReasoningEffort;
-use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -171,48 +169,6 @@ pub(crate) fn parse_collab_input(
     }
 }
 
-/// Builds the base config snapshot for a newly spawned sub-agent.
-///
-/// The returned config starts from the parent's effective config and then refreshes the
-/// runtime-owned fields carried by the turn, including model selection, reasoning settings,
-/// approval policy, sandbox, and cwd. Role-specific overrides are layered
-/// after this step; skipping this helper and cloning stale config state directly can send the child
-/// agent out with the wrong provider or runtime policy.
-pub(crate) fn build_agent_spawn_config(
-    base_instructions: &BaseInstructions,
-    turn: &TurnContext,
-) -> Result<Config, FunctionCallError> {
-    let mut config = build_agent_shared_config(turn)?;
-    config.base_instructions = Some(base_instructions.text.clone());
-    config.base_instructions_provenance = base_instructions.provenance.clone();
-    Ok(config)
-}
-
-fn build_agent_shared_config(turn: &TurnContext) -> Result<Config, FunctionCallError> {
-    let base_config = turn.config.clone();
-    let mut config = (*base_config).clone();
-    config.model = Some(turn.model_info().slug.clone());
-    config.model_provider = turn.provider.info().clone();
-    config.model_reasoning_effort = turn
-        .reasoning_effort()
-        .or(turn.model_info().default_reasoning_level.as_ref())
-        .cloned();
-    config.model_reasoning_summary = Some(turn.reasoning_summary());
-    config.developer_instructions = turn.developer_instructions.clone();
-    if turn.multi_agent_version == MultiAgentVersion::V2
-        && let Some(developer_instructions) = turn
-            .config
-            .multi_agent_v2
-            .subagent_developer_instructions
-            .clone()
-    {
-        config.developer_instructions = Some(developer_instructions);
-    }
-    apply_spawn_agent_runtime_overrides(&mut config, turn)?;
-
-    Ok(config)
-}
-
 pub(crate) fn reject_full_fork_identity_overrides(
     agent_type: Option<&str>,
     model: Option<&str>,
@@ -230,39 +186,6 @@ pub(crate) fn reject_full_fork_identity_overrides(
     Err(FunctionCallError::RespondToModel(format!(
         "Full-history forked agents inherit the parent role, model, and reasoning effort; omit {field}, or spawn without a full-history fork."
     )))
-}
-
-/// Copies runtime-only turn state onto a child config before it is handed to `AgentControl`.
-///
-/// These values are chosen by the live turn rather than persisted config, so leaving them stale can
-/// make a child agent disagree with its parent about approval policy, cwd, or sandboxing.
-pub(crate) fn apply_spawn_agent_runtime_overrides(
-    config: &mut Config,
-    turn: &TurnContext,
-) -> Result<(), FunctionCallError> {
-    config
-        .permissions
-        .approval_policy
-        .set(turn.approval_policy())
-        .map_err(|err| {
-            FunctionCallError::RespondToModel(format!("approval_policy is invalid: {err}"))
-        })?;
-    config.approvals_reviewer = turn.config.approvals_reviewer;
-    #[allow(deprecated)]
-    let turn_cwd = turn.cwd.clone();
-    config.cwd = turn_cwd;
-    config
-        .permissions
-        .set_permission_profile_from_session_snapshot(
-            turn.config
-                .permissions
-                .permission_profile_state()
-                .snapshot(),
-        )
-        .map_err(|err| {
-            FunctionCallError::RespondToModel(format!("permission_profile is invalid: {err}"))
-        })?;
-    Ok(())
 }
 
 #[derive(Default)]

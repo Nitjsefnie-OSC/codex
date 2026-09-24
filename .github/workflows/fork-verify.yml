@@ -796,6 +796,34 @@ jobs:
           done
           exit "$failures"
 
+      - name: spawn config step-settings tests
+        # The fork's spawn handlers layer identity selection over upstream's
+        # step-captured child config. Each filter must run its known number
+        # of passing tests, so a renamed test cannot make this check vacuous.
+        timeout-minutes: 20
+        working-directory: codex-rs
+        run: |
+          set +e
+          failures=0
+          run_filter() {
+            local target=$1 filter=$2 expected=$3
+            output=$(timeout 8m cargo test -p codex-core $target "$filter" -- \
+              --nocapture --test-threads=1 2>&1)
+            status=$?
+            printf '%s\n' "$output"
+            if ! printf '%s\n' "$output" | grep -Eq "test result: ok\. ${expected} passed"; then
+              echo "::error::filter $filter did not run exactly $expected passing tests"
+              status=1
+            fi
+            if [ "$status" -ne 0 ]; then
+              failures=$((failures + 1))
+            fi
+          }
+          run_filter "--test all" suite::step_settings::agent_spawn:: 4
+          run_filter --lib tools::handlers::multi_agents::tests::build_agent_spawn_config_uses_captured_step_settings_and_turn_context_values 2
+          run_filter --lib tools::handlers::multi_agents::tests::spawn_agent_service_tier_uses_root_preference_when_root_model_cannot_support_it 1
+          exit "$failures"
+
       - name: golden tool-name list
         working-directory: codex-rs
         run: cargo test -p codex-core --test all prompt_caching -- --nocapture || true
