@@ -26,7 +26,8 @@ jobs:
   yielded-exec-idle-wake:
     if: github.event_name == 'push' || inputs.mode == '' || inputs.mode == 'full'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # A cold build of the core test targets alone takes most of half an hour.
+    timeout-minutes: 75
     env:
       RUST_MIN_STACK: "8388608" # 8 MiB
     steps:
@@ -65,10 +66,15 @@ jobs:
           cargo clean -p v8
           run_exact() {
             set +e
-            output=$("$@" 2>&1)
+            # Bound each filter so a hung test fails by name instead of
+            # consuming the job's whole budget.
+            output=$(timeout 20m "$@" 2>&1)
             status=$?
             set -e
             printf '%s\n' "$output"
+            if [ "$status" -eq 124 ]; then
+              echo "::error::timed out after 20m: $*"
+            fi
             if [ "$status" -ne 0 ] \
               || printf '%s\n' "$output" | grep -Fq 'Skipping test because it cannot execute when network is disabled in a Codex sandbox.' \
               || ! printf '%s\n' "$output" | grep -Eq 'test result: .* [1-9][0-9]* passed'; then
