@@ -159,7 +159,10 @@ async fn residency_evicts_completed_children_before_their_completed_parent() {
         .await
         .expect("start root thread");
     let control = manager.agent_control();
-    let state = control.runtime.upgrade().expect("thread manager should be live");
+    let state = control
+        .runtime
+        .upgrade()
+        .expect("thread manager should be live");
 
     let parent_slot = control
         .reserve_v2_residency_slot(&state, &config, /*protected_thread_id*/ None)

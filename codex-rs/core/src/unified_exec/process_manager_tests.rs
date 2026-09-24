@@ -743,7 +743,10 @@ async fn draining_process_store_coordinates_with_terminal_notification_claim() {
                 tty: false,
                 environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
                 permissions: super::super::TerminalPermissions::for_launch(
-                    turn.initial_environments.environments.primary().expect("turn environment"),
+                    turn.initial_environments
+                        .environments
+                        .primary()
+                        .expect("turn environment"),
                     &turn,
                     super::super::TerminalSandboxSource::Native,
                     crate::sandboxing::SandboxPermissions::UseDefault,

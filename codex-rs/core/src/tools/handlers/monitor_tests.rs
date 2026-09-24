@@ -63,7 +63,8 @@ async fn harness() -> Harness {
         codex_config::Constrained::allow_any(codex_protocol::protocol::AskForApproval::Never);
     turn_mut.config = Arc::new(config);
     let TurnEnvironmentState::Ready(environment) = turn_mut
-        .initial_environments.environments
+        .initial_environments
+        .environments
         .environments
         .first_mut()
         .expect("test session should have a primary environment")

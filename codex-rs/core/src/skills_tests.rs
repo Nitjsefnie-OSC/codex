@@ -137,7 +137,8 @@ pub(crate) fn configure_implicit_skill_fixture_for_exec(
     fixture.turn.config = Arc::new(config);
     let TurnEnvironmentState::Ready(environment) = fixture
         .turn
-        .initial_environments.environments
+        .initial_environments
+        .environments
         .environments
         .first_mut()
         .expect("test session should have a primary environment")
@@ -174,7 +175,8 @@ async fn prepare_test_implicit_skill_activation(
 pub(crate) async fn assert_implicit_skill_candidate(fixture: &ImplicitSkillFixture, command: &str) {
     let cwd = fixture
         .turn
-        .initial_environments.environments
+        .initial_environments
+        .environments
         .primary()
         .expect("test session should have a primary environment")
         .cwd()
