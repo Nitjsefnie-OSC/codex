@@ -561,13 +561,9 @@ impl LocalAgentControl {
                 communication.set_turn_id_if_missing(&completion_turn_id);
                 let context =
                     AgentCommunicationContext::new(AgentCommunicationKind::Result, child_thread_id);
+                // The completion op records the result durably and wakes an idle parent.
                 let _ = control
-                    .send_inter_agent_communication(
-                        parent_thread_id,
-                        communication,
-                        context,
-                        codex_protocol::turn_input::TurnStartOptions::default(),
-                    )
+                    .deliver_inter_agent_completion(parent_thread_id, communication, context)
                     .await;
                 return;
             }
