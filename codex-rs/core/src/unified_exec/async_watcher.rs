@@ -422,13 +422,7 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
         /*turn_diff_tracker*/ None,
     );
     event_ctx.sandbox_type = sandbox_type;
-    let emitter = ToolEmitter::unified_exec(
-        &command,
-        cwd,
-        ExecCommandSource::UnifiedExecStartup,
-        process_id,
-        plugin_attribution,
-    );
+    let emitter = ToolEmitter::unified_exec(&command, cwd, source, process_id, plugin_attribution);
     emitter
         .emit(
             event_ctx,
@@ -483,13 +477,7 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
         /*turn_diff_tracker*/ None,
     );
     event_ctx.sandbox_type = sandbox_type;
-    let emitter = ToolEmitter::unified_exec(
-        &command,
-        cwd,
-        ExecCommandSource::UnifiedExecStartup,
-        process_id,
-        plugin_attribution,
-    );
+    let emitter = ToolEmitter::unified_exec(&command, cwd, source, process_id, plugin_attribution);
     emitter
         .emit(
             event_ctx,
