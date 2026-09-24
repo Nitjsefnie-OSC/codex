@@ -1200,6 +1200,12 @@ impl Session {
             matches!(event, EventMsg::TurnComplete(_)) && self.is_private_guardian_reviewer().await;
         if !saved_guardian_completion {
             self.send_event(turn_context.as_ref(), event.clone()).await;
+            // Signal persistence before taking the turn-start and delivery locks: an
+            // interrupt of this finishing turn waits for it while holding the delivery lock.
+            if let Err(err) = self.flush_rollout().await {
+                warn!("failed to flush rollout after emitting terminal turn event: {err}");
+            }
+            terminal_persisted_tx.send_replace(true);
         }
 
         let _turn_start_guard = self.input_queue.lock_turn_start().await;
@@ -1295,11 +1301,9 @@ impl Session {
         }
         drop(_turn_start_guard);
         // Private reviewers already flushed the terminal event before delivering it.
-        // Other buffering writers still need a barrier for the terminal event.
-        if !saved_guardian_completion && let Err(err) = self.flush_rollout().await {
-            warn!("failed to flush rollout after emitting terminal turn event: {err}");
+        if saved_guardian_completion {
+            terminal_persisted_tx.send_replace(true);
         }
-        terminal_persisted_tx.send_replace(true);
         if cleared_active_turn {
             self.maybe_start_turn_for_pending_work().await;
             self.input_queue.notify_background_wake();
