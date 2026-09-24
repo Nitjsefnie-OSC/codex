@@ -81,8 +81,6 @@ pub async fn inter_agent_communication(
     sess: &Arc<Session>,
     sub_id: String,
     communication: InterAgentCommunication,
-    parent_turn_id: Option<String>,
-    root_turn_id: Option<String>,
     start_options: codex_protocol::turn_input::TurnStartOptions,
 ) {
     let trigger_turn = communication.trigger_turn;
@@ -576,15 +574,8 @@ fn dispatch_submission(
                 communication,
                 start_options,
             } => {
-                inter_agent_communication(
-                    &sess,
-                    sub.id.clone(),
-                    communication,
-                    sub.parent_turn_id,
-                    sub.root_turn_id,
-                    start_options,
-                )
-                .await;
+                inter_agent_communication(&sess, sub.id.clone(), communication, start_options)
+                    .await;
                 false
             }
             Op::InterAgentCompletion { communication } => {
