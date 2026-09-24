@@ -310,7 +310,10 @@ impl Session {
         clippy::await_holding_invalid_type,
         reason = "record the started turn atomically with its active reservation"
     )]
-    pub(crate) async fn start_task<T: SessionTask>(
+    // Deliberately not `async`: callers `.await` the returned future, which
+    // runs the task start. As an `async fn` the `.await` would only yield this
+    // BoxFuture, which is then dropped unpolled and the turn never starts.
+    pub(crate) fn start_task<T: SessionTask>(
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
         input: Vec<TurnInput>,
