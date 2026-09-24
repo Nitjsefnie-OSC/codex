@@ -139,7 +139,6 @@ pub(crate) fn configure_implicit_skill_fixture_for_exec(
         .turn
         .initial_environments
         .environments
-        .environments
         .first_mut()
         .expect("test session should have a primary environment")
     else {
@@ -176,7 +175,6 @@ pub(crate) async fn assert_implicit_skill_candidate(fixture: &ImplicitSkillFixtu
     let cwd = fixture
         .turn
         .initial_environments
-        .environments
         .primary()
         .expect("test session should have a primary environment")
         .cwd()

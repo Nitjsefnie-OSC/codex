@@ -11507,7 +11507,11 @@ impl SessionTask for RecordOnAbortTask {
 
     async fn abort(&self, session: Arc<Session>, ctx: Arc<TurnContext>) {
         session
-            .record_conversation_items(ctx.as_ref(), std::slice::from_ref(&self.item))
+            .record_conversation_items(
+                ctx.as_ref(),
+                ctx.model_info(),
+                std::slice::from_ref(&self.item),
+            )
             .await;
     }
 }
