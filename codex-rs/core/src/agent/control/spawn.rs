@@ -555,7 +555,8 @@ impl LocalAgentControl {
                     let owner_config = owner_environment.config();
                     let child_config = match &selection.config {
                         EnvironmentConfigState::FromThread => {
-                            // Pin current owner authority instead of re-inferring child settings.                            selection.config = EnvironmentConfigState::Ready(owner_config.clone());
+                            // Pin current owner authority instead of re-inferring child settings.
+                            selection.config = EnvironmentConfigState::Ready(owner_config.clone());
                             continue;
                         }
                         EnvironmentConfigState::Ready(config) => config,
