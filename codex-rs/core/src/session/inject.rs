@@ -108,6 +108,14 @@ impl Session {
             .input_queue
             .lock_background_notification_delivery()
             .await;
+        self.inject_if_running_under_delivery(input).await
+    }
+
+    /// Callers must already hold the background-notification delivery lock.
+    async fn inject_if_running_under_delivery<T: Into<ResponseItemEnvelope>>(
+        &self,
+        input: Vec<T>,
+    ) -> Result<(), Vec<T>> {
         let mut active = self.active_turn.lock().await;
         match active.as_mut() {
             Some(active_turn) => {
@@ -461,7 +469,7 @@ impl Session {
             .input_queue
             .lock_background_notification_delivery()
             .await;
-        let Err(items) = self.inject_if_running(items).await else {
+        let Err(items) = self.inject_if_running_under_delivery(items).await else {
             return;
         };
         let default_turn_context;
