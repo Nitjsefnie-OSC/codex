@@ -3796,3 +3796,6 @@ async fn spawn_agent_tool_description_mentions_role_locked_settings() -> Result<
 
     Ok(())
 }
+
+#[path = "subagent_identity.rs"]
+mod identity;

@@ -4670,3 +4670,6 @@ async fn build_agent_resume_config_clears_base_instructions() {
         .expect("approval policy set");
     assert_eq!(config, expected);
 }
+
+#[path = "multi_agents_identity_tests.rs"]
+mod identity_tests;
