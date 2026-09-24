@@ -48,6 +48,7 @@ use codex_skills::SkillError;
 use codex_utils_git_discovery::GitRootDiscovery;
 use codex_utils_path::replace_path_and_deduplicate;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
 use tokio::sync::Semaphore;
 
 type McpToolApprovalMetadataMap =
@@ -90,6 +91,8 @@ pub(crate) struct Session {
     pub(crate) realtime_history: Option<Mutex<crate::realtime_history::RealtimeHistoryState>>,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
     pub(crate) async_hook_results: async_channel::Receiver<HookCompletedEvent>,
+    /// Blocks extension-initiated idle turns once session teardown begins.
+    pub(crate) shutdown_started: AtomicBool,
     pub(crate) input_queue: InputQueue,
     pub(crate) services: SessionServices,
     pub(super) git_enrichment_policy: GitEnrichmentPolicy,
@@ -1783,6 +1786,7 @@ impl Session {
                 .then(|| Mutex::new(Default::default())),
                 active_turn: Mutex::new(None),
                 async_hook_results,
+                shutdown_started: AtomicBool::new(false),
                 input_queue: InputQueue::new(),
                 services,
                 git_enrichment_policy,

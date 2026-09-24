@@ -1,12 +1,15 @@
 use super::*;
 use crate::config::ConfigBuilder;
+use crate::config::ConfigOverrides;
 use crate::plugins::plugins_manager_for_config;
 use crate::skills_load_input_from_config;
 use codex_config::test_support::CloudConfigBundleFixture;
 use codex_login::test_support::auth_manager_from_optional_auth;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::models::BaseInstructionsProvenance;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::protocol::AskForApproval;
 use codex_skills_extension::HostSkillsService;
 use codex_utils_absolute_path::test_support::PathExt;
 use pretty_assertions::assert_eq;
@@ -36,6 +39,92 @@ async fn write_role_config(home: &TempDir, name: &str, contents: &str) -> PathBu
         .await
         .expect("write role config");
     role_path
+}
+
+#[tokio::test]
+async fn apply_exec_agent_role_uses_role_identity_and_preserves_runtime_state() {
+    let home = TempDir::new().expect("create temp dir");
+    let runtime_root = home.path().join("runtime-root");
+    fs::create_dir_all(&runtime_root).expect("create runtime root");
+    let role_path = write_role_config(
+        &home,
+        "adversary.toml",
+        r#"model = "role-model"
+model_reasoning_effort = "high"
+developer_instructions = "ROLE-DEVELOPER-MARKER"
+approval_policy = "on-request"
+sandbox_mode = "read-only"
+include_permissions_instructions = false
+"#,
+    )
+    .await;
+    let mut config = ConfigBuilder::default()
+        .codex_home(home.path().to_path_buf())
+        .fallback_cwd(Some(home.path().to_path_buf()))
+        .harness_overrides(ConfigOverrides {
+            model: Some("cli-model".to_string()),
+            approval_policy: Some(AskForApproval::Never),
+            permission_profile: Some(PermissionProfile::Disabled),
+            workspace_roots: Some(vec![runtime_root.abs()]),
+            codex_self_exe: Some(PathBuf::from("/runtime/codex")),
+            codex_linux_sandbox_exe: Some(PathBuf::from("/runtime/bwrap")),
+            main_execve_wrapper_exe: Some(PathBuf::from("/runtime/execve-wrapper")),
+            ephemeral: Some(true),
+            bypass_hook_trust: Some(true),
+            ..Default::default()
+        })
+        .build()
+        .await
+        .expect("load exec config");
+    config.agent_roles.insert(
+        "adversary".to_string(),
+        AgentRoleConfig {
+            description: Some("Adversarial reviewer".to_string()),
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    );
+    let runtime_permissions = config.permissions.clone();
+    let runtime_cwd = config.cwd.clone();
+    let runtime_workspace_roots = config.workspace_roots.clone();
+
+    apply_exec_agent_role(&mut config, "adversary")
+        .await
+        .expect("exec role should apply");
+
+    assert_eq!(config.model.as_deref(), Some("role-model"));
+    assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::High));
+    assert_eq!(
+        config.developer_instructions.as_deref(),
+        Some("ROLE-DEVELOPER-MARKER")
+    );
+    assert_eq!(config.permissions, runtime_permissions);
+    assert!(config.include_permissions_instructions);
+    assert_eq!(config.cwd, runtime_cwd);
+    assert_eq!(config.workspace_roots, runtime_workspace_roots);
+    assert!(config.workspace_roots_explicit);
+    assert!(config.ephemeral);
+    assert!(config.bypass_hook_trust);
+    assert_eq!(config.codex_self_exe, Some(PathBuf::from("/runtime/codex")));
+    assert_eq!(
+        config.codex_linux_sandbox_exe,
+        Some(PathBuf::from("/runtime/bwrap"))
+    );
+    assert_eq!(
+        config.main_execve_wrapper_exe,
+        Some(PathBuf::from("/runtime/execve-wrapper"))
+    );
+}
+
+#[tokio::test]
+async fn apply_exec_agent_role_rejects_unknown_role() {
+    let (_home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+
+    let error = apply_exec_agent_role(&mut config, "missing-role")
+        .await
+        .expect_err("unknown exec role should fail");
+
+    assert_eq!(error, "unknown agent_type 'missing-role'");
 }
 
 fn session_flags_layer_count(config: &Config) -> usize {
@@ -700,7 +789,7 @@ fn spawn_tool_spec_lists_user_defined_roles_before_built_ins() {
 }
 
 #[test]
-fn spawn_tool_spec_marks_role_locked_model_and_reasoning_effort() {
+fn spawn_tool_spec_marks_role_model_and_reasoning_effort_defaults() {
     let tempdir = TempDir::new().expect("create temp dir");
     let role_path = tempdir.path().join("researcher.toml");
     fs::write(
@@ -720,12 +809,41 @@ fn spawn_tool_spec_marks_role_locked_model_and_reasoning_effort() {
     let spec = spawn_tool_spec::build(&user_defined_roles);
 
     assert!(spec.contains(
-            "Research carefully.\n- This role's model is set to `gpt-5` and its reasoning effort is set to `high`. These settings cannot be changed."
+            "Research carefully.\n- This role's model defaults to `gpt-5` and its reasoning effort defaults to `high`. Explicit `model` and `reasoning_effort` spawn arguments override these defaults."
         ));
 }
 
 #[test]
-fn spawn_tool_spec_marks_role_locked_reasoning_effort_only() {
+fn spawn_tool_spec_omits_hidden_identity_override_guidance() {
+    let tempdir = TempDir::new().expect("create temp dir");
+    let role_path = tempdir.path().join("researcher.toml");
+    fs::write(
+        &role_path,
+        "model = \"gpt-5\"\nmodel_reasoning_effort = \"high\"\n",
+    )
+    .expect("write role config");
+    let user_defined_roles = BTreeMap::from([(
+        "researcher".to_string(),
+        AgentRoleConfig {
+            description: Some("Research carefully.".to_string()),
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    )]);
+
+    let spec = spawn_tool_spec::build_with_model_overrides(
+        &user_defined_roles,
+        spawn_tool_spec::ModelOverrideExposure::Hidden,
+    );
+
+    assert!(spec.contains("researcher: {\nResearch carefully.\n- This role's model defaults to `gpt-5` and its reasoning effort defaults to `high`.\n}"));
+    assert!(!spec.contains(
+        "Explicit `model` and `reasoning_effort` spawn arguments override these defaults."
+    ));
+}
+
+#[test]
+fn spawn_tool_spec_marks_role_reasoning_effort_default() {
     let tempdir = TempDir::new().expect("create temp dir");
     let role_path = tempdir.path().join("reviewer.toml");
     fs::write(
@@ -745,7 +863,7 @@ fn spawn_tool_spec_marks_role_locked_reasoning_effort_only() {
     let spec = spawn_tool_spec::build(&user_defined_roles);
 
     assert!(spec.contains(
-            "Review carefully.\n- This role's reasoning effort is set to `medium` and cannot be changed."
+            "Review carefully.\n- This role's reasoning effort defaults to `medium`. An explicit `reasoning_effort` spawn argument overrides this default."
         ));
 }
 

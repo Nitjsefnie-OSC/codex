@@ -135,12 +135,15 @@ mod model_visible_layout;
 mod models_cache_auth;
 mod models_cache_ttl;
 mod models_etag_responses;
+#[cfg(unix)]
+mod monitor;
 mod multi_agent_mode;
 mod multi_agent_resume;
 mod multi_agent_tool_descriptions;
 #[cfg(unix)]
 mod multi_exec_server_sandbox;
 mod network_approval;
+mod notification_interrupt;
 mod openai_file_mcp;
 mod otel;
 mod override_updates;
@@ -210,6 +213,9 @@ mod truncation;
 mod turn_input_submission;
 mod turn_state;
 mod unified_exec;
+#[cfg(unix)]
+mod unified_exec_idle_wake;
+
 #[path = "unified_exec_launch_failure_tests.rs"]
 mod unified_exec_launch_failure;
 mod unified_exec_process_events;
@@ -225,6 +231,7 @@ mod web_search;
 #[path = "web_search_system_proxy_tests.rs"]
 mod web_search_system_proxy;
 mod websocket_fallback;
+mod whoami;
 mod window_headers;
 #[cfg(target_os = "windows")]
 mod windows_sandbox;

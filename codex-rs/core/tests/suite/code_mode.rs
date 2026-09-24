@@ -96,6 +96,7 @@ use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
 use core_test_support::wait_for_mcp_server;
+use futures::future::BoxFuture;
 use image::DynamicImage;
 use image::GenericImageView;
 use image::ImageBuffer;
@@ -264,35 +265,60 @@ async fn run_code_mode_turn_with_model_and_config(
     run_code_mode_turn_with_builder(server, prompt, code, builder).await
 }
 
-async fn run_code_mode_turn_with_builder(
-    server: &MockServer,
-    prompt: &str,
-    code: &str,
+fn run_code_mode_turn_with_builder<'a>(
+    server: &'a MockServer,
+    prompt: &'a str,
+    code: &'a str,
     mut builder: TestCodexBuilder,
-) -> Result<(TestCodex, ResponseMock)> {
-    let test = builder.build(server).await?;
+) -> BoxFuture<'a, Result<(TestCodex, ResponseMock)>> {
+    Box::pin(async move {
+        let test = builder.build(server).await?;
 
-    responses::mount_sse_once(
-        server,
-        sse(vec![
-            ev_response_created("resp-1"),
-            ev_custom_tool_call("call-1", "exec", code),
-            ev_completed("resp-1"),
-        ]),
-    )
-    .await;
+        responses::mount_sse_once(
+            server,
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_custom_tool_call("call-1", "exec", code),
+                ev_completed("resp-1"),
+            ]),
+        )
+        .await;
 
-    let second_mock = responses::mount_sse_once(
-        server,
-        sse(vec![
-            ev_assistant_message("msg-1", "done"),
-            ev_completed("resp-2"),
-        ]),
-    )
-    .await;
+        let second_mock = responses::mount_sse_once(
+            server,
+            sse(vec![
+                ev_assistant_message("msg-1", "done"),
+                ev_completed("resp-2"),
+            ]),
+        )
+        .await;
 
-    test.submit_turn(prompt).await?;
-    Ok((test, second_mock))
+        test.submit_turn(prompt).await?;
+        Ok((test, second_mock))
+    })
+}
+
+fn run_code_mode_failure_test(
+    test_name: &'static str,
+    test: impl FnOnce() -> BoxFuture<'static, Result<()>> + Send + 'static,
+) -> Result<()> {
+    const TEST_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
+
+    let handle = std::thread::Builder::new()
+        .name(test_name.to_string())
+        .stack_size(TEST_STACK_SIZE_BYTES)
+        .spawn(move || -> Result<()> {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()?;
+            runtime.block_on(test())
+        })?;
+
+    match handle.join() {
+        Ok(result) => result,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
 }
 
 async fn run_unavailable_code_mode_turn(
@@ -370,8 +396,17 @@ async fn missing_process_host_falls_back_to_direct_tools_and_warns_once() -> Res
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn missing_process_host_keeps_code_mode_only_and_fails_closed() -> Result<()> {
+// Upstream growth can make these failure-path futures overflow libtest's default thread stack
+// before the Tokio runtime runs their assertions.
+#[test]
+fn missing_process_host_keeps_code_mode_only_and_fails_closed() -> Result<()> {
+    run_code_mode_failure_test(
+        "missing_process_host_keeps_code_mode_only_and_fails_closed",
+        || Box::pin(missing_process_host_keeps_code_mode_only_and_fails_closed_impl()),
+    )
+}
+
+async fn missing_process_host_keeps_code_mode_only_and_fails_closed_impl() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -384,15 +419,27 @@ async fn missing_process_host_keeps_code_mode_only_and_fails_closed() -> Result<
                 .enable(Feature::CodeModeOnly)
                 .expect("code mode should be enabled");
         });
-    let (_test, follow_up_mock) = run_code_mode_turn_with_builder(
+    let (_test, _follow_up_mock) = run_code_mode_turn_with_builder(
         &server,
         "Run required code mode",
         "text('unreachable')",
         builder,
     )
     .await?;
-    let request = follow_up_mock.single_request();
-    let tools = tool_names(&request.body_json());
+    let requests = server
+        .received_requests()
+        .await
+        .expect("received requests should be available");
+    let response_requests = requests
+        .iter()
+        .filter(|request| request.url.path() == "/v1/responses")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        response_requests.len(),
+        1,
+        "a host spawn failure must abort before a model follow-up"
+    );
+    let tools = tool_names(&response_requests[0].body_json::<Value>()?);
     assert!(
         tools.iter().any(|name| name == "exec") && tools.iter().any(|name| name == "wait"),
         "code-mode-only must retain code-mode tools: {tools:?}"
@@ -403,17 +450,18 @@ async fn missing_process_host_keeps_code_mode_only_and_fails_closed() -> Result<
             .all(|name| !matches!(name.as_str(), "shell" | "exec_command")),
         "code-mode-only must never expose direct shell tools: {tools:?}"
     );
-    let (output, _) = custom_tool_output_body_and_success(&request, "call-1");
-    assert!(
-        output.contains("codex-code-mode-host-does-not-exist"),
-        "code-mode-only must report the host failure: {output}"
-    );
-
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn missing_process_host_fails_closed_when_direct_fallback_is_disabled() -> Result<()> {
+#[test]
+fn missing_process_host_fails_closed_when_direct_fallback_is_disabled() -> Result<()> {
+    run_code_mode_failure_test(
+        "missing_process_host_fails_closed_when_direct_fallback_is_disabled",
+        || Box::pin(missing_process_host_fails_closed_when_direct_fallback_is_disabled_impl()),
+    )
+}
+
+async fn missing_process_host_fails_closed_when_direct_fallback_is_disabled_impl() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -427,30 +475,43 @@ async fn missing_process_host_fails_closed_when_direct_fallback_is_disabled() ->
                 .expect("code mode should be enabled");
             config.code_mode.disable_in_process_fallback = true;
         });
-    let (_test, follow_up_mock) = run_code_mode_turn_with_builder(
+    let (_test, _follow_up_mock) = run_code_mode_turn_with_builder(
         &server,
         "Run required code mode",
         "text('unreachable')",
         builder,
     )
     .await?;
-    let request = follow_up_mock.single_request();
-    let tools = tool_names(&request.body_json());
+    let requests = server
+        .received_requests()
+        .await
+        .expect("received requests should be available");
+    let response_requests = requests
+        .iter()
+        .filter(|request| request.url.path() == "/v1/responses")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        response_requests.len(),
+        1,
+        "a host spawn failure must abort before a model follow-up"
+    );
+    let tools = tool_names(&response_requests[0].body_json::<Value>()?);
     assert!(
         tools.iter().any(|name| name == "exec") && tools.iter().any(|name| name == "wait"),
         "disabled fallback must retain code-mode tools: {tools:?}"
     );
-    let (output, _) = custom_tool_output_body_and_success(&request, "call-1");
-    assert!(
-        output.contains("codex-code-mode-host-does-not-exist"),
-        "disabled fallback must report the host failure: {output}"
-    );
-
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn disabled_process_host_with_fallback_disabled_attempts_the_host() -> Result<()> {
+#[test]
+fn disabled_process_host_with_fallback_disabled_attempts_the_host() -> Result<()> {
+    run_code_mode_failure_test(
+        "disabled_process_host_with_fallback_disabled_attempts_the_host",
+        || Box::pin(disabled_process_host_with_fallback_disabled_attempts_the_host_impl()),
+    )
+}
+
+async fn disabled_process_host_with_fallback_disabled_attempts_the_host_impl() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -467,18 +528,23 @@ async fn disabled_process_host_with_fallback_disabled_attempts_the_host() -> Res
                 .expect("code-mode host should be disabled");
             config.code_mode.disable_in_process_fallback = true;
         });
-    let (_test, follow_up_mock) = run_code_mode_turn_with_builder(
+    let (_test, _follow_up_mock) = run_code_mode_turn_with_builder(
         &server,
         "Run required code mode",
         "text('unreachable')",
         builder,
     )
     .await?;
-    let request = follow_up_mock.single_request();
-    let (output, _) = custom_tool_output_body_and_success(&request, "call-1");
-    assert!(
-        output.contains("failed to spawn code-mode host"),
-        "disabled fallback must still attempt the standalone host: {output}"
+    let response_count = server
+        .received_requests()
+        .await
+        .expect("received requests should be available")
+        .into_iter()
+        .filter(|request| request.url.path() == "/v1/responses")
+        .count();
+    assert_eq!(
+        response_count, 1,
+        "disabled fallback must attempt the host and abort before follow-up"
     );
 
     Ok(())

@@ -7,6 +7,63 @@
         "string",
         "null"
       ]
+    },
+    "SkillActivation": {
+      "additionalProperties": false,
+      "properties": {
+        "content_sha256": {
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "invocation": {
+          "$ref": "#/definitions/SkillActivationKind"
+        },
+        "name": {
+          "minLength": 1,
+          "pattern": ".*\\S.*",
+          "type": "string"
+        },
+        "path": {
+          "minLength": 1,
+          "pattern": ".*\\S.*",
+          "type": "string"
+        },
+        "scope": {
+          "$ref": "#/definitions/SkillActivationScope"
+        },
+        "turn_id": {
+          "minLength": 1,
+          "pattern": ".*\\S.*",
+          "type": "string"
+        }
+      },
+      "required": [
+        "content_sha256",
+        "invocation",
+        "name",
+        "path",
+        "scope",
+        "turn_id"
+      ],
+      "type": "object"
+    },
+    "SkillActivationKind": {
+      "enum": [
+        "explicit",
+        "implicit"
+      ],
+      "type": "string"
+    },
+    "SkillActivationScope": {
+      "enum": [
+        "user",
+        "repo",
+        "system",
+        "admin"
+      ],
+      "type": "string"
     }
   },
   "properties": {
@@ -39,6 +96,12 @@
     "session_id": {
       "type": "string"
     },
+    "skill_activations": {
+      "items": {
+        "$ref": "#/definitions/SkillActivation"
+      },
+      "type": "array"
+    },
     "tool_input": true,
     "tool_name": {
       "type": "string"
@@ -60,6 +123,7 @@
     "model",
     "permission_mode",
     "session_id",
+    "skill_activations",
     "tool_input",
     "tool_name",
     "tool_use_id",

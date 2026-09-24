@@ -240,6 +240,7 @@ mod permission_shortcuts;
 mod pets;
 mod platform_actions;
 mod plugin_mentions;
+mod process_list;
 mod rate_limit_refresh;
 mod realtime_delivery;
 mod realtime_settings;

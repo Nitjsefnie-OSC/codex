@@ -1,7 +1,6 @@
 use super::*;
 use crate::StartThreadOptions;
 use crate::ThreadManager;
-use crate::agent::child_config::apply_spawn_agent_service_tier;
 use crate::agent::child_config::build_agent_resume_config;
 use crate::agent::child_config::build_agent_spawn_config;
 use crate::config::AgentRoleConfig;
@@ -17,6 +16,8 @@ use crate::session::tests::make_session_and_context;
 use crate::session::tests::update_selected_settings_for_test;
 use crate::session::tests::update_turn_settings_for_test;
 use crate::session::turn_context::TurnContext;
+use crate::session_prefix::bounded_completion_turn_id;
+use crate::session_prefix::completion_agent_identity;
 use crate::session_prefix::format_inter_agent_completion_message;
 use crate::thread_manager::thread_store_from_config;
 use crate::tools::context::ToolOutput;
@@ -151,6 +152,14 @@ fn thread_manager() -> ThreadManager {
 }
 
 async fn install_role_with_model_override(turn: &mut TurnContext) -> String {
+    install_role_with_model_and_effort_override(turn, "minimal").await
+}
+
+/// Installs the model-override role with the given `model_reasoning_effort`.
+async fn install_role_with_model_and_effort_override(
+    turn: &mut TurnContext,
+    reasoning_effort: &str,
+) -> String {
     let role_name = "fork-context-role".to_string();
     tokio::fs::create_dir_all(&turn.config.codex_home)
         .await
@@ -162,10 +171,12 @@ async fn install_role_with_model_override(turn: &mut TurnContext) -> String {
         .join("fork-context-role.toml");
     tokio::fs::write(
         &role_config_path,
-        r#"model = "gpt-5-role-override"
+        format!(
+            r#"model = "gpt-5-role-override"
 model_provider = "ollama"
-model_reasoning_effort = "minimal"
-"#,
+model_reasoning_effort = "{reasoning_effort}"
+"#
+        ),
     )
     .await
     .expect("role config should be written");
@@ -452,9 +463,22 @@ async fn spawn_agent_service_tier_uses_root_preference_when_root_model_cannot_su
     assert_eq!(root.thread.config_snapshot().await.service_tier, None);
 
     config.model = Some("gpt-5.5".to_string());
-    apply_spawn_agent_service_tier(root.thread.session.as_ref(), &mut config)
-        .await
-        .expect("root preference should be resolved against the child model");
+    // Only the root preference is a candidate; the child config carries no tier of its own.
+    config.service_tier = None;
+    let root_service_tier = root
+        .thread
+        .session
+        .services
+        .agent_control
+        .root_service_tier();
+    apply_spawn_agent_service_tier(
+        root.thread.session.as_ref(),
+        &mut config,
+        root_service_tier.as_deref(),
+        /*requested_service_tier*/ None,
+    )
+    .await
+    .expect("root preference should be resolved against the child model");
 
     assert_eq!(
         config.service_tier,
@@ -1955,16 +1979,23 @@ async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn()
         )
         .await;
 
+    // Match the completion path: identities and a bounded turn id per turn.
+    let root_identity = completion_agent_identity(&AgentPath::root(), root.thread_id);
+    let worker_identity = completion_agent_identity(&worker_path, agent_id);
+    let first_turn_id = bounded_completion_turn_id(&first_turn.sub_id);
+    let second_turn_id = bounded_completion_turn_id(&second_turn.sub_id);
     let first_notification = format_inter_agent_completion_message(
-        AgentPath::root(),
-        worker_path.clone(),
+        &root_identity,
+        &worker_identity,
         &AgentStatus::Completed(Some("first done".to_string())),
+        Some(&first_turn_id),
     )
     .expect("completed status should render");
     let second_notification = format_inter_agent_completion_message(
-        AgentPath::root(),
-        worker_path.clone(),
+        &root_identity,
+        &worker_identity,
         &AgentStatus::Completed(Some("second done".to_string())),
+        Some(&second_turn_id),
     )
     .expect("completed status should render");
 
@@ -4661,3 +4692,6 @@ async fn build_agent_resume_config_clears_base_instructions() {
         .expect("approval policy set");
     assert_eq!(config, expected);
 }
+
+#[path = "multi_agents_identity_tests.rs"]
+mod identity_tests;

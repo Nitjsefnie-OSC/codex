@@ -1,0 +1,8 @@
+---
+source: tui/src/chatwidget/tests/plan_mode.rs
+assertion_line: 142
+expression: normalize_snapshot_paths(popup)
+---
+› make a plan
+
+  gpt-5 default · /tmp/project

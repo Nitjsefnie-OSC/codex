@@ -1,4 +1,5 @@
 use super::*;
+use crate::unified_exec::InitialExecCommandOutcome;
 use crate::unified_exec::clamp_yield_time;
 use codex_network_proxy::ManagedNetworkSandboxContext;
 use pretty_assertions::assert_eq;
@@ -417,6 +418,31 @@ async fn output_collection_preserves_omissions_from_drained_buffer() {
 }
 
 #[tokio::test]
+async fn process_exit_ends_output_collection_while_elicitation_is_paused() {
+    let cancellation_token = CancellationToken::new();
+    let output: OutputHandles = OutputHandles {
+        output_buffer: Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default())),
+        output_notify: Arc::new(Notify::new()),
+        output_closed: Arc::new(AtomicBool::new(true)),
+        output_closed_notify: Arc::new(Notify::new()),
+        cancellation_token: cancellation_token.clone(),
+    };
+    let (_pause_tx, pause_state) = tokio::sync::watch::channel(true);
+    let collect = UnifiedExecProcessManager::collect_output_until_deadline(
+        &output,
+        Some(pause_state),
+        Instant::now() + Duration::from_secs(5),
+    );
+
+    cancellation_token.cancel();
+    let collected = tokio::time::timeout(Duration::from_secs(1), collect)
+        .await
+        .expect("process exit should end paused output collection");
+
+    assert_eq!(collected, HeadTailBuffer::default());
+}
+
+#[tokio::test]
 async fn network_denial_fallback_message_names_sandbox_network_proxy() {
     let message = network_denial_message_for_session(/*session*/ None, /*deferred*/ None).await;
 
@@ -446,6 +472,7 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
         crate::session::step_context::StepContext::for_test(Arc::clone(&turn)),
         tokio_util::sync::CancellationToken::new(),
         "call-unified-denied".to_string(),
+        crate::unified_exec::InitialExecCommandOutputDestination::Rollout,
     );
     let request = ExecCommandRequest {
         command: vec![
@@ -487,6 +514,7 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
         &request,
         #[allow(deprecated)]
         turn.cwd.clone().into(),
+        ExecCommandSource::UnifiedExecStartup,
         /*plugin_attribution*/ None,
         transcript,
         "PRE_DENIAL_MARKER".to_string(),
@@ -631,7 +659,9 @@ async fn pruning_does_not_evict_live_process_while_exited_process_is_finalizing(
                 call_id: format!("call-{process_id}"),
                 process_id,
                 cwd: cwd.clone(),
-                initial_exec_command_active: Arc::new(AtomicBool::new(false)),
+                initial_exec_command_state: Arc::new(InitialExecCommandState::resolved(
+                    InitialExecCommandOutcome::NotYielded,
+                )),
                 hook_command: format!("command-{process_id}"),
                 tty: false,
                 environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
@@ -661,5 +691,108 @@ async fn pruning_does_not_evict_live_process_while_exited_process_is_finalizing(
     assert_eq!(
         (pruned.map(|entry| entry.process_id), store.processes.len()),
         (None, MAX_UNIFIED_EXEC_PROCESSES)
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn draining_process_store_coordinates_with_terminal_notification_claim() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let process = Arc::new(
+        crate::unified_exec::process_tests::remote_process(
+            codex_exec_server::WriteStatus::Accepted,
+            /*terminate_error*/ None,
+            codex_sandboxing::SandboxType::None,
+        )
+        .await,
+    );
+    let cleanup_wins = Arc::new(InitialExecCommandState::resolved(
+        InitialExecCommandOutcome::Yielded,
+    ));
+    let notification_wins = Arc::new(InitialExecCommandState::resolved(
+        InitialExecCommandOutcome::Yielded,
+    ));
+    let unrecorded = Arc::new(InitialExecCommandState::new());
+    unrecorded.mark_returned();
+    assert_eq!(
+        notification_wins.claim_terminal_notification().await,
+        Some(true)
+    );
+    let mut store = ProcessStore::default();
+    for (process_id, state) in [
+        (1, &cleanup_wins),
+        (2, &notification_wins),
+        (3, &unrecorded),
+    ] {
+        store.reserved_process_ids.insert(process_id);
+        store
+            .reservation_owners
+            .insert(process_id, Arc::downgrade(&process));
+        store.processes.insert(
+            process_id,
+            ProcessEntry {
+                process: Arc::clone(&process),
+                plugin_metrics_sidecar: None,
+                call_id: format!("call-{process_id}"),
+                process_id,
+                cwd: PathUri::parse("file:///tmp").expect("test cwd should be valid"),
+                initial_exec_command_state: Arc::clone(state),
+                hook_command: format!("command-{process_id}"),
+                tty: false,
+                environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
+                permissions: super::super::TerminalPermissions::for_launch(
+                    turn.initial_environments
+                        .primary()
+                        .expect("turn environment"),
+                    &turn,
+                    super::super::TerminalSandboxSource::Native,
+                    crate::sandboxing::SandboxPermissions::UseDefault,
+                    /*additional_permissions*/ None,
+                    /*internal_permissions*/ None,
+                ),
+                network_approval: None,
+                session: Arc::downgrade(&session),
+                last_used: Instant::now(),
+            },
+        );
+    }
+    store.reserved_process_ids.insert(4);
+
+    let drained = store.drain_unclaimed();
+    let mut retained_process_ids = store.processes.keys().copied().collect::<Vec<_>>();
+    retained_process_ids.sort_unstable();
+    let mut reserved_process_ids = store
+        .reserved_process_ids
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    reserved_process_ids.sort_unstable();
+
+    assert_eq!(
+        (
+            drained
+                .into_iter()
+                .map(|entry| entry.process_id)
+                .collect::<Vec<_>>(),
+            retained_process_ids,
+            reserved_process_ids,
+            cleanup_wins.terminal_result_available(),
+            cleanup_wins.claim_terminal_notification().await,
+            notification_wins.terminal_result_available(),
+            unrecorded.terminal_result_available(),
+        ),
+        (
+            vec![1],
+            vec![2, 3],
+            // Deterministic process ids (always on under test) stay reserved after removal
+            // so allocation never reuses them; production releases the drained id.
+            vec![1, 2, 3, 4],
+            false,
+            Some(false),
+            true,
+            true
+        )
     );
 }

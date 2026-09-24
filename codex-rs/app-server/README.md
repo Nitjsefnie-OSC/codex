@@ -244,7 +244,6 @@ Attachments record the resources currently associated with a thread, independent
     "threadId": "thr_123",
     "limit": 100
 } }
-{ "id": 21, "result": {
     "data": [{
         "id": "01984de2-8f74-7c91-a3b2-5c5e937cf318",
         "attachmentType": "pull_request",

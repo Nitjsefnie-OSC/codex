@@ -381,12 +381,25 @@ where
 {
     use tokio::time::Duration;
     use tokio::time::timeout;
+    // `DEBUG_TEST_EVENTS=1` prints every event a test consumes while waiting,
+    // so a timeout names the last event seen instead of only "Elapsed".
+    let trace = std::env::var_os("DEBUG_TEST_EVENTS").is_some();
     loop {
         // Allow a bit more time to accommodate async startup work (e.g. config IO, tool discovery)
-        let ev = timeout(wait_time.max(Duration::from_secs(10)), codex.next_event())
-            .await
-            .expect("timeout waiting for event")
-            .expect("stream ended unexpectedly");
+        let ev = match timeout(wait_time.max(Duration::from_secs(10)), codex.next_event()).await {
+            Ok(ev) => ev.expect("stream ended unexpectedly"),
+            Err(elapsed) => {
+                if trace {
+                    eprintln!("[test-events] timed out waiting for a matching event");
+                }
+                panic!("timeout waiting for event: {elapsed:?}");
+            }
+        };
+        if trace {
+            let rendered = format!("{:?}", ev.msg);
+            let shown: String = rendered.chars().take(300).collect();
+            eprintln!("[test-events] {shown}");
+        }
         if predicate(&ev.msg) {
             return ev.msg;
         }

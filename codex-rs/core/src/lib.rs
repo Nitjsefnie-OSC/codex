@@ -4,6 +4,10 @@
 // user-visible output must go through the appropriate abstraction (e.g.,
 // the TUI or the tracing stack).
 #![deny(clippy::print_stdout, clippy::print_stderr)]
+// The tool handlers compose deeply nested async futures — `monitor` reaches the
+// unified exec orchestrator through two more layers than `exec_command` does —
+// and auto-trait solving for those futures exceeds the default limit.
+#![recursion_limit = "256"]
 
 mod apply_patch;
 mod apps;
@@ -52,6 +56,13 @@ pub use codex_thread::GuardianRootSnapshot;
 pub use codex_thread::ThreadConfigSnapshot;
 pub use session::turn_context::TurnContext;
 pub use thread_startup_metadata::ThreadStartupMetadata;
+pub use unified_exec::MonitorAcknowledgement;
+pub use unified_exec::MonitorInfo;
+pub use unified_exec::MonitorKind;
+pub use unified_exec::MonitorOutput;
+pub use unified_exec::MonitorOwner;
+pub use unified_exec::MonitorState;
+pub use unified_exec::MonitorWaitOutcome;
 mod agent;
 pub use agent::api::AgentConfigUpdate;
 pub use agent::api::AgentControl;
@@ -144,6 +155,10 @@ pub use codex_prompts as review_prompts;
 mod thread_manager;
 pub(crate) mod web_search;
 pub(crate) mod windows_sandbox_read_grants;
+pub use agent::model_reasoning::validate_model_reasoning_effort;
+pub use agent::role::AgentRoleOverrideMask;
+pub use agent::role::apply_exec_agent_role;
+pub use agent::role::apply_exec_agent_role_with_overrides;
 pub use thread_manager::ForkSnapshot;
 pub use thread_manager::InternalSessionParent;
 pub use thread_manager::NewThread;

@@ -68,6 +68,7 @@ use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::ErrorEvent;
@@ -368,15 +369,20 @@ fn history_contains_text<'a>(
     needle: &str,
 ) -> bool {
     history_items.into_iter().any(|item| {
-        let ResponseItem::Message { content, .. } = item else {
-            return false;
-        };
-        content.iter().any(|content_item| match content_item {
-            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
-                text.contains(needle)
-            }
-            ContentItem::InputImage { .. } | ContentItem::InputAudio { .. } => false,
-        })
+        match item {
+            ResponseItem::Message { content, .. } => content.iter().any(|content_item| {
+                match content_item {
+                    ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                        text.contains(needle)
+                    }
+                    ContentItem::InputImage { .. } | ContentItem::InputAudio { .. } => false,
+                }
+            }),
+            ResponseItem::AgentMessage { content, .. } => content.iter().any(|content_item| {
+                matches!(content_item, codex_protocol::models::AgentMessageInputContent::InputText { text } if text.contains(needle))
+            }),
+            _ => false,
+        }
     })
 }
 
@@ -848,6 +854,126 @@ async fn ensure_v2_child_loaded_preserves_evicted_parent_authority() {
     check_v2_agent_reload(V2ReloadRoute::NestedParent).await;
 }
 
+#[tokio::test]
+async fn ensure_v2_agent_loaded_preserves_child_reasoning_effort() {
+    check_v2_agent_reload_identity(Some(ReasoningEffort::High)).await;
+}
+
+#[tokio::test]
+async fn ensure_v2_agent_loaded_preserves_absent_reasoning_effort() {
+    check_v2_agent_reload_identity(/*child_reasoning_effort*/ None).await;
+}
+
+/// A sender-driven reload keeps the worker's stored model and reasoning effort, even an absent
+/// one, over both the sender's and the role's identity, while reapplying the role's other
+/// settings.
+async fn check_v2_agent_reload_identity(child_reasoning_effort: Option<ReasoningEffort>) {
+    let (home, mut config) = test_config().await;
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    let _ = config.features.enable(Feature::Sqlite);
+    config.model = Some("gpt-5.6-sol".to_string());
+    let role_path = home.path().join("reload-role.toml");
+    tokio::fs::write(
+        &role_path,
+        "developer_instructions = \"Reload role instructions\"\nmodel = \"gpt-5.6-terra\"\nmodel_reasoning_effort = \"xhigh\"\n",
+    )
+    .await
+    .expect("reload role config should be written");
+    config.agent_roles.insert(
+        "reload-role".to_string(),
+        AgentRoleConfig {
+            description: Some("Reload role".to_string()),
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    );
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (parent_thread_id, parent_thread) = harness.start_paginated_thread().await;
+    let source = thread_spawn_source(
+        parent_thread_id,
+        &parent_thread.session_source,
+        next_thread_spawn_depth(&parent_thread.session_source),
+        Some("reload-role"),
+        Some("worker".to_string()),
+    )
+    .expect("child source");
+    let mut child_config = harness.config.clone();
+    child_config.model = Some("gpt-5.6-luna".to_string());
+    child_config.model_reasoning_effort = child_reasoning_effort.clone();
+    let spawned_agent = harness
+        .control
+        .spawn_agent_with_metadata(
+            child_config,
+            text_input("hello child"),
+            source,
+            SpawnAgentOptions {
+                parent_thread_id: Some(parent_thread_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("spawn_agent should succeed");
+    let child_thread = harness
+        .manager
+        .get_thread(spawned_agent.thread_id)
+        .await
+        .expect("child thread should exist");
+    child_thread
+        .inject_response_items(vec![assistant_message(
+            "child persisted",
+            Some(MessagePhase::FinalAnswer),
+        )])
+        .await
+        .expect("child rollout should persist with v2 metadata");
+    child_thread
+        .shutdown_and_wait()
+        .await
+        .expect("child thread should shut down");
+    let stored_child = child_thread
+        .read_thread(
+            /*include_archived*/ true, /*include_history*/ false,
+        )
+        .await
+        .expect("child metadata should be readable");
+    assert_eq!(stored_child.reasoning_effort, child_reasoning_effort);
+    assert_eq!(stored_child.agent_role.as_deref(), Some("reload-role"));
+    assert!(
+        harness
+            .manager
+            .remove_thread(&spawned_agent.thread_id)
+            .await
+            .is_some()
+    );
+
+    let mut sender_config = harness.config.clone();
+    sender_config.model_reasoning_effort = Some(ReasoningEffort::Minimal);
+    harness
+        .control
+        .ensure_v2_agent_loaded(sender_config, spawned_agent.thread_id, /*parent*/ None)
+        .await
+        .expect("known v2 agent should reload");
+    let reloaded_child = harness
+        .manager
+        .get_thread(spawned_agent.thread_id)
+        .await
+        .expect("reloaded child thread should exist");
+    let reloaded_snapshot = reloaded_child.config_snapshot().await;
+    assert_eq!(
+        (reloaded_snapshot.model, reloaded_snapshot.reasoning_effort),
+        ("gpt-5.6-luna".to_string(), child_reasoning_effort),
+        "residency reload must preserve the worker identity instead of the sender's or the role's",
+    );
+    assert_eq!(
+        reloaded_child
+            .session
+            .new_default_turn()
+            .await
+            .developer_instructions
+            .as_deref(),
+        Some("Reload role instructions"),
+        "residency reload must reapply non-identity role settings",
+    );
+}
 #[derive(Clone, Copy)]
 enum V2ReloadRoute {
     Sender,
@@ -998,7 +1124,6 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
         },
         Ok(_) => panic!("expected thread to be removed"),
     }
-
     let mut sender_config = harness.config.clone();
     sender_config.model_provider_id = "ollama".to_string();
     sender_config.model_provider = sender_config
@@ -4151,7 +4276,7 @@ async fn multi_agent_v2_completion_ignores_dead_direct_parent() {
 async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
     let harness = AgentControlHarness::new().await;
     let (_root_thread_id, root_thread) = harness.start_thread().await;
-    let (worker_thread_id, _worker_thread) = harness.start_thread().await;
+    let (worker_thread_id, worker_thread) = harness.start_thread().await;
     let mut tester_config = harness.config.clone();
     let _ = tester_config.features.enable(Feature::MultiAgentV2);
     let tester_thread_id = harness
@@ -4196,41 +4321,28 @@ async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
         )
         .await;
 
+    let worker_identity =
+        crate::session_prefix::completion_agent_identity(&worker_path, worker_thread_id);
+    let tester_identity =
+        crate::session_prefix::completion_agent_identity(&tester_path, tester_thread_id);
     let expected_message = crate::session_prefix::format_inter_agent_completion_message(
-        worker_path.clone(),
-        tester_path.clone(),
+        &worker_identity,
+        &tester_identity,
         &AgentStatus::Completed(Some("done".to_string())),
+        None,
     )
     .expect("completed status should render");
-    let expected = (
-        worker_thread_id,
-        Op::InterAgentCommunication {
-            communication: InterAgentCommunication::new(
-                tester_path.clone(),
-                worker_path.clone(),
-                Vec::new(),
-                expected_message.clone(),
-                /*trigger_turn*/ false,
-            ),
-            start_options: Default::default(),
-        },
-    );
-
     timeout(Duration::from_secs(5), async {
         loop {
-            let captured = harness
-                .manager
-                .captured_ops()
-                .into_iter()
-                .find(|entry| captured_op_matches(entry, &expected));
-            if captured.is_some() {
+            let history = worker_thread.session.clone_history().await;
+            if history_contains_text(history.raw_items(), &expected_message) {
                 break;
             }
             sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("completion watcher should queue a direct-parent message");
+    .expect("completion watcher should durably deliver a direct-parent message");
 
     let root_history = root_thread.session.clone_history().await;
     assert!(!history_contains_assistant_inter_agent_communication(

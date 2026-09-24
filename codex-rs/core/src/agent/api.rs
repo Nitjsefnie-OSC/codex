@@ -124,6 +124,12 @@ pub trait AgentControl: Send + Sync {
     /// Read the latest shared service tier for use at normal runtime config update points.
     fn service_tier(&self) -> Option<String>;
 
+    /// The root session's preferred service tier, for propagating to spawned children.
+    fn root_service_tier(&self) -> Option<String>;
+
+    /// Whether the tree rooted at `parent_thread_id` still has live descendants.
+    fn has_live_descendants(&self, parent_thread_id: ThreadId) -> BoxFuture<'_, bool>;
+
     /// Publish a shared setting synchronously with the runtime's root-owned config update.
     fn propagate_config_update(&self, update: AgentConfigUpdate);
 

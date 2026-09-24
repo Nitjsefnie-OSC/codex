@@ -11,10 +11,12 @@ mod current_time_reminder;
 mod developer_instructions;
 mod environment_context;
 mod environments_instructions;
+mod exec_command_completion_notification;
 mod guardian_approved_action;
 mod guardian_budget_omission;
 mod guardian_context_mode;
 pub use guardian_budget_omission::GuardianBudgetOmission;
+pub(crate) use multi_agent_mode_instructions::MultiAgentModeInstructions;
 mod guardian_followup_review_reminder;
 mod guardian_node_repl_policy;
 mod guardian_policy;
@@ -31,6 +33,7 @@ mod legacy_model_mismatch_warning;
 mod legacy_unified_exec_process_limit_warning;
 mod memory;
 mod model_switch_instructions;
+mod monitor_notification;
 mod multi_agent_mode_instructions;
 mod multi_agent_usage_hint;
 mod network_rule_saved;
@@ -72,6 +75,8 @@ pub(crate) use current_time_reminder::CurrentTimeReminder;
 pub(crate) use current_time_reminder::CurrentTimeUnavailable;
 pub(crate) use developer_instructions::DeveloperInstructions;
 pub(crate) use environments_instructions::EnvironmentsInstructions;
+pub(crate) use exec_command_completion_notification::ExecCommandCompletion;
+pub(crate) use exec_command_completion_notification::ExecCommandCompletionNotification;
 pub(crate) use guardian_approved_action::GuardianApprovedAction;
 pub use guardian_context_mode::GuardianContextMode;
 pub(crate) use guardian_followup_review_reminder::GuardianFollowupReviewReminder;
@@ -98,7 +103,8 @@ pub(crate) use legacy_model_mismatch_warning::LegacyModelMismatchWarning;
 pub(crate) use legacy_unified_exec_process_limit_warning::LegacyUnifiedExecProcessLimitWarning;
 pub use memory::MemoryContextFragment;
 pub(crate) use model_switch_instructions::ModelSwitchInstructions;
-pub(crate) use multi_agent_mode_instructions::MultiAgentModeInstructions;
+pub(crate) use monitor_notification::MonitorNotification;
+
 pub(crate) use multi_agent_usage_hint::MultiAgentUsageHint;
 pub(crate) use network_rule_saved::NetworkRuleSaved;
 pub use node_repl_review_evidence::NodeReplReviewEvidence;
@@ -124,3 +130,9 @@ pub(crate) use user_instructions::UserInstructions;
 pub(crate) use user_shell_command::UserShellCommand;
 pub(crate) use user_verification_notice::UserVerificationNotice;
 pub(crate) use world_state::ManagedDeveloperInstructions;
+
+pub(crate) fn is_background_notification(item: &codex_protocol::models::ResponseItem) -> bool {
+    MonitorNotification::is_response_item(item)
+        || ExecCommandCompletionNotification::is_response_item(item)
+        || SubagentNotification::is_response_item(item)
+}
