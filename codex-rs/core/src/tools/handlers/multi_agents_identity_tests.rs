@@ -849,7 +849,7 @@ async fn multi_agent_v2_full_history_inherits_parent_role_metadata() {
         .await
         .expect("root thread should start");
     let agent_control = manager.agent_control();
-    session.services.agent_control = agent_control.clone();
+    set_agent_control(&mut session, agent_control.clone());
     session.thread_id = root.thread_id;
     turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
         parent_thread_id: root.thread_id,
