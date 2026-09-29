@@ -45,6 +45,7 @@ use super::ConfiguredHandler;
 use super::ConfiguredHandlerKind;
 use super::HandlerSourcePath;
 use super::HookListEntryHandler;
+use crate::BackgroundState;
 use crate::events::interrupt::InterruptRequest;
 use crate::events::pre_tool_use::PreToolUseRequest;
 use crate::events::stop::StopHookTarget;
@@ -648,6 +649,7 @@ with Path(r"{log_path}").open("a", encoding="utf-8") as handle:
         matcher_aliases: Vec::new(),
         tool_use_id: "tool-1".to_string(),
         tool_input: serde_json::json!({ "command": "echo hello" }),
+        skill_activations: Vec::new(),
     });
     assert_eq!(preview.len(), 1);
     assert_eq!(preview[0].source_path, managed_dir);
@@ -665,6 +667,7 @@ with Path(r"{log_path}").open("a", encoding="utf-8") as handle:
             matcher_aliases: Vec::new(),
             tool_use_id: "tool-1".to_string(),
             tool_input: serde_json::json!({ "command": "echo hello" }),
+            skill_activations: Vec::new(),
         })
         .await;
 
@@ -739,6 +742,7 @@ async fn requirements_managed_hooks_execute_windows_command_override() {
             matcher_aliases: Vec::new(),
             tool_use_id: "tool-1".to_string(),
             tool_input: serde_json::json!({ "command": "echo hello" }),
+            skill_activations: Vec::new(),
         })
         .await;
 
@@ -1135,6 +1139,7 @@ fn requirements_managed_hooks_load_when_managed_dir_is_missing() {
         matcher_aliases: Vec::new(),
         tool_use_id: "tool-1".to_string(),
         tool_input: serde_json::json!({ "command": "echo hello" }),
+        skill_activations: Vec::new(),
     });
     assert_eq!(preview.len(), 1);
     assert_eq!(
@@ -1565,6 +1570,7 @@ fn discovers_hooks_from_json_and_toml_in_the_same_layer() {
         matcher_aliases: Vec::new(),
         tool_use_id: "tool-1".to_string(),
         tool_input: serde_json::json!({ "command": "echo hello" }),
+        skill_activations: Vec::new(),
     });
     assert_eq!(preview.len(), 2);
     assert_eq!(
@@ -1656,6 +1662,7 @@ fn profile_user_layers_load_shared_hooks_json_once() {
         matcher_aliases: Vec::new(),
         tool_use_id: "tool-1".to_string(),
         tool_input: serde_json::json!({ "command": "echo hello" }),
+        skill_activations: Vec::new(),
     });
     assert_eq!(preview.len(), 1);
     assert_eq!(preview[0].source_path, hooks_json_path);
@@ -2073,6 +2080,7 @@ print(json.dumps({
         matcher_aliases: Vec::new(),
         tool_use_id: "tool-1".to_string(),
         tool_input: serde_json::json!({ "command": "echo hello" }),
+        skill_activations: Vec::new(),
     });
     assert_eq!(preview.len(), 1);
     assert_eq!(preview[0].source, HookSource::Plugin);
@@ -2105,6 +2113,7 @@ print(json.dumps({
             matcher_aliases: Vec::new(),
             tool_use_id: "tool-1".to_string(),
             tool_input: serde_json::json!({ "command": "echo hello" }),
+            skill_activations: Vec::new(),
         })
         .await;
 
@@ -2357,6 +2366,7 @@ fn executor_stop_hook_fixture() -> (
         model: "test-model".to_string(),
         permission_mode: "default".to_string(),
         request_metadata: request_metadata.clone(),
+        background: BackgroundState::default(),
         stop_hook_active: false,
         last_assistant_message: None,
         target: StopHookTarget::Stop,
@@ -2727,6 +2737,7 @@ async fn mcp_tool_hooks_expand_event_input_and_apply_pre_tool_decisions() {
         matcher_aliases: Vec::new(),
         tool_use_id: "tool-1".to_string(),
         tool_input: serde_json::json!({ "command": "rm important.txt" }),
+        skill_activations: Vec::new(),
     };
     let calls = Arc::new(Mutex::new(Vec::new()));
     let executor = StaticMcpExecutor {

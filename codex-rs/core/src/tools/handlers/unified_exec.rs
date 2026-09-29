@@ -119,25 +119,47 @@ pub(crate) fn get_command(
             .as_ref()
             .map(|shell_str| get_shell_by_model_provided_path(&PathBuf::from(shell_str)))
             .unwrap_or_else(|| session_shell.as_ref().clone()),
-        UnifiedExecShellMode::ZshFork(zsh_fork_config) => {
+        UnifiedExecShellMode::ZshFork(_) => {
             if args.shell.is_some() {
                 return Err(
                     "`shell` is not supported for local zsh-fork exec; omit `shell` to use zsh-fork, or target a remote environment where `shell` is supported.".to_string(),
                 );
             }
-            Shell {
-                shell_type: ShellType::Zsh,
-                shell_path: zsh_fork_config.shell_zsh_path.as_path().to_path_buf(),
-            }
+            session_shell.as_ref().clone()
         }
     };
-    Ok(ResolvedCommand {
-        command: shell.derive_exec_args(&args.cmd, use_login_shell),
+    Ok(resolve_shell_command(
+        &args.cmd,
+        &shell,
+        shell_mode,
+        use_login_shell,
+    ))
+}
+
+/// Wrap a shell command string in the argv the configured shell mode requires.
+///
+/// Shared with `monitor` so a monitored command is spawned exactly the way
+/// `exec_command` spawns one.
+pub(crate) fn resolve_shell_command(
+    cmd: &str,
+    shell: &Shell,
+    shell_mode: &UnifiedExecShellMode,
+    use_login_shell: bool,
+) -> ResolvedCommand {
+    let shell = match shell_mode {
+        UnifiedExecShellMode::Direct => shell.clone(),
+        UnifiedExecShellMode::ZshFork(zsh_fork_config) => Shell {
+            shell_type: ShellType::Zsh,
+            shell_path: zsh_fork_config.shell_zsh_path.as_path().to_path_buf(),
+        },
+    };
+    ResolvedCommand {
+        command: shell.derive_exec_args(cmd, use_login_shell),
         shell: ShellInvocation {
             shell,
             use_login_shell,
         },
-    })
+    }
 }
 
 pub(crate) fn shell_mode_for_environment(

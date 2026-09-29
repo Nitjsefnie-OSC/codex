@@ -20,6 +20,7 @@ use super::turn_context::NewTurnContextOptions;
 use super::turn_context::TurnContext;
 use crate::state::ActiveTurn;
 use crate::state::TurnState;
+use crate::tasks::MailboxParentProvenance;
 use crate::tasks::RegularTask;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
@@ -231,6 +232,7 @@ pub(super) async fn handle(
                 submission_id,
                 kind,
                 /*expected_previous_turn_id*/ None,
+                MailboxParentProvenance::Ignore,
             )
             .await
         }
@@ -248,6 +250,7 @@ pub(super) async fn handle(
                 submission_id,
                 TurnStartKind::Recovery,
                 Some(expected_previous_turn_id),
+                MailboxParentProvenance::Ignore,
             )
             .await
         }
@@ -288,6 +291,22 @@ pub(super) async fn handle_recovery(
         submission_id,
         TurnStartKind::Recovery,
         /*expected_previous_turn_id*/ None,
+        MailboxParentProvenance::Ignore,
+    )
+    .await
+}
+
+pub(super) async fn handle_background_wake(
+    session: &Arc<Session>,
+    submission_id: String,
+) -> CodexResult<TurnInputSubmission> {
+    start_if_idle(
+        session,
+        TurnInputRequest::user_input(Vec::new()),
+        submission_id,
+        TurnStartKind::Automatic,
+        /*expected_previous_turn_id*/ None,
+        MailboxParentProvenance::Attribute,
     )
     .await;
     if let Ok(TurnInputSubmission::Started { turn_id }) = &result {
@@ -405,7 +424,17 @@ async fn start_if_idle(
     submission_id: String,
     kind: TurnStartKind,
     expected_previous_turn_id: Option<String>,
+    mailbox_parent_provenance: MailboxParentProvenance,
 ) -> CodexResult<TurnInputSubmission> {
+    let _turn_start_guard = session.input_queue.lock_turn_start().await;
+    if session
+        .shutdown_started
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Ok(TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::NotIdle,
+        });
+    }
     let TurnInputRequest {
         input,
         thread_settings,
@@ -523,18 +552,24 @@ async fn start_if_idle(
             if !matches!(&input, SubmittedTurnInput::UserInput { .. }) {
                 session
                     .input_queue
-                    .extend_pending_input_for_turn_state(
+                    .extend_pending_input_batch_for_turn_state(
                         turn_state.as_ref(),
                         vec![
                             pending_turn_input(session, input, &turn_context.sub_id, origin).await,
                         ],
+                        crate::session::input_queue::PendingTurnProvenance::default(),
                     )
                     .await;
             }
         }
     }
     session
-        .start_task(turn_context, task_input, RegularTask::new())
+        .start_task(
+            turn_context,
+            task_input,
+            RegularTask::new(),
+            mailbox_parent_provenance,
+        )
         .await;
     Ok(TurnInputSubmission::Started {
         turn_id: submission_id,
@@ -661,6 +696,10 @@ impl Session {
         responsesapi_client_metadata: Option<HashMap<String, String>>,
         origin: UserInputOrigin,
     ) -> Result<String, NotSubmittedReason> {
+        let _delivery_guard = self
+            .input_queue
+            .lock_background_notification_delivery()
+            .await;
         let mut active = self.active_turn.lock().await;
         let Some(active_turn) = active.as_mut() else {
             return Err(NotSubmittedReason::NoActiveTurn);
@@ -733,8 +772,9 @@ impl Session {
         };
         pending_input.push(input);
         self.input_queue
-            .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
+            .drain_mailbox_into_turn_state_before_input(
                 active_turn.turn_state.as_ref(),
+                Some(active_task.turn_context.turn_metadata_state.as_ref()),
                 pending_input,
             )
             .await;

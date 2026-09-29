@@ -730,7 +730,37 @@ fn final_message_separator_includes_worked_label_after_one_minute() {
 
 #[test]
 fn ps_output_empty_snapshot() {
-    let cell = new_unified_exec_processes_output(Vec::new());
+    let cell = new_process_list_output(Vec::new(), Vec::new(), Vec::new());
+    let rendered = render_lines(&cell.display_lines(/*width*/ 60)).join("\n");
+    insta::assert_snapshot!(rendered);
+}
+
+#[test]
+fn ps_output_empty_fleet_keeps_distinct_sections() {
+    let cell = new_process_list_output(Vec::new(), Vec::new(), Vec::new());
+    let rendered = render_lines(&cell.display_lines(/*width*/ 60)).join("\n");
+
+    assert!(rendered.contains("Native agents"));
+    assert!(rendered.contains("exec_command terminals"));
+    assert!(rendered.contains("Monitor jobs and watchers"));
+}
+
+#[test]
+fn ps_output_mixed_fleet_snapshot() {
+    let cell = new_process_list_output(
+        vec![NativeAgentDetails {
+            agent_path: "/root/research".to_string(),
+            label: "Ada [explorer]".to_string(),
+        }],
+        vec![UnifiedExecProcessDetails {
+            command_display: "cargo check --workspace".to_string(),
+            recent_chunks: vec!["Checking codex-tui".to_string()],
+        }],
+        vec![UnifiedExecProcessDetails {
+            command_display: "gh run watch 42".to_string(),
+            recent_chunks: vec!["check in progress".to_string()],
+        }],
+    );
     let rendered = render_lines(&cell.display_lines(/*width*/ 60)).join("\n");
     insta::assert_snapshot!(rendered);
 }
@@ -868,34 +898,42 @@ async fn session_info_hides_tooltips_when_disabled() {
 
 #[test]
 fn ps_output_multiline_snapshot() {
-    let cell = new_unified_exec_processes_output(vec![
-        UnifiedExecProcessDetails {
-            command_display: "echo hello\nand then some extra text".to_string(),
-            recent_chunks: vec!["hello".to_string(), "done".to_string()],
-        },
-        UnifiedExecProcessDetails {
-            command_display: "(\n  sleep 120\n)".to_string(),
-            recent_chunks: Vec::new(),
-        },
-        UnifiedExecProcessDetails {
-            command_display: "sleep 1\r\nsleep 120".to_string(),
-            recent_chunks: Vec::new(),
-        },
-        UnifiedExecProcessDetails {
-            command_display: "rg \"foo\" src".to_string(),
-            recent_chunks: vec!["src/main.rs:12:foo".to_string()],
-        },
-    ]);
+    let cell = new_process_list_output(
+        Vec::new(),
+        vec![
+            UnifiedExecProcessDetails {
+                command_display: "echo hello\nand then some extra text".to_string(),
+                recent_chunks: vec!["hello".to_string(), "done".to_string()],
+            },
+            UnifiedExecProcessDetails {
+                command_display: "(\n  sleep 120\n)".to_string(),
+                recent_chunks: Vec::new(),
+            },
+            UnifiedExecProcessDetails {
+                command_display: "sleep 1\r\nsleep 120".to_string(),
+                recent_chunks: Vec::new(),
+            },
+            UnifiedExecProcessDetails {
+                command_display: "rg \"foo\" src".to_string(),
+                recent_chunks: vec!["src/main.rs:12:foo".to_string()],
+            },
+        ],
+        Vec::new(),
+    );
     let rendered = render_lines(&cell.display_lines(/*width*/ 40)).join("\n");
     insta::assert_snapshot!(rendered);
 }
 
 #[test]
 fn ps_output_multiline_long_command_snapshot() {
-    let cell = new_unified_exec_processes_output(vec![UnifiedExecProcessDetails {
-        command_display: format!("(\n  {}\n)", "x".repeat(100)),
-        recent_chunks: Vec::new(),
-    }]);
+    let cell = new_process_list_output(
+        Vec::new(),
+        vec![UnifiedExecProcessDetails {
+            command_display: format!("(\n  {}\n)", "x".repeat(100)),
+            recent_chunks: Vec::new(),
+        }],
+        Vec::new(),
+    );
     let rendered = render_lines(&cell.display_lines(/*width*/ 100)).join("\n");
     insta::assert_snapshot!(rendered);
 }
@@ -937,35 +975,45 @@ fn cyber_policy_error_event_narrow_snapshot() {
 
 #[test]
 fn ps_output_long_command_snapshot() {
-    let cell = new_unified_exec_processes_output(vec![UnifiedExecProcessDetails {
-        command_display: String::from(
-            "rg \"foo\" src --glob '**/*.rs' --max-count 1000 --no-ignore --hidden --follow --glob '!target/**'",
-        ),
-        recent_chunks: vec!["searching...".to_string()],
-    }]);
+    let cell = new_process_list_output(
+        Vec::new(),
+        vec![UnifiedExecProcessDetails {
+            command_display: String::from(
+                "rg \"foo\" src --glob '**/*.rs' --max-count 1000 --no-ignore --hidden --follow --glob '!target/**'",
+            ),
+            recent_chunks: vec!["searching...".to_string()],
+        }],
+        Vec::new(),
+    );
     let rendered = render_lines(&cell.display_lines(/*width*/ 36)).join("\n");
     insta::assert_snapshot!(rendered);
 }
 
 #[test]
 fn ps_output_halfwidth_sound_marks_snapshot() {
-    let cell = new_unified_exec_processes_output(vec![UnifiedExecProcessDetails {
-        command_display: "echo ｶﾞﾊﾟｶﾞﾊﾟｶﾞﾊﾟｶﾞﾊﾟｶﾞﾊﾟ".to_string(),
-        recent_chunks: vec!["output ｶﾞﾊﾟｶﾞﾊﾟｶﾞﾊﾟｶﾞﾊﾟｶﾞﾊﾟ".to_string()],
-    }]);
+    let cell = new_process_list_output(
+        Vec::new(),
+        vec![UnifiedExecProcessDetails {
+            command_display: "echo ｶﾞﾊﾟｶﾞﾊﾟｶﾞﾊﾟｶﾞﾊﾟｶﾞﾊﾟ".to_string(),
+            recent_chunks: vec!["output ｶﾞﾊﾟｶﾞﾊﾟｶﾞﾊﾟｶﾞﾊﾟｶﾞﾊﾟ".to_string()],
+        }],
+        Vec::new(),
+    );
     let rendered = render_lines(&cell.display_lines(/*width*/ 24)).join("\n");
     insta::assert_snapshot!(rendered);
 }
 
 #[test]
 fn ps_output_many_sessions_snapshot() {
-    let cell = new_unified_exec_processes_output(
+    let cell = new_process_list_output(
+        Vec::new(),
         (0..20)
             .map(|idx| UnifiedExecProcessDetails {
                 command_display: format!("command {idx}"),
                 recent_chunks: Vec::new(),
             })
             .collect(),
+        Vec::new(),
     );
     let rendered = render_lines(&cell.display_lines(/*width*/ 32)).join("\n");
     insta::assert_snapshot!(rendered);
@@ -973,13 +1021,17 @@ fn ps_output_many_sessions_snapshot() {
 
 #[test]
 fn ps_output_chunk_leading_whitespace_snapshot() {
-    let cell = new_unified_exec_processes_output(vec![UnifiedExecProcessDetails {
-        command_display: "just fix".to_string(),
-        recent_chunks: vec![
-            "  indented first".to_string(),
-            "    more indented".to_string(),
-        ],
-    }]);
+    let cell = new_process_list_output(
+        Vec::new(),
+        vec![UnifiedExecProcessDetails {
+            command_display: "just fix".to_string(),
+            recent_chunks: vec![
+                "  indented first".to_string(),
+                "    more indented".to_string(),
+            ],
+        }],
+        Vec::new(),
+    );
     let rendered = render_lines(&cell.display_lines(/*width*/ 60)).join("\n");
     insta::assert_snapshot!(rendered);
 }

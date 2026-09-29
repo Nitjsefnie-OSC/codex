@@ -276,6 +276,16 @@ impl AgentControl for LocalAgentControl {
         self.root_service_tier()
     }
 
+    fn root_service_tier(&self) -> Option<String> {
+        LocalAgentControl::root_service_tier(self)
+    }
+
+    fn has_live_descendants(&self, parent_thread_id: ThreadId) -> BoxFuture<'_, bool> {
+        Box::pin(
+            async move { LocalAgentControl::has_live_descendants(self, parent_thread_id).await },
+        )
+    }
+
     fn propagate_config_update(&self, update: AgentConfigUpdate) {
         match update {
             AgentConfigUpdate::ServiceTier(tier) => self.set_root_service_tier(tier),

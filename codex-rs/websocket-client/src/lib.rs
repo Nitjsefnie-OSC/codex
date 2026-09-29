@@ -114,7 +114,15 @@ impl WebSocketConnector {
 
     /// Connects a WebSocket after resolving the request destination through the configured proxy
     /// policy.
-    pub async fn connect(
+    pub fn connect<'a>(
+        &'a self,
+        request: Request,
+        config: WebSocketConfig,
+    ) -> BoxFuture<'a, Result<(WebSocketConnection, Response), WebSocketError>> {
+        Box::pin(async move { self.connect_inner(request, config).await })
+    }
+
+    async fn connect_inner(
         &self,
         request: Request,
         config: WebSocketConfig,

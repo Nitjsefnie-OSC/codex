@@ -4,7 +4,11 @@ expression: rendered
 ---
 /ps
 
-Background terminals
+Native agents
+
+  • No native agents running.
+
+exec_command terminals
 
   • echo hello↵and then some extra text
     ↳ hello
@@ -13,3 +17,7 @@ Background terminals
   • sleep 1↵sleep 120
   • rg "foo" src
     ↳ src/main.rs:12:foo
+
+Monitor jobs and watchers
+
+  • No monitor jobs or watchers running.
