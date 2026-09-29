@@ -983,6 +983,7 @@ async fn ordinary_response_backpressure_cannot_cancel_delivery_receipt_response(
                 yield_time_ms: 1,
             },
             caller_cancellation: caller_cancellation.token(),
+            yield_signal: None,
             response_tx: wait_response_tx,
         })
         .await

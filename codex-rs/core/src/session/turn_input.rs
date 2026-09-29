@@ -293,7 +293,11 @@ pub(super) async fn handle_recovery(
         /*expected_previous_turn_id*/ None,
         MailboxParentProvenance::Ignore,
     )
-    .await
+    .await;
+    if let Ok(TurnInputSubmission::Started { turn_id }) = &result {
+        tracing::Span::current().record("turn.id", turn_id);
+    }
+    result
 }
 
 pub(super) async fn handle_background_wake(
