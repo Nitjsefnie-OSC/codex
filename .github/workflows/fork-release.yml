@@ -72,8 +72,45 @@ jobs:
             || { echo "❌  Tag '${GITHUB_REF_NAME}' is not fork-vMAJOR.MINOR.PATCH"; exit 1; }
           echo "✅  ${GITHUB_REF_NAME}"
 
-  build:
+  # The ChatGPT backend offers models by the client version a request reports,
+  # and upstream main builds as 0.0.0, which is refused current models (gpt-6-sol,
+  # gpt-6-luna). Report the newest upstream release this tree already contains,
+  # the same one-line stamp upstream's own release commits make.
+  upstream-version:
     needs: tag-check
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.pick.outputs.version }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Pick the newest upstream release contained in this tree
+        id: pick
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --filter=blob:none https://github.com/openai/codex.git \
+            '+refs/heads/main:refs/remotes/upstream/main' \
+            '+refs/tags/rust-v*:refs/tags/rust-v*'
+          base="$(git merge-base HEAD upstream/main)"
+          version=""
+          # Upstream tags each release on a side branch; the release is in this
+          # tree once its branch point on main is.
+          while read -r tag; do
+            branch_point="$(git merge-base "$tag" upstream/main)"
+            if git merge-base --is-ancestor "$branch_point" "$base"; then
+              version="${tag#rust-v}"
+              break
+            fi
+          done < <(git tag -l 'rust-v*' | grep -E '^rust-v[0-9]+\.[0-9]+\.[0-9]+$' | sort -rV)
+          [[ -n "$version" ]] || { echo "❌  no upstream release is contained in ${base}"; exit 1; }
+          echo "upstream base ${base} contains release ${version}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: [tag-check, upstream-version]
     name: Build - ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
@@ -180,6 +217,21 @@ jobs:
         with:
           target: ${{ matrix.target }}
 
+      - name: Stamp the upstream release version
+        shell: bash
+        env:
+          UPSTREAM_VERSION: ${{ needs.upstream-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "${UPSTREAM_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { echo "❌  bad upstream version '${UPSTREAM_VERSION}'"; exit 1; }
+          # Exactly the workspace version line upstream's release commits change.
+          # `\r\?` because a Windows checkout may carry CRLF line endings.
+          [[ "$(grep -c '^version = "0.0.0"\r\?$' Cargo.toml)" == 1 ]] \
+            || { echo "❌  expected one workspace version = \"0.0.0\" line"; exit 1; }
+          sed -i "s/^version = \"0.0.0\"\(\r\?\)$/version = \"${UPSTREAM_VERSION}\"\1/" Cargo.toml
+          grep -n '^version = ' Cargo.toml
+
       - name: Build bwrap and export digest (Linux)
         if: ${{ runner.os == 'Linux' }}
         shell: bash
@@ -219,6 +271,8 @@ jobs:
 
       - name: Verify the build reports the commit it was built from
         shell: bash
+        env:
+          UPSTREAM_VERSION: ${{ needs.upstream-version.outputs.version }}
         run: |
           set -euo pipefail
           # `[[ ... ]] && exe=.exe` would abort the whole step under `set -e`
@@ -238,6 +292,10 @@ jobs:
           # a tree.
           [[ "${reported}" == "${GITHUB_SHA}" ]] \
             || { echo "❌  binary reports '${reported}', expected '${GITHUB_SHA}'"; exit 1; }
+          reported_version="$("$codex" --version | tr -d '\r')"
+          echo "reported version: ${reported_version}"
+          [[ "${reported_version}" == "codex-cli ${UPSTREAM_VERSION}" ]] \
+            || { echo "❌  binary reports '${reported_version}', expected codex-cli ${UPSTREAM_VERSION}"; exit 1; }
           "$codex" fork-manifest
 
       - name: Stage artifact contents
