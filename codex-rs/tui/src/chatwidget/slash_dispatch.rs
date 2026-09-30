@@ -554,7 +554,7 @@ impl ChatWidget {
                 self.open_pets_picker();
             }
             SlashCommand::Ps => {
-                self.add_ps_output();
+                self.app_event_tx.send(AppEvent::OpenProcessList);
             }
             SlashCommand::Stop => {
                 self.clean_background_terminals();

@@ -229,7 +229,7 @@ async fn dropped_tool_callbacks_release_the_origin_before_dispatch() {
     );
     let response = response_rx.await;
     assert_eq!(
-        response.unwrap(),
-        Err("code mode nested tool call cancelled".to_string()),
+        response.unwrap().err(),
+        Some("code mode nested tool call cancelled".to_string()),
     );
 }

@@ -17,6 +17,7 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecCommandOutputDeltaEvent;
+use codex_protocol::protocol::ExecCommandSource;
 use codex_protocol::protocol::ExecOutputStream;
 use codex_sandboxing::SandboxType;
 
@@ -58,6 +59,7 @@ async fn streaming_output_harness() -> anyhow::Result<StreamingOutputHarness> {
         crate::session::step_context::StepContext::for_test(turn),
         tokio_util::sync::CancellationToken::new(),
         "streaming-output-test".to_string(),
+        crate::unified_exec::InitialExecCommandOutputDestination::Rollout,
     );
     let output_buffer = Arc::clone(&process.output_handles().output_buffer);
 
@@ -108,12 +110,14 @@ async fn completed_output_preserves_bytes_before_subscription(
         &context,
         vec!["proof".to_string()],
         cwd,
+        ExecCommandSource::UnifiedExecStartup,
         /*process_id*/ 123,
         /*plugin_attribution*/ None,
         output_buffer,
         Instant::now(),
         /*network_denial_monitor*/ None,
         /*plugin_metrics_sidecar*/ None,
+        /*completion_notification*/ None,
     );
     stdout_tx.send(late_output.to_vec())?;
     drop(stdout_tx);
@@ -319,17 +323,19 @@ async fn exit_watcher_waits_for_late_network_denial_before_classifying_end() -> 
         mode: codex_protocol::openai_models::TruncationMode::Bytes,
         limit: 4,
     };
-    spawn_exit_watcher(
+    let watcher = spawn_exit_watcher(
         Arc::clone(&process),
         &context,
         vec!["proof".to_string()],
         cwd,
+        ExecCommandSource::UnifiedExecStartup,
         /*process_id*/ 123,
         /*plugin_attribution*/ None,
         output_buffer,
         Instant::now(),
         Some(network_denial_monitor),
         /*plugin_metrics_sidecar*/ None,
+        /*completion_notification*/ None,
     );
 
     let exited_at = Instant::now();
@@ -368,6 +374,7 @@ async fn exit_watcher_waits_for_late_network_denial_before_classifying_end() -> 
         elapsed >= Duration::from_millis(10) && elapsed < TRAILING_OUTPUT_GRACE,
         "completion should wait for denial without falling back to the output grace: {elapsed:?}"
     );
+    watcher.await.expect("exit watcher");
 
     Ok(())
 }

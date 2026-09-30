@@ -230,6 +230,12 @@ pub enum DelegateRequest {
         cell_id: WireCellId,
         text: String,
     },
+    #[serde(rename = "tool/resultDelivered")]
+    ToolResultDelivered {
+        cell_id: WireCellId,
+        runtime_tool_call_id: String,
+        delivered: bool,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -239,6 +245,8 @@ pub enum DelegateResponse {
     ToolResult { result: JsonValue },
     #[serde(rename = "notification/delivered")]
     NotificationDelivered,
+    #[serde(rename = "tool/resultDeliveryRecorded")]
+    ToolResultDeliveryRecorded,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Serialize)]

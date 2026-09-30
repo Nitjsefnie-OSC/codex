@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Codex exec agent role selection — design</title>
+  <style>
+    :root { --bg:#1b1a17; --panel:#252420; --line:#3a3833; --text:#cfccc2; --muted:#8f8d82; --accent:#d97757; --ok:#8fa56e; }
+    * { box-sizing:border-box } body { margin:0; padding:48px 28px 100px; background:var(--bg); color:var(--text); font:15px/1.6 system-ui,sans-serif }
+    main { max-width:980px; margin:auto } h1,h2 { color:#f5f3ec; font-family:Georgia,serif; font-weight:500 } h1 { font-size:38px; line-height:1.15 } h2 { margin-top:44px }
+    nav,.card,.decision { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:18px 22px; margin:18px 0 }
+    .decision { border-left:4px solid var(--accent) } code,pre { font-family:ui-monospace,monospace } code { color:#c9b98a } pre { overflow:auto; background:#2e2c27; padding:14px; border-radius:8px }
+    a { color:#e7a087 } table { width:100%; border-collapse:collapse; background:var(--panel) } th,td { border:1px solid var(--line); padding:11px; text-align:left; vertical-align:top } th { color:#f5f3ec }
+    .tag { color:var(--ok); font:12px ui-monospace,monospace; text-transform:uppercase } ul { padding-left:22px }
+    .review { display:flex; gap:8px; flex-wrap:wrap; margin-top:18px } button { background:#2e2c27; color:var(--text); border:1px solid var(--line); border-radius:7px; padding:8px 12px; cursor:pointer } button:hover { border-color:var(--accent) }
+    textarea { width:100%; min-height:90px; margin-top:10px; background:#1b1a17; color:var(--text); border:1px solid var(--line); border-radius:8px; padding:10px }
+  </style>
+</head>
+<body><main>
+  <div class="tag">Design spec · Codex fork · 2026-08-10</div>
+  <h1>Give headless Codex a real named agent identity</h1>
+  <nav><strong>Jump:</strong> <a href="#decision">Decision</a> · <a href="#contract">Contract</a> · <a href="#architecture">Architecture</a> · <a href="#tests">Verification</a> · <a href="#risks">Risks</a></nav>
+
+  <section id="decision" class="decision">
+    <div class="tag">Decision</div>
+    <h2>Add <code>codex exec --agent &lt;ROLE&gt;</code></h2>
+    <p>Resolve the role from the registry already loaded from <code>$CODEX_HOME/agents</code> and apply it through the existing core role-layer machinery. Do not duplicate profiles through <code>--profile</code> or translate TOML into ad hoc overrides.</p>
+    <div class="review"><button onclick="mark('decision','approved')">Approve</button><button onclick="mark('decision','rejected')">Reject</button><button onclick="copySection('decision')">Copy section</button></div><textarea id="decision-notes" placeholder="Reviewer annotation"></textarea>
+  </section>
+
+  <section id="contract"><h2>Command contract</h2>
+    <pre>codex exec --agent adversary -- "Review this claim" &lt; /dev/null</pre>
+    <table><thead><tr><th>Concern</th><th>Rule</th></tr></thead><tbody>
+      <tr><td>Identity</td><td>The role owns model, reasoning effort, and developer instructions, matching native spawn semantics.</td></tr>
+      <tr><td>Runtime</td><td>Headless approval, sandbox/permissions, CWD, writable roots, executable paths, hook-trust bypass, persistence, and PSP remain invocation-owned.</td></tr>
+      <tr><td>Errors</td><td>Unknown or malformed roles fail before an API request.</td></tr>
+      <tr><td>Existing sessions</td><td>Resume and fork retain their recorded role. Review remains its dedicated mode; all three reject <code>--agent</code>.</td></tr>
+    </tbody></table>
+  </section>
+
+  <section id="architecture"><h2>Architecture</h2>
+    <ul>
+      <li><strong>Exec CLI:</strong> add one optional role name and validate new-session-only use.</li>
+      <li><strong>Core boundary:</strong> expose a narrow exec adapter around the existing role resolver and layer application.</li>
+      <li><strong>Precedence:</strong> role identity fields win; the adapter reapplies invocation-owned runtime state after the config-layer rebuild.</li>
+      <li><strong>No duplicate parser:</strong> the exec crate never reads or interprets agent TOML.</li>
+    </ul>
+  </section>
+
+  <section id="tests"><h2>Verification</h2>
+    <ul>
+      <li>CLI parser accepts a role and rejects an empty value.</li>
+      <li>A real temporary role changes model, effort, and developer instructions.</li>
+      <li>Headless runtime selections survive role application.</li>
+      <li>Unknown roles and incompatible subcommands fail before mocked network traffic.</li>
+      <li>GitHub Actions builds and exercises the exact test filters non-vacuously.</li>
+    </ul>
+  </section>
+
+  <section id="risks"><h2>Risks and mitigations</h2>
+    <table><thead><tr><th>Risk</th><th>Mitigation</th></tr></thead><tbody>
+      <tr><td>Role rebuild drops danger-full-access or never-approve.</td><td>Snapshot and assert every invocation-owned runtime field.</td></tr>
+      <tr><td>CLI and spawn role semantics diverge.</td><td>Call the same core role-layer function and share role-application tests.</td></tr>
+      <tr><td>Resume silently changes identity.</td><td>Reject the combination at argument validation.</td></tr>
+    </tbody></table>
+  </section>
+
+  <section class="card"><h2>Review record</h2><p id="review-state">No decision recorded in this browser.</p><button onclick="copyReview()">Copy review as JSON</button></section>
+</main>
+<script>
+  const review = {};
+  function mark(section, state) { review[section] = {state, notes:document.getElementById(section+'-notes')?.value || ''}; document.getElementById('review-state').textContent = JSON.stringify(review); }
+  function copySection(id) { navigator.clipboard.writeText(document.getElementById(id).innerText); }
+  function copyReview() { navigator.clipboard.writeText(JSON.stringify(review, null, 2)); }
+</script></body></html>

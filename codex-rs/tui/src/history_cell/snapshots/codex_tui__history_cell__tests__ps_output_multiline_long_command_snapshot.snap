@@ -4,6 +4,14 @@ expression: rendered
 ---
 /ps
 
-Background terminals
+Native agents
+
+  • No native agents running.
+
+exec_command terminals
 
   • (↵  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx [...]
+
+Monitor jobs and watchers
+
+  • No monitor jobs or watchers running.

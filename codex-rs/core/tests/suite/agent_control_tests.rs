@@ -165,6 +165,14 @@ impl AgentControl for TestAgentControl {
         self.service_tier.lock().expect("service tier lock").clone()
     }
 
+    fn root_service_tier(&self) -> Option<String> {
+        self.service_tier()
+    }
+
+    fn has_live_descendants(&self, _parent_thread_id: ThreadId) -> BoxFuture<'_, bool> {
+        Box::pin(async { false })
+    }
+
     fn propagate_config_update(&self, update: AgentConfigUpdate) {
         let AgentConfigUpdate::ServiceTier(tier) = update;
         *self.service_tier.lock().expect("service tier lock") = tier;
