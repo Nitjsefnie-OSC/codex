@@ -110,6 +110,7 @@ async fn wait_for_interrupt_boundary(test: &TestCodex) -> anyhow::Result<()> {
     test.codex
         .submit(Op::ThreadSettings {
             thread_settings: ThreadSettingsOverrides::default(),
+            reply: None,
         })
         .await?;
     timeout(

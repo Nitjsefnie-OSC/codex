@@ -95,25 +95,26 @@ async fn spawn_v1_agent_with_role_identity_and_configured_defaults(
 
 #[tokio::test]
 async fn spawn_agent_explicit_model_and_effort_override_role_defaults() {
-    let snapshot = spawn_v1_agent_with_role_identity(Some("gpt-5.4"), Some(ReasoningEffort::High))
-        .await
-        .expect("spawn_agent should honor explicit identity overrides");
+    let snapshot =
+        spawn_v1_agent_with_role_identity(Some("gpt-5.6-sol"), Some(ReasoningEffort::High))
+            .await
+            .expect("spawn_agent should honor explicit identity overrides");
 
     pretty_assertions::assert_eq!(
         (snapshot.model.as_str(), snapshot.reasoning_effort),
-        ("gpt-5.4", Some(ReasoningEffort::High))
+        ("gpt-5.6-sol", Some(ReasoningEffort::High))
     );
 }
 
 #[tokio::test]
 async fn spawn_agent_explicit_model_preserves_role_effort_default() {
-    let snapshot = spawn_v1_agent_with_role_identity(Some("gpt-5.4"), None)
+    let snapshot = spawn_v1_agent_with_role_identity(Some("gpt-5.6-sol"), None)
         .await
         .expect("spawn_agent should honor an explicit model");
 
     pretty_assertions::assert_eq!(
         (snapshot.model.as_str(), snapshot.reasoning_effort),
-        ("gpt-5.4", Some(ReasoningEffort::Low))
+        ("gpt-5.6-sol", Some(ReasoningEffort::Low))
     );
 }
 
@@ -372,14 +373,15 @@ async fn multi_agent_v2_uncatalogued_role_model_preserves_parent_effort() {
 
 #[tokio::test]
 async fn spawn_agent_rejects_invalid_final_model_effort_pair() {
-    let error = spawn_v1_agent_with_role_identity(Some("gpt-5.4"), Some(ReasoningEffort::Minimal))
-        .await
-        .expect_err("the final model and effort should be validated together");
+    let error =
+        spawn_v1_agent_with_role_identity(Some("gpt-5.6-sol"), Some(ReasoningEffort::Minimal))
+            .await
+            .expect_err("the final model and effort should be validated together");
 
     pretty_assertions::assert_eq!(
         error,
         FunctionCallError::RespondToModel(
-            "Reasoning effort `minimal` is not supported for model `gpt-5.4`. Supported reasoning efforts: low, medium, high, xhigh".to_string()
+            "Reasoning effort `minimal` is not supported for model `gpt-5.6-sol`. Supported reasoning efforts: low, medium, high, xhigh, max, ultra".to_string()
         )
     );
 }
@@ -459,25 +461,26 @@ async fn spawn_v2_agent_with_role_identity_and_configured_defaults(
 
 #[tokio::test]
 async fn multi_agent_v2_spawn_explicit_model_and_effort_override_role_defaults() {
-    let snapshot = spawn_v2_agent_with_role_identity(Some("gpt-5.4"), Some(ReasoningEffort::High))
-        .await
-        .expect("spawn_agent should honor explicit identity overrides");
+    let snapshot =
+        spawn_v2_agent_with_role_identity(Some("gpt-5.6-sol"), Some(ReasoningEffort::High))
+            .await
+            .expect("spawn_agent should honor explicit identity overrides");
 
     pretty_assertions::assert_eq!(
         (snapshot.model.as_str(), snapshot.reasoning_effort),
-        ("gpt-5.4", Some(ReasoningEffort::High))
+        ("gpt-5.6-sol", Some(ReasoningEffort::High))
     );
 }
 
 #[tokio::test]
 async fn multi_agent_v2_spawn_explicit_model_preserves_role_effort_default() {
-    let snapshot = spawn_v2_agent_with_role_identity(Some("gpt-5.4"), None)
+    let snapshot = spawn_v2_agent_with_role_identity(Some("gpt-5.6-sol"), None)
         .await
         .expect("spawn_agent should honor an explicit model");
 
     pretty_assertions::assert_eq!(
         (snapshot.model.as_str(), snapshot.reasoning_effort),
-        ("gpt-5.4", Some(ReasoningEffort::Low))
+        ("gpt-5.6-sol", Some(ReasoningEffort::Low))
     );
 }
 
@@ -512,14 +515,15 @@ async fn multi_agent_v2_role_overrides_invalid_configured_identity_defaults() {
 
 #[tokio::test]
 async fn multi_agent_v2_rejects_invalid_final_model_effort_pair() {
-    let error = spawn_v2_agent_with_role_identity(Some("gpt-5.4"), Some(ReasoningEffort::Minimal))
-        .await
-        .expect_err("the final model and effort should be validated together");
+    let error =
+        spawn_v2_agent_with_role_identity(Some("gpt-5.6-sol"), Some(ReasoningEffort::Minimal))
+            .await
+            .expect_err("the final model and effort should be validated together");
 
     pretty_assertions::assert_eq!(
         error,
         FunctionCallError::RespondToModel(
-            "Reasoning effort `minimal` is not supported for model `gpt-5.4`. Supported reasoning efforts: low, medium, high, xhigh".to_string()
+            "Reasoning effort `minimal` is not supported for model `gpt-5.6-sol`. Supported reasoning efforts: low, medium, high, xhigh, max, ultra".to_string()
         )
     );
 }
