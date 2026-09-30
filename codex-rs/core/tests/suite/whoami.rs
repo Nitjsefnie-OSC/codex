@@ -23,7 +23,7 @@ use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 
-const REQUESTED_MODEL: &str = "gpt-5.4";
+const REQUESTED_MODEL: &str = "gpt-5.6-sol";
 const SERVER_MODEL: &str = "gpt-5.5";
 
 fn user_turn(test: &TestCodex) -> TurnInputRequest {
