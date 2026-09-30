@@ -192,7 +192,7 @@ async fn exec_agent_role_preserves_role_model_and_explicit_effort() -> anyhow::R
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_agent_role_rejects_invalid_final_model_effort_pair() -> anyhow::Result<()> {
     let test = test_codex_exec();
-    install_adversary_role_with_identity(test.home_path(), "gpt-5.4", "low")?;
+    install_adversary_role_with_identity(test.home_path(), "gpt-5.6-sol", "low")?;
     let server = responses::start_mock_server().await;
 
     let output = test
@@ -208,7 +208,7 @@ async fn exec_agent_role_rejects_invalid_final_model_effort_pair() -> anyhow::Re
     assert!(!output.status.success(), "invalid pair unexpectedly ran");
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
-        stderr.contains("Reasoning effort `minimal` is not supported for model `gpt-5.4`"),
+        stderr.contains("Reasoning effort `minimal` is not supported for model `gpt-5.6-sol`"),
         "unexpected stderr: {stderr}"
     );
     let requests = server.received_requests().await.unwrap_or_default();
