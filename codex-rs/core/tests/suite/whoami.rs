@@ -215,16 +215,22 @@ async fn whoami_does_not_attest_websocket_handshake_model() -> Result<()> {
     ])
     .await;
 
-    let mut builder = test_codex().with_model(REQUESTED_MODEL);
+    // Every catalog model except the server model is code-mode-only, which warns when the
+    // code-mode host is unavailable; that warning is unrelated to handshake identity.
+    let mut builder = test_codex()
+        .with_model(REQUESTED_MODEL)
+        .with_model_info_override(REQUESTED_MODEL, |model_info| {
+            model_info.tool_mode = None;
+        });
     let test = builder.build_with_websocket_server(&server).await?;
     test.codex.start_or_steer_turn(user_turn(&test)).await?;
     let mut reroute_count = 0;
-    let mut warning_count = 0;
+    let mut warnings = Vec::new();
     loop {
         let event = test.codex.next_event().await?;
         match event.msg {
             codex_protocol::protocol::EventMsg::ModelReroute(_) => reroute_count += 1,
-            codex_protocol::protocol::EventMsg::Warning(_) => warning_count += 1,
+            codex_protocol::protocol::EventMsg::Warning(warning) => warnings.push(warning.message),
             codex_protocol::protocol::EventMsg::TurnComplete(_) => break,
             _ => {}
         }
@@ -234,7 +240,8 @@ async fn whoami_does_not_attest_websocket_handshake_model() -> Result<()> {
         "handshake metadata must not reroute a turn"
     );
     assert_eq!(
-        warning_count, 0,
+        warnings,
+        Vec::<String>::new(),
         "handshake metadata must not warn the user"
     );
 
