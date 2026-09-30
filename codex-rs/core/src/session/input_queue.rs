@@ -1880,7 +1880,7 @@ mod tests {
                 text_elements: Vec::new(),
             }],
             client_id: None,
-            acceptance_order: None,
+            metadata: Default::default(),
         };
         let completion = TurnInput::AgentCompletion(make_mail(
             AgentPath::try_from("/root/worker").expect("agent path"),
@@ -1937,7 +1937,7 @@ mod tests {
                 text_elements: Vec::new(),
             }],
             client_id: None,
-            acceptance_order: None,
+            metadata: Default::default(),
         };
         let completion_b = TurnInput::AgentCompletion(make_mail(
             AgentPath::try_from("/root/b").expect("agent path"),

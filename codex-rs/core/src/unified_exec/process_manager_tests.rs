@@ -430,7 +430,9 @@ async fn output_collection_preserves_omissions_from_drained_buffer() {
 async fn process_exit_ends_output_collection_while_elicitation_is_paused() {
     let cancellation_token = CancellationToken::new();
     let output: OutputHandles = OutputHandles {
-        output_buffer: Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default())),
+        output_buffer: Arc::new(tokio::sync::Mutex::new(
+            crate::unified_exec::process::OutputBuffers::default(),
+        )),
         output_notify: Arc::new(Notify::new()),
         output_closed: Arc::new(AtomicBool::new(true)),
         output_closed_notify: Arc::new(Notify::new()),

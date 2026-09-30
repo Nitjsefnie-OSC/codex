@@ -110,12 +110,14 @@ async fn completed_output_preserves_bytes_before_subscription(
         &context,
         vec!["proof".to_string()],
         cwd,
+        ExecCommandSource::UnifiedExecStartup,
         /*process_id*/ 123,
         /*plugin_attribution*/ None,
         output_buffer,
         Instant::now(),
         /*network_denial_monitor*/ None,
         /*plugin_metrics_sidecar*/ None,
+        /*completion_notification*/ None,
     );
     stdout_tx.send(late_output.to_vec())?;
     drop(stdout_tx);

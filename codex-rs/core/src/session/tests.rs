@@ -11835,7 +11835,7 @@ impl SessionTask for BlockingStartTask {
                     text_elements: Vec::new(),
                 }],
                 client_id: None,
-                acceptance_order: None,
+                metadata: Default::default(),
             }],
             "the pending start input must be preserved exactly",
         );
@@ -12609,7 +12609,7 @@ async fn aborting_sentinel_blocks_direct_task_start_until_cleanup_finishes() {
                         text_elements: Vec::new(),
                     }],
                     client_id: None,
-                    acceptance_order: None,
+                    metadata: Default::default(),
                 }],
                 BlockingStartTask { started, run_count },
                 MailboxParentProvenance::Ignore,
@@ -13383,7 +13383,10 @@ async fn active_mailbox_precedes_later_steer() {
                     text_elements: Vec::new(),
                 }],
                 client_id: None,
-                acceptance_order: Some(0),
+                metadata: crate::session::UserInputMetadata {
+                    acceptance_order: Some(0),
+                    ..Default::default()
+                },
             },
         ]
     );
@@ -13501,7 +13504,7 @@ async fn non_regular_task_persists_older_idle_mailbox_before_start() {
                 text_elements: Vec::new(),
             }],
             client_id: None,
-            acceptance_order: None,
+            metadata: Default::default(),
         }],
         NeverEndingTask {
             kind: TaskKind::Review,
