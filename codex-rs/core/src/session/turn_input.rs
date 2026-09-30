@@ -312,11 +312,7 @@ pub(super) async fn handle_background_wake(
         /*expected_previous_turn_id*/ None,
         MailboxParentProvenance::Attribute,
     )
-    .await;
-    if let Ok(TurnInputSubmission::Started { turn_id }) = &result {
-        tracing::Span::current().record("turn.id", turn_id);
-    }
-    result
+    .await
 }
 
 async fn start_or_steer(
